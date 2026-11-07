@@ -3237,6 +3237,13 @@ PYEOF
 preflight_processor() {
   local py=python3
   command -v python3 >/dev/null 2>&1 || py=python
+  # ensure_cuda_compat 有 CUDA_COMPAT_OK 快速返回，正常路径下 patch_fl2va_launcher
+  # 已经把它写好了；这里再兜一次，免得某个分支漏写导致预检自己先崩
+  [ -s "$PYDEPS/dyn/h3_proc_fix.py" ] || write_proc_fix >/dev/null 2>&1 || true
+  [ -s "$PYDEPS/dyn/h3_proc_fix.py" ] || {
+    say "  !! processor 兜底脚本没写出来（$PYDEPS/dyn/h3_proc_fix.py）"
+    return 4
+  }
   export PYTHONPATH="$PYDEPS/dyn:$PYDEPS${PYTHONPATH:+:$PYTHONPATH}"
 
   say "  预检 3/3：processor 加载（torchvision 缺失时 image_processor 应走 PIL 后端）"
