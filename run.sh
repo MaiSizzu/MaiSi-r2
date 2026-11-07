@@ -70,6 +70,8 @@ PKG=$AFS/MaiSi-r2
 INFINI=$AFS/infini
 OUT=$AFS/outputs
 PYLIBS=$AFS/pylibs
+# 纯 Python 小依赖补充（janus / xxhash），见 ensure_pydeps：离线 pylibs 里没有它们
+PYDEPS=$AFS/pydeps
 # infinicore 的 Python 包目录是上个作业 uid 留下的只读树，写不进去，所以在可写盘上拼一个
 # overlay（包文件 + 编好的 .so），PYTHONPATH 前置它；/dev/shm 优先，装不下再退 AFS
 OVL=${OVL:-/dev/shm/ic_py}
@@ -531,7 +533,7 @@ do_check() {
     [ -s "$f" ] && { NT=$f; break; }
   done
   echo "  九齿头文件 = ${NT:-<无，build 时自动写入 build/ninetoothed/>}"
-  PYTHONPATH="$PYLIBS:$PYTHONPATH" python3 - <<'PY'
+  PYTHONPATH="$PYDEPS:$PYLIBS:$PYTHONPATH" python3 - <<'PY'
 import sys
 print("  python    =", sys.version.split()[0])
 try:
@@ -542,6 +544,12 @@ try:
     import PIL; print("  Pillow    =", PIL.__version__)
 except Exception as e:
     print("  Pillow    = FAIL(首帧生成会退回内置编码)")
+for _m in ("janus", "xxhash"):
+    try:
+        _mod = __import__(_m)
+        print("  %-9s =" % _m, getattr(_mod, "__version__", "?"), (getattr(_mod, "__file__", "") or "")[-46:])
+    except Exception:
+        print("  %-9s = 缺（smoke 时由 ensure_pydeps 补到 $PYDEPS）" % _m)
 try:
     import diffusers; print("  diffusers  =", diffusers.__version__)
 except Exception:
@@ -1594,10 +1602,345 @@ probe_dcu() {   # $1=plain|preload → 0 有卡 / 2 没卡 / 3 判断不了
   return 0
 }
 
+# =============================================================================
+# 5.5 纯 Python 小依赖：janus / xxhash
+# =============================================================================
+# 11:29 那一单断在 `import janus`（infinilm/llm/request.py 在第 13 行就导入了它）。
+# 离线 pylibs 里没有 janus / xxhash，但对我们这条路径，它俩只是"import 得过去就行"：
+#   · janus   —— 只有 LLM / AsyncLLMEngine 的异步队列会真用；FL2VA 走 multimodal runner
+#   · xxhash  —— 只用来算前缀缓存的分块键（16 字节摘要），换 blake2b-128 语义等价
+# 所以在 AFS 上放一份极小的等价实现，PYTHONPATH 前置；缺别的包时再加一轮联网补齐。
+ensure_pydeps() {
+  local pd=$PYDEPS
+  mkdir -p "$pd" 2>/dev/null || { say "  !! $pd 不可写"; return 1; }
+
+  local stamp="janus2-xxh1"
+  if [ "$(cat "$pd/.stamp" 2>/dev/null)" != "$stamp" ] || [ ! -f "$pd/janus/__init__.py" ]; then
+    say "  补纯 Python 小依赖 → $pd（janus 等价实现 + xxhash 等价实现）"
+    mkdir -p "$pd/janus"
+    cat > "$pd/janus/__init__.py" <<'PYEOF'
+"""janus 的最小等价实现：一个 queue.Queue 同时暴露 sync_q / async_q。
+
+InfiniLM 只用到 Queue() + sync_q.{put,get,put_nowait,get_nowait,qsize,task_done,empty}
++ async_q.{put,get,put_nowait,get_nowait,task_done,empty}，语义与 janus 1.x 一致：
+两侧共用同一个底层队列，task_done / qsize 自然对齐。
+"""
+
+import asyncio
+import queue as _queue
+
+__version__ = "1.0.0+h3shim"
+
+
+class _AsyncSide:
+    """asyncio 一侧：阻塞操作丢到线程池，绝不卡事件循环。"""
+
+    __slots__ = ("_q",)
+
+    def __init__(self, q):
+        self._q = q
+
+    async def put(self, item):
+        self._q.put(item)
+
+    def put_nowait(self, item):
+        return self._q.put_nowait(item)
+
+    async def get(self):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._q.get)
+
+    def get_nowait(self):
+        try:
+            return self._q.get_nowait()
+        except _queue.Empty:
+            raise asyncio.QueueEmpty from None
+
+    def task_done(self):
+        return self._q.task_done()
+
+    async def join(self):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._q.join)
+
+    def qsize(self):
+        return self._q.qsize()
+
+    def empty(self):
+        return self._q.empty()
+
+    def full(self):
+        return self._q.full()
+
+
+class Queue:
+    def __init__(self, maxsize=0):
+        self._q = _queue.Queue(maxsize)
+        self._async_q = _AsyncSide(self._q)
+        self._closed = False
+
+    @property
+    def sync_q(self):
+        return self._q
+
+    @property
+    def async_q(self):
+        return self._async_q
+
+    @property
+    def closed(self):
+        return self._closed
+
+    def close(self):
+        self._closed = True
+
+    def shutdown(self, immediate=False):
+        self._closed = True
+
+    async def aclose(self):
+        self._closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+PYEOF
+
+    cat > "$pd/xxhash.py" <<'PYEOF'
+"""xxhash 的最小等价实现：只覆盖 InfiniLM 用到的 xxh3_128()。
+
+前缀缓存的分块键只要求"稳定 + 128 位"，算法本身可替换，这里用 blake2b-128。
+对外接口（update / digest / hexdigest / intdigest / copy / reset）与 xxhash 一致。
+"""
+
+import hashlib
+
+__version__ = "0.0.0+h3shim"
+
+_ALGO = "blake2b"
+
+
+class _Hasher:
+    def __init__(self, digest_size=8, seed=0, data=b""):
+        self._size = digest_size
+        self._seed = seed
+        self._h = hashlib.blake2b(digest_size=digest_size)
+        if data:
+            self.update(data)
+
+    def update(self, data):
+        if isinstance(data, str):
+            data = data.encode()
+        elif isinstance(data, memoryview):
+            data = data.tobytes()
+        self._h.update(bytes(data))
+        return self
+
+    def digest(self):
+        return self._h.digest()
+
+    def hexdigest(self):
+        return self._h.hexdigest()
+
+    def intdigest(self):
+        return int.from_bytes(self._h.digest(), "big")
+
+    def copy(self):
+        other = _Hasher(self._size, self._seed)
+        other._h = self._h.copy()
+        return other
+
+    def reset(self):
+        self._h = hashlib.blake2b(digest_size=self._size)
+
+
+def _make(size, data=b"", *args, **kwargs):
+    return _Hasher(size, data=data)
+
+
+def xxh3_128(data=b"", *args, **kwargs):
+    return _Hasher(16, data=data)
+
+
+def xxh3_64(data=b"", *args, **kwargs):
+    return _Hasher(8, data=data)
+
+
+def xxh128(data=b"", *args, **kwargs):
+    return _Hasher(16, data=data)
+
+
+def xxh64(data=b"", *args, **kwargs):
+    return _Hasher(8, data=data)
+
+
+def xxh32(data=b"", *args, **kwargs):
+    return _Hasher(4, data=data)
+
+
+def xxh3_128_digest(data=b"", *args, **kwargs):
+    return hashlib.blake2b(bytes(data), digest_size=16).digest()
+
+
+def xxh3_64_digest(data=b"", *args, **kwargs):
+    return hashlib.blake2b(bytes(data), digest_size=8).digest()
+
+
+def xxh128_digest(data=b"", *args, **kwargs):
+    return xxh3_128_digest(data)
+
+
+def xxh64_digest(data=b"", *args, **kwargs):
+    return xxh3_64_digest(data)
+
+
+def xxh32_digest(data=b"", *args, **kwargs):
+    return hashlib.blake2b(bytes(data), digest_size=4).digest()
+
+
+def digest(data, digest_size=8, *args, **kwargs):
+    return hashlib.blake2b(bytes(data), digest_size=digest_size).digest()
+
+
+def h3_128(data, *args, **kwargs):
+    return xxh3_128_digest(data)
+
+
+class VERSION:
+    VERSION = "0.0.0+h3shim"
+PYEOF
+    echo "$stamp" > "$pd/.stamp" 2>/dev/null
+  fi
+
+  # 自检：真把两个包 import 起来跑一遍最小动作，别只看文件在不在
+  local py=python3
+  command -v python3 >/dev/null 2>&1 || py=python
+  local out
+  out=$(PYTHONPATH="$pd${PYTHONPATH:+:$PYTHONPATH}" "$py" - 2>&1 <<'PYEOF'
+import janus, xxhash
+q = janus.Queue()
+q.sync_q.put({"a": 1})
+assert q.async_q.get_nowait() == {"a": 1}, "janus 两侧没共用同一个队列"
+assert q.sync_q.qsize() == 0
+h = xxhash.xxh3_128()
+h.update(b"InfiniLM-prefix-cache-v1\0")
+h.update(b"\0")
+assert len(h.digest()) == 16, "xxhash 摘要不是 16 字节"
+assert xxhash.xxh3_128(b"x").hexdigest() == xxhash.xxh3_128(b"x").hexdigest()
+print("janus %s / xxhash %s" % (getattr(janus, "__version__", "?"), getattr(xxhash, "__version__", "?")))
+PYEOF
+)
+  if [ $? -eq 0 ]; then
+    say "  janus + xxhash 可用：$out"
+    return 0
+  fi
+  say "  !! janus/xxhash 自检失败："
+  printf '%s\n' "$out" | tail -8 | sed 's/^/    /'
+  return 1
+}
+
+# 依赖表：把这条链真正会 import 的顶层包一次列全，别一轮一轮试错
+dep_table() {
+  local py=python3
+  command -v python3 >/dev/null 2>&1 || py=python
+  PYTHONPATH="$PYDEPS/dyn:$PYDEPS${PYTHONPATH:+:$PYTHONPATH}" "$py" - 2>&1 <<'PYEOF'
+import importlib.util
+
+# (分组, 模块名, 是否必需, pip 包名)
+NEED = [
+    ("核心", "janus", True, "janus"),
+    ("核心", "xxhash", True, "xxhash"),
+    ("基础", "numpy", True, "numpy"),
+    ("基础", "torch", True, "torch"),
+    ("基础", "PIL", True, "pillow"),
+    ("模型", "safetensors", True, "safetensors"),
+    ("模型", "transformers", True, "transformers"),
+    ("模型", "tokenizers", True, "tokenizers"),
+    ("模型", "diffusers", True, "diffusers"),
+    ("模型", "accelerate", True, "accelerate"),
+    ("模型", "huggingface_hub", True, "huggingface-hub"),
+    ("工具", "tqdm", True, "tqdm"),
+    ("工具", "yaml", True, "pyyaml"),
+    ("工具", "regex", True, "regex"),
+    ("工具", "psutil", False, "psutil"),
+    ("工具", "imageio", False, "imageio"),
+    ("工具", "imageio_ffmpeg", False, "imageio-ffmpeg"),
+]
+
+missing = []
+for grp, name, must, dist in NEED:
+    try:
+        spec = importlib.util.find_spec(name)
+    except Exception:
+        spec = None
+    if spec is None:
+        print("    %-4s %-18s %s" % (grp, name, "缺" if must else "缺（可选）"))
+        if must:
+            missing.append(dist)
+    else:
+        loc = spec.origin
+        if not loc or loc == "namespace":
+            locs = list(spec.submodule_search_locations or [])
+            loc = locs[0] if locs else "?"
+        print("    %-4s %-18s OK   %s" % (grp, name, str(loc)[:60]))
+print("MISSING=" + " ".join(missing))
+PYEOF
+}
+
+# 依赖表还有缺的才走这条路：先 8 秒探通网络，再 pip --target，绝不干等 DNS 超时
+pip_heal() {
+  local pd=$PYDEPS/dyn py=python3
+  command -v python3 >/dev/null 2>&1 || py=python
+  "$py" -m pip --version >/dev/null 2>&1 || { say "  !! 没有 pip，无法联网补齐"; return 1; }
+  mkdir -p "$pd" 2>/dev/null || return 1
+  if command -v curl >/dev/null 2>&1; then
+    curl -sS -m 8 -o /dev/null https://pypi.tuna.tsinghua.edu.cn/simple/ 2>/dev/null \
+      || { say "  !! 这台机器连不上 PyPI（离线），只能靠自带实现"; return 1; }
+  fi
+  say "  联网补齐：$* → $pd"
+  local tmo="" log rc
+  command -v timeout >/dev/null 2>&1 && tmo="timeout 240"
+  log=$($tmo "$py" -m pip install -q --no-input --no-cache-dir --disable-pip-version-check \
+        --target "$pd" -i https://pypi.tuna.tsinghua.edu.cn/simple \
+        --timeout 10 --retries 1 "$@" 2>&1)
+  rc=$?
+  if [ $rc -eq 0 ]; then
+    say "  联网补齐成功"
+    return 0
+  fi
+  say "  !! 联网补齐失败 rc=$rc"
+  printf '%s\n' "$log" | tail -6 | sed 's/^/    /'
+  return 1
+}
+
 preflight_import() {
   local py=python3
   command -v python3 >/dev/null 2>&1 || py=python
-  say "  预检：import infinicore + _infinicore + _infinilm（不加载权重）"
+  export PYTHONPATH="$PYDEPS/dyn:$PYDEPS${PYTHONPATH:+:$PYTHONPATH}"
+
+  # 第一步：依赖表。缺什么一次列全，避免"补一个又冒一个"
+  say "  预检 1/2：第三方依赖体检（一次列全，不逐个试错）"
+  local tbl miss
+  tbl=$(dep_table)
+  printf '%s\n' "$tbl" | sed '/^MISSING=/d' | sed 's/^/  /'
+  miss=$(printf '%s\n' "$tbl" | sed -n 's/^MISSING=//p')
+  if [ -n "$miss" ]; then
+    say "  !! 还缺：$miss"
+    if pip_heal $miss; then
+      tbl=$(dep_table)
+      printf '%s\n' "$tbl" | sed '/^MISSING=/d' | sed 's/^/  /'
+      miss=$(printf '%s\n' "$tbl" | sed -n 's/^MISSING=//p')
+    fi
+    if [ -n "$miss" ]; then
+      say "  !! 依赖补不齐（$miss）—— 先解决这几个包，别往下跑"
+      return 3
+    fi
+  fi
+
+  # 第二步：真 import。只 import 不加载权重，$tag 越大越接近真实路径
+  say "  预检 2/2：import infinicore → _infinicore → _infinilm → infinilm → multimodal"
   local pl
   pl=$(printf '%s' "${H3_CUDA_PRELOAD:-}" | tr ':' '\n' | while read -r x; do [ -n "$x" ] && basename "$x"; done | tr '\n' ' ')
   say "    环境 INFINI_ROOT=${INFINI_ROOT:-?}  LD_PRELOAD=${pl:-<空>}  /dev/shm 余量 $(shm_free_mb)MB"
@@ -1609,14 +1952,24 @@ from infinicore.lib import _infinicore
 print("_infinicore OK:", _infinicore.__file__)
 from infinilm.lib import _infinilm
 print("_infinilm OK:", _infinilm.__file__)
+import infinilm
+print("infinilm OK（janus / xxhash 这一步通了）")
+from infinilm.multimodal.minimax_h3 import MiniMaxH3TransformerRunner
+print("multimodal.minimax_h3 OK（FL2VA 入口类可导入）")
 PYEOF
 )
   local rc=$?
   if [ $rc -eq 0 ]; then
-    printf '%s\n' "$out" | tail -4 | sed 's/^/    /'
-  else
-    say "  !! 预检失败，根因就在下面几行（末尾 20 行）："
-    printf '%s\n' "$out" | tail -20 | sed 's/^/    /'
+    printf '%s\n' "$out" | tail -5 | sed 's/^/    /'
+    return 0
+  fi
+  say "  !! 预检失败，根因就在下面几行（末尾 25 行）："
+  printf '%s\n' "$out" | tail -25 | sed 's/^/    /'
+  if printf '%s\n' "$out" | grep -q 'ModuleNotFoundError'; then
+    say "     ↳ 是缺包：把这一行贴我，或确认 $PYDEPS/dyn 里有没有它"
+  fi
+  if printf '%s\n' "$out" | grep -q 'undefined symbol'; then
+    say "     ↳ 是 cu*→HIP 薄壳没覆盖到，把符号名贴我"
   fi
   return $rc
 }
@@ -1674,6 +2027,8 @@ do_run() {
     fi
   fi
   ensure_infinilm || say "警告：_infinilm 没编出来，import infinilm.cache 会失败"
+  # janus / xxhash 不在离线 pylibs 里，得先补上，否则 import infinilm 第 13 行就断
+  ensure_pydeps || say "警告：janus/xxhash 没补上，import infinilm 会报 ModuleNotFoundError"
   # 干完重活再探一次：10:33 那单的卡就是在 21 分钟编译过程中丢的，这里能立刻看见
   local pd=0
   probe_dcu preload || pd=$?
@@ -1685,7 +2040,7 @@ do_run() {
   local pyic="$PKG/src/InfiniCore/python"
   [ -n "${INFINICORE_OVERLAY:-}" ] && pyic="$INFINICORE_OVERLAY:$pyic"
   # overlay 放最前：既保证用的是新编的 infinicore，也让它的 sitecustomize.py 先生效
-  export PYTHONPATH="$pyic:$PYLIBS:$PKG/src/InfiniLM/python"
+  export PYTHONPATH="$pyic:$PYLIBS:$PYDEPS/dyn:$PYDEPS:$PKG/src/InfiniLM/python"
 
   if [ "$tag" = "smoke" ]; then export SMOKE=1; fi
 
