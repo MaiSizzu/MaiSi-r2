@@ -24,6 +24,11 @@
 #   full 2      → 2 卡（TP=8 报 heads 不整除时用）
 #
 # 所有大文件都落在个人 AFS（$IFAB_AFS_HOME），不占项目空间。
+#
+# 13:11 那单暴露的最后一个坑：Qwen3VLVideoProcessor 硬依赖 torchvision，缺了它
+# 整个 Qwen3VLProcessor 都构造不出来 → components.processor = None → encoders.py
+# 里 processor.image_processor(...) 直接崩。而 image processor 本身有纯 PIL 后端，
+# keyframes 完全够用。解法见 §5.5（给 video_processor 挂空壳）与 §5.5 的预检。
 # =============================================================================
 
 MODE=${1:-check}
@@ -1792,6 +1797,206 @@ H3CCLEOF
   return 0
 }
 
+# =============================================================================
+# 5.5 processor 兜底（torchvision 缺失 → video_processor 加载失败 → processor = None）
+# =============================================================================
+# 13:11 那单的经验：8 卡 TP 起来了、73G 权重也加载完了，最后死在这一行——
+#     Qwen3VLVideoProcessor requires the Torchvision library but it was not found
+#     AttributeError: 'NoneType' object has no attribute 'image_processor'
+# 根因不在 image processor：transformers 给 qwen3_vl 配了两套后端，
+#     {"torchvision": "Qwen2VLImageProcessor", "pil": "Qwen2VLImageProcessorPil"}
+# 没有 torchvision 时自动走 PIL 那套，keyframes 完全够用。卡住的是同级的
+# video_processor —— 它被 define_import_structure 按文件名标成依赖 torchvision，
+# 一缺就成 Dummy，于是整个 Qwen3VLProcessor 构造不出来。MiniMax-H3 只用图片，
+# 所以给它挂个空壳顶上（详见脚本内的注释）。
+write_proc_fix() {
+  local dyn=$PYDEPS/dyn entry=$AFS/ic_py/h3_entry.py
+  mkdir -p "$dyn" "$AFS/ic_py" 2>/dev/null || return 1
+  local stamp="procfix1"
+  if [ "$(cat "$dyn/.procfix_stamp" 2>/dev/null)" = "$stamp" ] \
+     && [ -s "$dyn/h3_proc_fix.py" ] && [ -s "$entry" ]; then
+    H3_ENTRY_PY=$entry
+    export H3_ENTRY_PY
+    return 0
+  fi
+
+  cat > "$dyn/h3_proc_fix.py" <<'PYEOF'
+"""让 MiniMax-H3 的 processor 在缺少 torchvision 的容器里也能加载。
+
+transformers 给 Qwen3-VL 的 image processor 配了两套后端：
+
+    ("qwen3_vl", {"torchvision": "Qwen2VLImageProcessor",
+                  "pil":        "Qwen2VLImageProcessorPil"})
+
+没有 torchvision 时 AutoImageProcessor 自动挑 pil 那套（Qwen2VLImageProcessorPil，
+只依赖 PIL + numpy），MiniMax-H3 的 keyframes 走的正是它，能力完全够用。
+
+真正卡死的是同级的 video_processor：define_import_structure 按文件名把
+video_processing_*.py 整类标成依赖 (vision, torch, torchvision)，torchvision 一缺，
+Qwen3VLVideoProcessor 就退化成 Dummy，AutoVideoProcessor.from_pretrained 直接抛
+ImportError。而 ProcessorMixin._get_arguments_from_pretrained 是逐个加载子组件的，
+video_processor 一抛，整个 Qwen3VLProcessor 都构造不出来，diffusers 于是把
+components.processor 置成 None，随后 encoders.py 里
+
+    vision = processor.image_processor(images=..., return_tensors="pt")
+
+就 AttributeError: 'NoneType' object has no attribute 'image_processor'。
+
+MiniMax-H3 全程只喂 keyframes（图片），从不走视频分支，所以这里让
+AutoVideoProcessor 加载失败时返回一个空壳：它满足 isinstance(VideoProcessorMixin)
+（ProcessorMixin 的类型校验要过），真被调用（preprocess 视频）才报错。
+
+本模块 import 即生效，幂等。
+"""
+
+from __future__ import annotations
+
+import logging
+
+_LOG = logging.getLogger("h3.procfix")
+
+_APPLIED = False
+
+
+def _null_video_processor_class():
+    """造一个只占位的 video_processor 类（继承 VideoProcessorMixin 才能过类型校验）。"""
+    from transformers.video_processing_utils import VideoProcessorMixin
+
+    class NullVideoProcessor(VideoProcessorMixin):
+        # Qwen2-VL / Qwen3-VL 的 patch 参数；processor 侧只读 merge_size
+        merge_size = 2
+        patch_size = 16
+        temporal_patch_size = 2
+        model_input_names: list[str] = []
+
+        def __init__(self, **kwargs):
+            # 故意不调 super().__init__：那套参数校验对空壳没有意义
+            pass
+
+        def preprocess(self, videos=None, **kwargs):
+            raise RuntimeError(
+                "[h3] 当前环境没有 torchvision，video_processor 只是占位；"
+                "MiniMax-H3 只用 keyframes（走 image_processor），不该走到这里"
+            )
+
+        def to_dict(self):
+            return {"video_processor_type": "NullVideoProcessor"}
+
+        def save_pretrained(self, *args, **kwargs):
+            return None
+
+    return NullVideoProcessor
+
+
+def _patch_auto_video_processor(null_cls):
+    from transformers.models.auto.video_processing_auto import AutoVideoProcessor
+
+    current = AutoVideoProcessor.from_pretrained
+    if getattr(current, "_h3_patched", False):
+        return
+    original = getattr(current, "__func__", current)
+
+    def from_pretrained(cls, *args, **kwargs):
+        try:
+            return original(cls, *args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 —— 这里就是要吞掉，否则整个 processor 都没了
+            head = str(exc).strip().splitlines()[0][:160] if str(exc).strip() else ""
+            _LOG.warning(
+                "[h3] video_processor 加载失败，改挂空壳（不影响 keyframes）：%s: %s",
+                type(exc).__name__,
+                head,
+            )
+            return null_cls()
+
+    from_pretrained._h3_patched = True
+    AutoVideoProcessor.from_pretrained = classmethod(from_pretrained)
+
+
+def _patch_none_argument():
+    """ProcessorMixin 的类型校验不接受 None，这里给 None 放行（兜底，正常走不到）。"""
+    from transformers.processing_utils import ProcessorMixin
+
+    current = ProcessorMixin.check_argument_for_proper_class
+    if getattr(current, "_h3_patched", False):
+        return
+    original = current
+
+    def check_argument_for_proper_class(self, argument_name, argument):
+        if argument is None:
+            return None
+        return original(self, argument_name, argument)
+
+    check_argument_for_proper_class._h3_patched = True
+    ProcessorMixin.check_argument_for_proper_class = check_argument_for_proper_class
+
+
+def apply() -> bool:
+    global _APPLIED
+    if _APPLIED:
+        return True
+
+    try:
+        import transformers  # noqa: F401
+    except Exception as exc:  # noqa: BLE001
+        print(f"[h3] 没装上 processor 兜底：import transformers 失败 {type(exc).__name__}: {exc}", flush=True)
+        return False
+
+    try:
+        _patch_auto_video_processor(_null_video_processor_class())
+        _patch_none_argument()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[h3] 没装上 processor 兜底：{type(exc).__name__}: {exc}", flush=True)
+        return False
+
+    _APPLIED = True
+    print("[h3] processor 兜底已装：video_processor 缺失时挂空壳，image_processor 走 PIL 后端", flush=True)
+    return True
+
+
+apply()
+PYEOF
+
+  cat > "$entry" <<'PYEOF'
+"""examples/minimax_h3.py 的薄包装：先给 transformers 装好 processor 兜底，再原样跑入口。
+
+FL2VA 的入口是 `python examples/minimax_h3.py fl2va --model-path=...`，而补丁必须赶在
+AutoProcessor 加载之前生效。命令行里塞 `-c` 会打乱 argv[0] 和相对路径，所以用一个
+runpy 包装：argv 原样传给入口脚本，`__name__ == "__main__"` 也保持成立。
+"""
+
+import os
+import runpy
+import sys
+
+try:
+    import h3_proc_fix  # noqa: F401  —— import 即生效
+except Exception as exc:  # noqa: BLE001 —— 兜底装不上也要让主流程继续，别拦路
+    print(f"[h3] processor 兜底没装上：{type(exc).__name__}: {exc}", flush=True)
+
+_script = os.environ.get("H3_ENTRY_SCRIPT") or os.path.join(
+    os.getcwd(), "examples", "minimax_h3.py"
+)
+if not os.path.isfile(_script):
+    sys.exit(f"[h3] 找不到入口脚本：{_script}（cwd={os.getcwd()}）")
+
+# 直接 `python examples/minimax_h3.py` 时 sys.path[0] 是 examples/，改走 runpy 后
+# 会变成这个中转脚本所在的目录；补回来，行为跟原启动方式一致
+_here = os.path.dirname(os.path.abspath(_script))
+if _here not in sys.path:
+    sys.path.insert(0, _here)
+
+sys.argv[0] = _script
+runpy.run_path(_script, run_name="__main__")
+PYEOF
+
+  [ -s "$dyn/h3_proc_fix.py" ] && [ -s "$entry" ] || { say "  !! processor 兜底脚本没写出来"; return 1; }
+  echo "$stamp" > "$dyn/.procfix_stamp" 2>/dev/null
+  H3_ENTRY_PY=$entry
+  export H3_ENTRY_PY
+  say "  processor 兜底就位：$dyn/h3_proc_fix.py + $entry"
+  return 0
+}
+
 # 子脚本里那行 `[ -f "$PRELOAD" ] && export LD_PRELOAD=$PRELOAD` 会把我们的 shim
 # 直接顶掉。包目录是上个作业 uid 的只读树（改不了），所以在可写目录生成一份打过
 # 补丁的副本：shim 放最前、DTK libcuda 跟在后面；PYTHONPATH 改成追加，保证
@@ -1803,7 +2008,10 @@ patch_fl2va_launcher() {
   [ -n "${H3_CUDA_SHIM:-}" ] || return 1
   mkdir -p "$AFS/ic_py" 2>/dev/null || return 1
 
-  local line out="" n=0
+  # entry 中转脚本必须先就位，下面替换 python 调用行时才有东西可指
+  write_proc_fix || say "  !! processor 兜底脚本没备好，这一单仍会在 processor 处失败"
+
+  local line out="" n=0 pf=0
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
       '[ -f "$PRELOAD" ] && export LD_PRELOAD=$PRELOAD')
@@ -1821,6 +2029,12 @@ patch_fl2va_launcher() {
         out+='export PYTHONPATH="$PYTHONPATH:$SS/InfiniCore/python:$SS/InfiniLM/python"'$'\n'
         n=$((n+1))
         ;;
+      '"$PY" examples/minimax_h3.py fl2va \')
+        # 换成 h3_entry.py 中转，好在 AutoProcessor 加载之前装上 processor 兜底
+        out+='H3_ENTRY_SCRIPT="$PWD/examples/minimax_h3.py" "$PY" '"${H3_ENTRY_PY:-$AFS/ic_py/h3_entry.py}"$' fl2va \\'$'\n'
+        n=$((n+1))
+        pf=1
+        ;;
       *)
         out+=$line$'\n'
         ;;
@@ -1830,6 +2044,9 @@ patch_fl2va_launcher() {
   if [ $n -lt 2 ]; then
     say "  !! 启动器结构和预期不一致（只替换了 $n 处），不冒险，放弃打补丁"
     return 1
+  fi
+  if [ $pf -eq 0 ]; then
+    say "  !! 启动器里没匹配到 python 调用行，processor 兜底挂不上（会退回 processor=None 的老问题）"
   fi
   printf '%s' "$out" > "$dst" 2>/dev/null || return 1
   chmod +x "$dst" 2>/dev/null
@@ -2959,7 +3176,7 @@ preflight_import() {
   export PYTHONPATH="$PYDEPS/dyn:$PYDEPS${PYTHONPATH:+:$PYTHONPATH}"
 
   # 第一步：依赖表。缺什么一次列全，避免"补一个又冒一个"
-  say "  预检 1/2：第三方依赖体检（一次列全，不逐个试错）"
+  say "  预检 1/3：第三方依赖体检（一次列全，不逐个试错）"
   local tbl miss
   tbl=$(dep_table)
   printf '%s\n' "$tbl" | sed '/^MISSING=/d' | sed 's/^/  /'
@@ -2978,7 +3195,7 @@ preflight_import() {
   fi
 
   # 第二步：真 import。只 import 不加载权重，$tag 越大越接近真实路径
-  say "  预检 2/2：import infinicore → _infinicore → _infinilm → infinilm → multimodal"
+  say "  预检 2/3：import infinicore → _infinicore → _infinilm → infinilm → multimodal"
   local pl
   # 注意：不能用 `while read` 处理——最后一个条目没有换行符时 read 返回非 0，
   # 循环体不执行，列表会静默少一项（13:22 那单就把 libh3ccl.so 漏掉了，看着像没预加载）
@@ -2999,20 +3216,103 @@ print("multimodal.minimax_h3 OK（FL2VA 入口类可导入）")
 PYEOF
 )
   local rc=$?
-  if [ $rc -eq 0 ]; then
-    printf '%s\n' "$out" | tail -5 | sed 's/^/    /'
+  if [ $rc -ne 0 ]; then
+    say "  !! 预检失败，根因就在下面几行（末尾 25 行）："
+    printf '%s\n' "$out" | tail -25 | sed 's/^/    /'
+    if printf '%s\n' "$out" | grep -q 'ModuleNotFoundError'; then
+      say "     ↳ 是缺包：把这一行贴我，或确认 $PYDEPS/dyn 里有没有它"
+    fi
+    if printf '%s\n' "$out" | grep -q 'undefined symbol'; then
+      say "     ↳ 是 cu*→HIP 薄壳没覆盖到，把符号名贴我"
+    fi
+    return $rc
+  fi
+  printf '%s\n' "$out" | tail -5 | sed 's/^/    /'
+  return 0
+}
+
+# processor 自检单独一个函数：它只要几十秒，不该被「骨架指纹一致就跳过」省掉。
+# 13:11 那单是加载完 73G 权重、一路跑进 encoders.py 才炸在 processor 上的
+# （Qwen3VLVideoProcessor requires the Torchvision library），代价 40 分钟。
+preflight_processor() {
+  local py=python3
+  command -v python3 >/dev/null 2>&1 || py=python
+  export PYTHONPATH="$PYDEPS/dyn:$PYDEPS${PYTHONPATH:+:$PYTHONPATH}"
+
+  say "  预检 3/3：processor 加载（torchvision 缺失时 image_processor 应走 PIL 后端）"
+  local gout grc
+  gout=$(MODEL_ROOT="$MODEL_ROOT" LD_PRELOAD="${H3_CUDA_PRELOAD:-}${LD_PRELOAD:+:$LD_PRELOAD}" \
+    "$py" - 2>&1 <<'PYEOF'
+import glob
+import os
+import sys
+
+import h3_proc_fix  # noqa: F401  —— 装 processor 兜底（幂等）
+
+root = os.environ.get("MODEL_ROOT", "")
+if not root or not os.path.isdir(root):
+    print("!! MODEL_ROOT 不可用：%r" % root)
+    sys.exit(1)
+
+# processor 可能在根目录、也可能在 processor/ 或 diffusers/processor/；按配置文件找，不猜
+found = None
+level1 = [root] + sorted(p for p in glob.glob(os.path.join(root, "*")) if os.path.isdir(p))
+for base in level1:
+    for c in [base] + sorted(p for p in glob.glob(os.path.join(base, "*")) if os.path.isdir(p)):
+        if os.path.isfile(os.path.join(c, "processor_config.json")) or os.path.isfile(
+            os.path.join(c, "preprocessor_config.json")
+        ):
+            found = c
+            break
+    if found:
+        break
+if found is None:
+    print("!! 没在 %s 下两层里找到 processor 配置，目录结构：" % root)
+    for n in sorted(os.listdir(root))[:20]:
+        print("      ", n)
+    sys.exit(1)
+print("processor 目录 = %s" % found)
+
+from transformers.models.qwen3_vl.processing_qwen3_vl import Qwen3VLProcessor
+
+proc = Qwen3VLProcessor.from_pretrained(found)
+ip = getattr(proc, "image_processor", None)
+if ip is None:
+    print("!! processor 起来了但 image_processor 是 None —— 兜底没生效")
+    sys.exit(1)
+print("processor OK: %s" % type(proc).__name__)
+print(
+    "  image_processor = %s  merge_size = %s  backend = %s"
+    % (type(ip).__name__, getattr(ip, "merge_size", "?"), getattr(ip, "backend", "?"))
+)
+print("  video_processor = %s" % type(getattr(proc, "video_processor", None)).__name__)
+print("  create_mm_token_type_ids = %s"
+      % ("有" if callable(getattr(proc, "create_mm_token_type_ids", None)) else "缺"))
+
+# encoders.py 就调这一句，keyframes 必须能过
+import numpy as np
+from PIL import Image
+
+arr = (np.arange(64 * 64 * 3, dtype=np.uint8) % 251).reshape(64, 64, 3)
+res = ip(images=[Image.fromarray(arr)], return_tensors="pt")
+for k in ("pixel_values", "image_grid_thw"):
+    if k not in res:
+        print("!! image_processor 输出缺 %s，实际有：%s" % (k, list(res.keys())))
+        sys.exit(1)
+print("  图片预处理 OK: pixel_values=%s image_grid_thw=%s"
+      % (tuple(res["pixel_values"].shape), res["image_grid_thw"].tolist()))
+PYEOF
+)
+  grc=$?
+  if [ $grc -eq 0 ]; then
+    printf '%s\n' "$gout" | sed 's/^/    /'
     return 0
   fi
-  say "  !! 预检失败，根因就在下面几行（末尾 25 行）："
-  printf '%s\n' "$out" | tail -25 | sed 's/^/    /'
-  if printf '%s\n' "$out" | grep -q 'ModuleNotFoundError'; then
-    say "     ↳ 是缺包：把这一行贴我，或确认 $PYDEPS/dyn 里有没有它"
-  fi
-  if printf '%s\n' "$out" | grep -q 'undefined symbol'; then
-    say "     ↳ 是 cu*→HIP 薄壳没覆盖到，把符号名贴我"
-  fi
-  return $rc
+  say "  !! processor 自检失败（这次只花几十秒，不是 40 分钟），根因在下面："
+  printf '%s\n' "$gout" | tail -20 | sed 's/^/    /'
+  return $grc
 }
+
 
 # 骨架指纹：包 + python 版本 + 所有运行时 .so 的 size:mtime。
 # 任何一处重编/换包都会变，变了就老老实实走完整预检。
@@ -3119,6 +3419,12 @@ do_run() {
     }
     echo "$SKFP" > "$AFS/.skel_ok" 2>/dev/null || true
   fi
+
+  # processor 检查只要几十秒，不跟着骨架指纹一起跳过
+  preflight_processor || {
+    say "  !! processor 起不来，中止：这一环断了，加载完 73G 权重照样死在 encoders.py"
+    return 3
+  }
 
   local launcher=$PKG/scripts/run_fl2va_direct.sh
   local patched=0
