@@ -57,6 +57,9 @@ PKG=$AFS/MaiSi-r2
 INFINI=$AFS/infini
 OUT=$AFS/outputs
 PYLIBS=$AFS/pylibs
+# infinicore 的 Python 包目录是上个作业 uid 留下的只读树，写不进去，所以在可写盘上拼一个
+# overlay（包文件 + 编好的 .so），PYTHONPATH 前置它；/dev/shm 优先，装不下再退 AFS
+OVL=${OVL:-/dev/shm/ic_py}
 FIRST_FRAME=$AFS/inputs/first_frame.png
 TS=$(date +%m%d_%H%M%S)
 mkdir -p "$OUT" 2>/dev/null
@@ -830,6 +833,87 @@ ensure_nt_header() {
   [ -s "$d/ninetoothed.h" ] || say "  !! 主位置没写成，靠 patch_inc / include 兜底（若报找不到 ninetoothed.h 就贴日志）"
 }
 
+# _infinicore 的安装位置和 Python 的 import 位置对不上：
+#   xmake install -> python/infinicore/_infinicore*.so
+#   代码里却是   from infinicore.lib import _infinicore  -> 要 python/infinicore/lib/
+# 而 $SRC_IC 是上个作业 uid 的只读树，cp 回去会静默失败（2>/dev/null 把报错吃掉）。
+# 于是把「完整包 + lib/ 下的 .so」拼到可写目录，PYTHONPATH 前置，绕开写权限。
+ensure_infinicore_overlay() {
+  # 单独跑 smoke / full 时没走 pick_ic，这里补一下
+  [ -n "$SRC_IC" ] || SRC_IC=$PKG/src/InfiniCore
+  if [ -z "$IC" ]; then
+    # 有 .so 的树才是真编译树；只认 xmake.lua 会在标记文件丢失时选错
+    if ls "$AFS/ic_work"/python/infinicore/_infinicore*.so >/dev/null 2>&1; then
+      IC=$AFS/ic_work
+    elif [ -f "$AFS/ic_work/xmake.lua" ]; then
+      IC=$AFS/ic_work
+    else
+      IC=$SRC_IC
+    fi
+  fi
+  local so
+  so=$(ls "$IC"/python/infinicore/_infinicore*.so 2>/dev/null | head -1)
+  if [ -z "$so" ]; then
+    so=$(ls "$IC"/build/linux/x86_64/release/_infinicore*.so 2>/dev/null | head -1)
+  fi
+  if [ -z "$so" ]; then
+    # 最后兜底：xmake 的 install 前缀因版本而异，全树找一遍（很慢，只在上面都落空时跑）
+    so=$(find "$IC" -maxdepth 7 -name '_infinicore*.so' 2>/dev/null | head -1)
+  fi
+  if [ -z "$so" ]; then
+    say "  !! 编译树里找不到 _infinicore*.so（$IC）"
+    return 1
+  fi
+
+  # overlay 放哪：优先 /dev/shm（读写快），空间不够就退回 AFS
+  local so_kb avail_kb
+  so_kb=$(( $(stat -c %s "$so" 2>/dev/null || echo 0) / 1024 ))
+  avail_kb=$(df -k /dev/shm 2>/dev/null | awk 'NR==2{print $4}')
+  if [ -n "$avail_kb" ] && [ "$avail_kb" -lt $((so_kb * 4 + 65536)) ]; then
+    say "  /dev/shm 余量 $((avail_kb/1024))MB 放不下 overlay（.so 约 $((so_kb/1024))MB），改放 AFS"
+    OVL=$AFS/ic_py
+  fi
+  if ! mkdir -p "$OVL" 2>/dev/null || ! touch "$OVL/.wtest" 2>/dev/null; then
+    OVL=$AFS/ic_py
+    mkdir -p "$OVL" 2>/dev/null || { say "  !! overlay 目录不可写：$OVL"; return 1; }
+  fi
+  rm -f "$OVL/.wtest" 2>/dev/null
+
+  local fp; fp=$(stat -c '%s-%Y' "$so" 2>/dev/null || echo unknown)
+  if [ "$(cat "$OVL/.fp" 2>/dev/null)" != "$fp" ] || [ ! -f "$OVL/infinicore/__init__.py" ]; then
+    say "  组装 infinicore overlay（包目录只读，在可写副本上补 .so）"
+    rm -rf "$OVL/infinicore.tmp" 2>/dev/null
+    if cp -a "$SRC_IC/python/infinicore" "$OVL/infinicore.tmp" 2>/dev/null; then
+      rm -rf "$OVL/infinicore" 2>/dev/null
+      mv -f "$OVL/infinicore.tmp" "$OVL/infinicore" 2>/dev/null || { rm -rf "$OVL/infinicore.tmp"; return 1; }
+      echo "$fp" > "$OVL/.fp"
+    else
+      rm -rf "$OVL/infinicore.tmp" 2>/dev/null
+      mkdir -p "$OVL/infinicore/lib"
+      say "  !! 包目录复制失败，只补 lib/"
+    fi
+  fi
+  mkdir -p "$OVL/infinicore/lib"
+  cp -f "$so" "$OVL/infinicore/lib/" || return 1
+  export INFINICORE_OVERLAY=$OVL
+  say "  _infinicore.so 就位：$OVL/infinicore/lib/$(basename "$so")  $(ls -lh "$so" 2>/dev/null | awk '{print $5}')"
+
+  # 能写回包目录就写（老路径的保底），写不进去不算错
+  if mkdir -p "$SRC_IC/python/infinicore/lib" 2>/dev/null; then
+    cp -f "$so" "$SRC_IC/python/infinicore/lib/" 2>/dev/null \
+      && cp -f "$so" "$SRC_IC/python/infinicore/" 2>/dev/null \
+      && say "  同时写回包目录（双保险）"
+  fi
+
+  # 缺库要立刻看见，别等 Python 报 import 失败
+  if command -v ldd >/dev/null 2>&1; then
+    local miss
+    miss=$(ldd "$so" 2>/dev/null | grep 'not found' | head -5)
+    [ -n "$miss" ] && { echo "  !! .so 缺动态库（LD_LIBRARY_PATH 要补）："; echo "$miss" | sed 's/^/    /'; }
+  fi
+  return 0
+}
+
 do_build() {
   ensure_pkg
   ensure_deps
@@ -905,7 +989,19 @@ do_build() {
   local STAMP_IOP=$OUT/.stamp_infiniop STAMP_CORE=$OUT/.stamp_infinicore
   local need_iop=1 need_core=1
   if [ -f "$STAMP_IOP" ] && [ -f "$INFINI/lib/libinfiniop.so" ]; then need_iop=0; fi
-  if [ -f "$STAMP_CORE" ] && ls "$IC"/python/infinicore/_infinicore*.so >/dev/null 2>&1; then need_core=0; fi
+  # 产物判据以编译树 $IC 为准（$SRC_IC 是上个作业 uid 的只读树，别拿它当判据）
+  if ls "$IC"/python/infinicore/_infinicore*.so >/dev/null 2>&1; then
+    # stamp 丢了但 .so 还在（11-07 那轮就是：编完但 stamp 没写），直接复用，别再花 280s configure
+    if [ -f "$STAMP_CORE" ]; then
+      need_core=0
+    elif [ "${FORCE_BUILD:-0}" = "1" ]; then
+      say "  FORCE_BUILD=1，忽略已有 _infinicore.so 重新编译"
+    else
+      say "4/4 发现已编译好的 _infinicore.so（无 stamp），直接复用；要强制重编请 FORCE_BUILD=1"
+      touch "$STAMP_CORE" 2>/dev/null
+      need_core=0
+    fi
+  fi
 
   if [ "$need_iop" = "0" ]; then
     say "3/4 跳过编译 infiniop（$INFINI/lib/libinfiniop.so 已装好，跨作业复用）"
@@ -960,22 +1056,21 @@ do_build() {
     return 1
   fi
   xmake install _infinicore 2>&1 | tail -10
-
-  # 编译树在 AFS 的 ic_work 里，do_run 的 PYTHONPATH 指向包目录，得把 .so 拷回去
-  if [ "$IC" != "$SRC_IC" ]; then
-    say "  把 _infinicore 拷回包目录"
-    mkdir -p "$SRC_IC/python/infinicore" 2>/dev/null
-    cp -f "$IC"/python/infinicore/_infinicore*.so "$SRC_IC/python/infinicore/" 2>/dev/null
-  fi
-  ls "$SRC_IC"/python/infinicore/_infinicore*.so >/dev/null 2>&1 && touch "$STAMP_CORE" 2>/dev/null
+  ls "$IC"/python/infinicore/_infinicore*.so >/dev/null 2>&1 && touch "$STAMP_CORE" 2>/dev/null
   fi   # end of need_core
+
+  # 无论本轮编没编，都把 .so 摆到能被 import 的位置（跳过编译时也要建 overlay）
+  ensure_infinicore_overlay || say "  !! overlay 组装失败，import infinicore 大概率还是失败"
 
   echo "  --- 产物核对 ---"
   ls -lh "$INFINI/lib/"*.so 2>/dev/null | head -5
-  find "$SRC_IC/python" -name '_infinicore*.so' 2>/dev/null | head -3
+  # 定点 ls，别 find 整棵只读树（在一次日志里 find+du 白花了 3 分钟）
+  ls -lh "$IC"/python/infinicore/_infinicore*.so 2>/dev/null | head -3
+  ls -lh "$SRC_IC"/python/infinicore/lib/_infinicore*.so 2>/dev/null | head -3
+  ls -lh "$OVL"/infinicore/lib/_infinicore*.so 2>/dev/null | head -2
   [ -f "$INFINI/lib/libinfiniop.so" ] || die "没生成 libinfiniop.so"
-  # 增量树留在 AFS 上，下轮直接接着编；顺便报一下体积给用户判断
-  say "编译树 $IC  $(du -sh "$IC" 2>/dev/null | cut -f1)（下轮增量复用）"
+  # 增量树留在 AFS 上，下轮直接接着编
+  say "编译树 $IC（下轮增量复用）"
   say "build 完成"
 }
 
@@ -989,8 +1084,15 @@ do_run() {
   export PKG SS INFINI_ROOT=$INFINI
   export MODEL_ROOT FIRST_FRAME OUTPUT_DIR=$OUT
   export GPUS=$(seq -s, 0 $((WANT_GPU - 1)))
-  export PYTHONPATH="$PYLIBS:$PKG/src/InfiniCore/python:$PKG/src/InfiniLM/python"
+  # .so 必须在 infinicore/lib/ 下才能被 from infinicore.lib import _infinicore 找到；
+  # 包目录只读，用 overlay 兜住（单独跑 smoke 没走 build 时也在这里补一次）
+  ensure_infinicore_overlay || say "警告：infinicore overlay 没建起来，import 大概率失败"
+  local pyic="$PKG/src/InfiniCore/python"
+  [ -n "$INFINICORE_OVERLAY" ] && pyic="$INFINICORE_OVERLAY:$pyic"
+  export PYTHONPATH="$PYLIBS:$pyic:$PKG/src/InfiniLM/python"
   export LD_LIBRARY_PATH="$INFINI/lib:$DTK_ROOT/lib:/opt/hyhal/lib:/opt/hyhal/lib64:$LD_LIBRARY_PATH"
+  # libinfinicore_cpp_api.so / libinfiniccl.so 只编在 build 目录里，没 install 到 infini/lib
+  [ -d "$IC/build/linux/x86_64/release" ] && LD_LIBRARY_PATH="$IC/build/linux/x86_64/release:$LD_LIBRARY_PATH"
   [ -n "$CUDA_COMPAT" ] && [ -d "$CUDA_COMPAT/lib64" ] && LD_LIBRARY_PATH="$CUDA_COMPAT/lib64:$LD_LIBRARY_PATH"
   export LD_LIBRARY_PATH
 
