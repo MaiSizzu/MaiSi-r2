@@ -914,6 +914,126 @@ ensure_infinicore_overlay() {
   return 0
 }
 
+has_dynsym() {   # $1=so 文件  $2=符号名
+  if command -v nm >/dev/null 2>&1; then
+    nm -D --defined-only "$1" 2>/dev/null | awk '{print $NF}' | grep -qx "$2"
+  elif command -v readelf >/dev/null 2>&1; then
+    readelf -Ws "$1" 2>/dev/null | awk '{print $8}' | grep -qx "$2"
+  elif command -v strings >/dev/null 2>&1; then
+    strings -a "$1" 2>/dev/null | grep -qx "$2"
+  else
+    # 没有 binutils 时，把 ELF 的符号串表按 \0 拆行再比对
+    tr '\0' '\n' < "$1" 2>/dev/null | grep -qx "$2"
+  fi
+}
+
+# 九齿生成的 .cu 内核用 CUDA driver API（cuModuleLoadData / cuLaunchKernel）。
+# libinfiniop.so 链接时没带 -lcuda，这些符号只能在运行时靠 DTK 的 CUDA 兼容层解析，
+# 否则 import infinicore 直接「undefined symbol: cuLaunchKernel」（11-07 08:31 那单）。
+# 重编 infiniop 要 38 分钟，改为 LD_PRELOAD 兼容层，秒级解决。
+ensure_cuda_compat() {
+  [ -n "${CUDA_COMPAT_OK:-}" ] && return 0
+
+  # 先把 libinfiniop.so 里所有未定义的 CUDA driver API 符号列出来
+  # （日志已经确认至少缺 cuLaunchKernel，但很可能不止一个）
+  local need="cuLaunchKernel"
+  local -a cuundef=()
+  if command -v nm >/dev/null 2>&1 && [ -f "$INFINI/lib/libinfiniop.so" ]; then
+    local u s
+    u=$(nm -D --undefined-only "$INFINI/lib/libinfiniop.so" 2>/dev/null | awk '{print $NF}' | grep -E '^cu[A-Z]' | sort -u | head -24)
+    if [ -n "$u" ]; then
+      while IFS= read -r s; do [ -n "$s" ] && cuundef+=("$s"); done <<< "$u"
+      need=${cuundef[0]}
+      say "  libinfiniop.so 未定义的 CUDA 符号 ${#cuundef[@]} 个：$(echo $u | cut -c1-160)"
+    fi
+  fi
+
+  local -a cands=()
+  local d f
+  for d in /opt/hyhal/lib /opt/hyhal/lib64 \
+           "$DTK_ROOT"/cuda/*/lib64 "$DTK_ROOT"/cuda/*/lib \
+           "$DTK_ROOT"/cuda/*/targets/x86_64-linux/lib \
+           "$DTK_ROOT"/cuda/*/compat \
+           "$DTK_ROOT"/lib "$DTK_ROOT"/lib64; do
+    for f in "$d"/libcuda.so "$d"/libcuda.so.1; do
+      [ -e "$f" ] && cands+=("$f")
+    done
+  done
+
+  if [ ${#cands[@]} -eq 0 ]; then
+    say "  !! DTK 里没找到 libcuda.so*；libinfiniop.so 需要 $need，import 会失败"
+    return 1
+  fi
+  say "  探测 CUDA 兼容层（缺 $need），候选 ${#cands[@]} 个"
+
+  local hit="" n=0
+  for f in "${cands[@]}"; do
+    n=$((n+1)); [ $n -gt 10 ] && break
+    if has_dynsym "$f" "$need"; then
+      say "    √ $f 提供 $need"
+      hit=$f
+      break
+    fi
+  done
+
+  if [ -z "$hit" ]; then
+    say "  !! 候选都不提供 $need，已试："
+    printf '    %s\n' "${cands[@]:0:8}"
+    say "  --- 线索（下次直接看这里）---"
+    ldconfig -p 2>/dev/null | grep -i 'libcuda' | head -5 | sed 's/^/    /'
+    find "$DTK_ROOT" -maxdepth 3 -name 'libcuda*' 2>/dev/null | head -8 | sed 's/^/    /'
+    return 1
+  fi
+
+  # 一个符号对上不代表全都对上，把未定义的 cu* 逐个核一遍
+  if [ ${#cuundef[@]} -gt 0 ]; then
+    local miss=""
+    for s in "${cuundef[@]}"; do
+      has_dynsym "$hit" "$s" || miss="$miss $s"
+    done
+    if [ -n "$miss" ]; then
+      say "  !! 这个库还缺符号（import 仍会失败）：$miss"
+    else
+      say "  符号核对：${#cuundef[@]}/${#cuundef[@]} 全覆盖"
+    fi
+  fi
+
+  # 不要 export LD_PRELOAD 到整个 shell：之后每条 ls/sed 都会去加载驱动库，
+  # 既慢又可能因为库的初始化副作用出怪问题。只存起来，启动推理进程时再拼进去。
+  export H3_CUDA_PRELOAD="$hit"
+  say "  预加载库（启动推理时生效）= $hit"
+
+  # Python 侧兜底：sitecustomize 在解释器启动时用 RTLD_GLOBAL 加载兼容层，
+  # 就算 run_fl2va_direct.sh 把 LD_PRELOAD 覆盖掉，符号也已经进全局符号表
+  local ovl="${INFINICORE_OVERLAY:-$OVL}"
+  if [ -d "$ovl" ]; then
+    cat > "$ovl/sitecustomize.py" <<'PYEOF'
+import ctypes, os
+_p = os.environ.get("H3_LIBCUDA", "")
+if _p and os.path.exists(_p):
+    try:
+        ctypes.CDLL(_p, mode=ctypes.RTLD_GLOBAL)
+    except OSError:
+        pass
+PYEOF
+    export H3_LIBCUDA="$hit"
+    say "  Python 侧兜底：$ovl/sitecustomize.py"
+  fi
+  export CUDA_COMPAT_OK=1
+
+  # run_fl2va_direct.sh 里还有一段 PRELOAD=... 会覆盖 LD_PRELOAD，
+  # 那个路径若存在，检查它是否也提供符号；不提供就会把我们的预加载冲掉
+  local sub="$DTK_ROOT/cuda/cuda-12/targets/x86_64-linux/lib/libcuda.so.1"
+  if [ -f "$sub" ]; then
+    if has_dynsym "$sub" "$need"; then
+      say "  子脚本的 PRELOAD 路径也存在且提供 $need，覆盖无害"
+    else
+      say "  !! 子脚本会覆盖 LD_PRELOAD 成 $sub（不提供 $need），需要在子脚本里保留"
+    fi
+  fi
+  return 0
+}
+
 do_build() {
   ensure_pkg
   ensure_deps
@@ -1087,10 +1207,17 @@ do_run() {
   # .so 必须在 infinicore/lib/ 下才能被 from infinicore.lib import _infinicore 找到；
   # 包目录只读，用 overlay 兜住（单独跑 smoke 没走 build 时也在这里补一次）
   ensure_infinicore_overlay || say "警告：infinicore overlay 没建起来，import 大概率失败"
+  ensure_cuda_compat || say "警告：CUDA 兼容层没接上，import 会报 undefined symbol: cuLaunchKernel"
   local pyic="$PKG/src/InfiniCore/python"
   [ -n "$INFINICORE_OVERLAY" ] && pyic="$INFINICORE_OVERLAY:$pyic"
-  export PYTHONPATH="$PYLIBS:$pyic:$PKG/src/InfiniLM/python"
+  # overlay 放最前：既保证用的是新编的 infinicore，也让它的 sitecustomize.py 先生效
+  export PYTHONPATH="$pyic:$PYLIBS:$PKG/src/InfiniLM/python"
   export LD_LIBRARY_PATH="$INFINI/lib:$DTK_ROOT/lib:/opt/hyhal/lib:/opt/hyhal/lib64:$LD_LIBRARY_PATH"
+  # DTK 的 CUDA 兼容层（libcudart / libcuda stub）在 cuda-12/lib64
+  local cudalib
+  for cudalib in "$DTK_ROOT"/cuda/*/lib64 "$DTK_ROOT"/cuda/*/targets/x86_64-linux/lib; do
+    [ -d "$cudalib" ] && LD_LIBRARY_PATH="$cudalib:$LD_LIBRARY_PATH"
+  done
   # libinfinicore_cpp_api.so / libinfiniccl.so 只编在 build 目录里，没 install 到 infini/lib
   [ -d "$IC/build/linux/x86_64/release" ] && LD_LIBRARY_PATH="$IC/build/linux/x86_64/release:$LD_LIBRARY_PATH"
   [ -n "$CUDA_COMPAT" ] && [ -d "$CUDA_COMPAT/lib64" ] && LD_LIBRARY_PATH="$CUDA_COMPAT/lib64:$LD_LIBRARY_PATH"
@@ -1098,7 +1225,12 @@ do_run() {
 
   if [ "$tag" = "smoke" ]; then export SMOKE=1; fi
   say "启动 $tag：GPUS=$GPUS  MODEL_ROOT=$MODEL_ROOT"
-  bash "$PKG/scripts/run_fl2va_direct.sh"
+  if [ -n "${H3_CUDA_PRELOAD:-}" ]; then
+    say "  只为这条命令预加载：$H3_CUDA_PRELOAD"
+    LD_PRELOAD="$H3_CUDA_PRELOAD${LD_PRELOAD:+:$LD_PRELOAD}" bash "$PKG/scripts/run_fl2va_direct.sh"
+  else
+    bash "$PKG/scripts/run_fl2va_direct.sh"
+  fi
   local rc=$?
   echo
   if [ $rc -eq 0 ]; then
