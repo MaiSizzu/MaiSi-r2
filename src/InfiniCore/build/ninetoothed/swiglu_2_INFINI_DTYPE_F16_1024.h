@@ -1,0 +1,12 @@
+#ifndef NINETOOTHED_SWIGLU_2_INFINI_DTYPE_F16_1024_H
+#define NINETOOTHED_SWIGLU_2_INFINI_DTYPE_F16_1024_H
+
+#include "ninetoothed.h"
+
+#ifdef __cplusplus
+extern "C" NineToothedResult launch_swiglu_2_INFINI_DTYPE_F16_1024(NineToothedStream stream, NineToothedTensor ninetoothed_tensor_12, NineToothedTensor ninetoothed_tensor_13, NineToothedTensor ninetoothed_tensor_14);
+#else
+NineToothedResult launch_swiglu_2_INFINI_DTYPE_F16_1024(NineToothedStream stream, NineToothedTensor ninetoothed_tensor_12, NineToothedTensor ninetoothed_tensor_13, NineToothedTensor ninetoothed_tensor_14);
+#endif
+
+#endif

@@ -1,6 +1,10 @@
 # Xmake cache
 .xmake/
-build/
+# build/ 整目录不能忽略：build/ninetoothed 是九齿预生成算子源码，必须入库
+# （其余 build 子目录是编译产物，逐个忽略）
+build/*
+!build/ninetoothed/
+
 python/infinicore/lib/*.so
 
 # MacOS Cache
@@ -22,8 +26,6 @@ __pycache__/
 # Cache
 cache/
 
-# JSON
-*.json
 
 #GGUF
 *.gguf

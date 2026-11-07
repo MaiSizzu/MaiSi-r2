@@ -1,0 +1,12 @@
+#ifndef NINETOOTHED_KV_CACHING_1_INFINI_DTYPE_F16_64_64_H
+#define NINETOOTHED_KV_CACHING_1_INFINI_DTYPE_F16_64_64_H
+
+#include "ninetoothed.h"
+
+#ifdef __cplusplus
+extern "C" NineToothedResult launch_kv_caching_1_INFINI_DTYPE_F16_64_64(NineToothedStream stream, NineToothedTensor ninetoothed_tensor_0, NineToothedTensor ninetoothed_tensor_1, NineToothedTensor ninetoothed_tensor_2, NineToothedTensor ninetoothed_tensor_3, NineToothedTensor ninetoothed_tensor_4);
+#else
+NineToothedResult launch_kv_caching_1_INFINI_DTYPE_F16_64_64(NineToothedStream stream, NineToothedTensor ninetoothed_tensor_0, NineToothedTensor ninetoothed_tensor_1, NineToothedTensor ninetoothed_tensor_2, NineToothedTensor ninetoothed_tensor_3, NineToothedTensor ninetoothed_tensor_4);
+#endif
+
+#endif
