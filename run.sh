@@ -329,6 +329,20 @@ PY
     say "  !! 现在用的是 $(basename "$ZIP")，请把 pylibs-py311-v3.zip 传到个人存储根目录再跑"
   fi
 
+  # 这段校验要真 import torch+diffusers+transformers，在 AFS 上实测 6~7 分钟。
+  # 骨架没变就没必要每单重付：指纹只管「包 + python 版本 + 这段脚本版本」，
+  # 包换了（.ready 变）或我改了校验逻辑（DEPS_VER 变）都会自动失效。
+  local DFP=""
+  DFP=$(printf '%s|%s|%s' "$(cat "$PYLIBS/.ready" 2>/dev/null)" \
+        "$(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null)" \
+        "deps2" | md5sum | cut -c1-16)
+  if [ -f "$PYLIBS/.deps_ok" ] && [ "$(cat "$PYLIBS/.deps_ok" 2>/dev/null)" = "$DFP" ] \
+     && [ -d "$PYLIBS/diffusers" ] && [ -d "$PYLIBS/transformers" ]; then
+    say "校验依赖：指纹 $DFP 与上一单一致（已通过），跳过导入（省约 6 分钟）"
+    DEPS_OK=1
+    return 0
+  fi
+
   say "校验依赖（diffusers 0.42 + transformers 5.x + hub 2.x 是配套的一套）"
   PYTHONPATH="$PYLIBS:$PYTHONPATH" python3 - <<'PY'
 import sys
@@ -376,7 +390,12 @@ if ok_d and ok_h and ok_t:
 sys.exit(3)
 PY
   local rc=$?
-  if [ $rc -eq 0 ]; then say "依赖全部就绪"; DEPS_OK=1; return 0; fi
+  if [ $rc -eq 0 ]; then
+    say "依赖全部就绪"
+    echo "$DFP" > "$PYLIBS/.deps_ok" 2>/dev/null || true
+    DEPS_OK=1
+    return 0
+  fi
   die "依赖校验失败（见上）"
 }
 
@@ -2961,7 +2980,9 @@ preflight_import() {
   # 第二步：真 import。只 import 不加载权重，$tag 越大越接近真实路径
   say "  预检 2/2：import infinicore → _infinicore → _infinilm → infinilm → multimodal"
   local pl
-  pl=$(printf '%s' "${H3_CUDA_PRELOAD:-}" | tr ':' '\n' | while read -r x; do [ -n "$x" ] && basename "$x"; done | tr '\n' ' ')
+  # 注意：不能用 `while read` 处理——最后一个条目没有换行符时 read 返回非 0，
+  # 循环体不执行，列表会静默少一项（13:22 那单就把 libh3ccl.so 漏掉了，看着像没预加载）
+  pl=$(printf '%s' "${H3_CUDA_PRELOAD:-}" | tr ':' '\n' | sed 's#.*/##' | tr '\n' ' ')
   say "    环境 INFINI_ROOT=${INFINI_ROOT:-?}  LD_PRELOAD=${pl:-<空>}  /dev/shm 余量 $(shm_free_mb)MB"
   local out
   out=$(LD_PRELOAD="${H3_CUDA_PRELOAD:-}${LD_PRELOAD:+:$LD_PRELOAD}" "$py" - 2>&1 <<'PYEOF'
@@ -2991,6 +3012,22 @@ PYEOF
     say "     ↳ 是 cu*→HIP 薄壳没覆盖到，把符号名贴我"
   fi
   return $rc
+}
+
+# 骨架指纹：包 + python 版本 + 所有运行时 .so 的 size:mtime。
+# 任何一处重编/换包都会变，变了就老老实实走完整预检。
+skel_fp() {
+  local s="v1|$(cat "$PYLIBS/.ready" 2>/dev/null)|$(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null)"
+  local f
+  for f in "$INFINI/lib/libinfiniop.so" "$INFINI/lib/libinfiniccl.so" \
+           "$AFS/cudashim/libh3cuda.so" "$AFS/cudashim/libh3ccl.so" \
+           "$PKG/src/InfiniLM/python/infinilm/lib/_infinilm.cpython-311-x86_64-linux-gnu.so"; do
+    [ -f "$f" ] && s="$s|$(basename "$f"):$(stat -c '%s:%Y' "$f" 2>/dev/null)"
+  done
+  for f in "$AFS"/ic_py/infinicore/lib/_infinicore*.so; do
+    [ -f "$f" ] && s="$s|ic:$(stat -c '%s:%Y' "$f" 2>/dev/null)"
+  done
+  printf '%s' "$s" | md5sum | cut -c1-16
 }
 
 do_run() {
@@ -3068,12 +3105,20 @@ do_run() {
 
   if [ "$tag" = "smoke" ]; then export SMOKE=1; fi
 
-  # 便宜的自检：只 import，不加载权重。挂了 200 秒内就看到根因，不用等整条管线
+  # 便宜的自检：只 import，不加载权重。挂了 5 分钟内就看到根因，不用等整条管线。
+  # 但这段导入本身要 5 分钟，而启动器马上会把同一批模块再导一遍——骨架没变就跳过。
   free_shm
-  preflight_import || {
-    say "  !! 预检没过，直接中止：这条链已经断了，再加载 73G 权重也必然失败，不烧这 40 分钟"
-    return 3
-  }
+  local SKFP=""
+  SKFP=$(skel_fp)
+  if [ -f "$AFS/.skel_ok" ] && [ "$(cat "$AFS/.skel_ok" 2>/dev/null)" = "$SKFP" ]; then
+    say "  预检：骨架指纹 $SKFP 与上一单一致（已导入通过），跳过（省约 5 分钟）"
+  else
+    preflight_import || {
+      say "  !! 预检没过，直接中止：这条链已经断了，再加载 73G 权重也必然失败，不烧这 40 分钟"
+      return 3
+    }
+    echo "$SKFP" > "$AFS/.skel_ok" 2>/dev/null || true
+  fi
 
   local launcher=$PKG/scripts/run_fl2va_direct.sh
   local patched=0
