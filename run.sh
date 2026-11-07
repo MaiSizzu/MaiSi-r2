@@ -1376,21 +1376,147 @@ do_build() {
 }
 
 # 只跑 import、不加载权重：这一关过了才值得花 50 分钟跑管线
+# =============================================================================
+# InfiniLM 的 python 扩展 _infinilm —— 九齿只编了 InfiniCore，这一层从来没编过
+#   examples/minimax_h3.py → infinilm.cache → from infinilm.lib import _infinilm
+#   xmake.lua 把 .so 装到 python/infinilm/，而 lib/__init__.py 只往
+#   python/infinilm/lib/ 里找（和 _infinicore 同一个坑），所以两头都补。
+# =============================================================================
+ensure_infinilm() {
+  [ -n "${INFINILM_OK:-}" ] && return 0
+  local src=$PKG/src/InfiniLM
+  local root=$AFS/il_root
+  local ovl=${INFINICORE_OVERLAY:-$OVL}
+  [ -d "$src/csrc" ] || { say "  !! 找不到 $src/csrc"; return 1; }
+  [ -d "$ovl" ] || { say "  !! overlay 没建好，先跑 ensure_infinicore_overlay"; return 1; }
+
+  # 1) 之前编过就直接摆到位（overlay 若在 /dev/shm，每轮要重新拷一次）
+  local so
+  so=$(ls "$root"/_infinilm*.so 2>/dev/null | head -1)
+  if [ -n "$so" ] && [ -f "$OUT/.stamp_infinilm" ]; then
+    cp -f "$so" "$ovl/" 2>/dev/null
+    mkdir -p "$src/python/infinilm/lib" 2>/dev/null && cp -f "$so" "$src/python/infinilm/lib/" 2>/dev/null
+    export INFINILM_OK=1 INFINILM_LIBDIR=$ovl
+    say "  _infinilm.so 复用：$(basename "$so")  $(ls -lh "$so" 2>/dev/null | awk '{print $5}')"
+    return 0
+  fi
+
+  # 2) 准备一个 InfiniLM 能直接用的 INFINI_ROOT：四个库 + 头文件
+  #    （InfiniCore 的 install 只装了 infiniop/infinirt，cpp_api 和 infiniccl 留在 build 里）
+  mkdir -p "$root/lib" "$root/include" 2>/dev/null || { say "  !! $root 不可写"; return 1; }
+  local l f base item
+  for l in libinfinicore_cpp_api.so libinfiniop.so libinfinirt.so libinfiniccl.so; do
+    [ -f "$root/lib/$l" ] && continue
+    if [ -f "$INFINI/lib/$l" ]; then cp -f "$INFINI/lib/$l" "$root/lib/" 2>/dev/null && continue; fi
+    f=$(ls "$IC/build/linux/x86_64/release/$l" 2>/dev/null | head -1)
+    if [ -z "$f" ]; then f=$(find "$IC/build" -maxdepth 4 -name "$l" 2>/dev/null | head -1); fi
+    if [ -n "$f" ]; then cp -f "$f" "$root/lib/" 2>/dev/null; else say "  !! 缺 $l（链接 _infinilm 会失败）"; fi
+  done
+  for item in infinicore infiniop infinicore.h infinicore.hpp infiniop.h infinirt.h infiniccl.h; do
+    [ -e "$root/include/$item" ] && continue
+    for base in "$INFINI/include" "$IC/include"; do
+      if [ -e "$base/$item" ]; then
+        ln -sfn "$base/$item" "$root/include/$item" 2>/dev/null
+        # 少数文件系统不让建软链，退化成拷贝（头文件很小）
+        [ -e "$root/include/$item" ] || cp -a "$base/$item" "$root/include/" 2>/dev/null
+        break
+      fi
+    done
+    [ -e "$root/include/$item" ] || say "  !! 缺头文件 $item"
+  done
+
+  # 3) 编译目录：包目录可写就就地编（对象落在 AFS，下轮增量）；
+  #    不可写才用软链树（源码只读、只让 build/ 落盘），避免再花 6 分钟拷 1752 个文件
+  local work=$src
+  if ! touch "$src/.wtest" 2>/dev/null; then
+    work=$AFS/il_work
+    mkdir -p "$work" 2>/dev/null
+    for f in "$src"/*; do
+      base=$(basename "$f")
+      [ "$base" = build ] && continue
+      ln -sfn "$f" "$work/$base" 2>/dev/null
+    done
+    # 软链建不起来（少数文件系统不支持）就老老实实拷一份源码树
+    if [ ! -e "$work/xmake.lua" ]; then
+      say "  软链不可用，改拷源码树（22MB / 1752 个文件，会慢几分钟）"
+      cp -a "$src"/. "$work"/ 2>/dev/null
+      rm -rf "$work/build" 2>/dev/null
+    fi
+    say "  包目录只读，改用软链编译树 $work"
+  else
+    rm -f "$src/.wtest" 2>/dev/null
+  fi
+
+  ensure_xmake
+  local j=${IL_JOBS:-48}
+  local pb=$PYLIBS/pybind11/include
+  [ -d "$pb" ] || pb=$PYLIBS/pybind11/pybind11/include
+  [ -d "$pb" ] || { say "  !! 缺 pybind11 头文件（$pb），先跑 setup"; return 1; }
+  local pyinc
+  pyinc=$(python3 -c "import sysconfig;print(sysconfig.get_paths()['include'])" 2>/dev/null)
+  [ -n "$pyinc" ] && [ -d "$pyinc" ] || pyinc=/usr/local/include/python3.11
+
+  local log=$OUT/build_infinilm_$(date +%H%M%S).log
+  say "  编译 _infinilm（$work，$j 并发，日志 $(basename "$log")）"
+  (
+    cd "$work" || exit 1
+    export INFINI_ROOT=$root
+    export PYBIND11_INCLUDE=$pb
+    export PYTHON_INCLUDE=$pyinc
+    export XMAKE_GLOBALDIR=${XMAKE_GLOBALDIR:-$AFS/.xmake_global}
+    mkdir -p "$XMAKE_GLOBALDIR" 2>/dev/null
+    xmake f -y -p linux -a x86_64 2>&1
+    exec xmake build -y -j"$j" _infinilm 2>&1
+  ) > "$log" 2>&1 &
+  local pid=$! p rc=0
+  # 每 20 秒报一次进度：既不让日志一片空白，也不刷屏
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 20
+    kill -0 "$pid" 2>/dev/null || break
+    p=$(grep -oE '\[ *[0-9]+%\]' "$log" 2>/dev/null | tail -1)
+    [ -n "$p" ] && say "    _infinilm 进度 $p"
+  done
+  wait "$pid"; rc=$?
+  if [ $rc -ne 0 ]; then
+    say "  !! _infinilm 编译失败 rc=$rc，最后 20 行："
+    tail -20 "$log" 2>/dev/null | sed 's/^/    /'
+    return 1
+  fi
+
+  so=$(ls "$work"/build/linux/x86_64/release/_infinilm*.so 2>/dev/null | head -1)
+  [ -z "$so" ] && so=$(find "$work/build" -maxdepth 5 -name '_infinilm*.so' 2>/dev/null | head -1)
+  if [ -z "$so" ]; then
+    say "  !! 编完却找不到 _infinilm*.so，最后 20 行："
+    tail -20 "$log" 2>/dev/null | sed 's/^/    /'
+    return 1
+  fi
+
+  cp -f "$so" "$root/" 2>/dev/null
+  cp -f "$so" "$ovl/" 2>/dev/null || say "  !! 拷进 overlay 失败：$ovl"
+  mkdir -p "$src/python/infinilm/lib" 2>/dev/null && cp -f "$so" "$src/python/infinilm/lib/" 2>/dev/null
+  touch "$OUT/.stamp_infinilm" 2>/dev/null
+  export INFINILM_OK=1 INFINILM_LIBDIR=$ovl
+  say "  _infinilm.so 就位：$ovl/$(basename "$so")  $(ls -lh "$so" 2>/dev/null | awk '{print $5}')"
+  return 0
+}
+
 preflight_import() {
   local py=python3
   command -v python3 >/dev/null 2>&1 || py=python
-  say "  预检：import infinicore + _infinicore（不加载权重）"
+  say "  预检：import infinicore + _infinicore + _infinilm（不加载权重）"
   local out
   out=$(LD_PRELOAD="${H3_CUDA_PRELOAD:-}${LD_PRELOAD:+:$LD_PRELOAD}" "$py" - 2>&1 <<'PYEOF'
 import infinicore
 print("infinicore OK:", infinicore.__file__)
 from infinicore.lib import _infinicore
 print("_infinicore OK:", _infinicore.__file__)
+from infinilm.lib import _infinilm
+print("_infinilm OK:", _infinilm.__file__)
 PYEOF
 )
   local rc=$?
   if [ $rc -eq 0 ]; then
-    printf '%s\n' "$out" | tail -3 | sed 's/^/    /'
+    printf '%s\n' "$out" | tail -4 | sed 's/^/    /'
   else
     say "  !! 预检失败，根因就在下面几行："
     printf '%s\n' "$out" | tail -6 | sed 's/^/    /'
@@ -1412,6 +1538,7 @@ do_run() {
   # 包目录只读，用 overlay 兜住（单独跑 smoke 没走 build 时也在这里补一次）
   ensure_infinicore_overlay || say "警告：infinicore overlay 没建起来，import 大概率失败"
   ensure_cuda_compat || say "警告：CUDA→HIP 薄壳没建好，import 仍会报 undefined symbol"
+  ensure_infinilm || say "警告：_infinilm 没编出来，import infinilm.cache 会失败"
   local pyic="$PKG/src/InfiniCore/python"
   [ -n "$INFINICORE_OVERLAY" ] && pyic="$INFINICORE_OVERLAY:$pyic"
   # overlay 放最前：既保证用的是新编的 infinicore，也让它的 sitecustomize.py 先生效
@@ -1424,6 +1551,8 @@ do_run() {
   done
   # libinfinicore_cpp_api.so / libinfiniccl.so 只编在 build 目录里，没 install 到 infini/lib
   [ -d "$IC/build/linux/x86_64/release" ] && LD_LIBRARY_PATH="$IC/build/linux/x86_64/release:$LD_LIBRARY_PATH"
+  # _infinilm.so 链接的是 $AFS/il_root/lib 里那四个库
+  [ -d "$AFS/il_root/lib" ] && LD_LIBRARY_PATH="$AFS/il_root/lib:$LD_LIBRARY_PATH"
   [ -n "$CUDA_COMPAT" ] && [ -d "$CUDA_COMPAT/lib64" ] && LD_LIBRARY_PATH="$CUDA_COMPAT/lib64:$LD_LIBRARY_PATH"
   export LD_LIBRARY_PATH
 
