@@ -927,110 +927,268 @@ has_dynsym() {   # $1=so 文件  $2=符号名
   fi
 }
 
-# 九齿生成的 .cu 内核用 CUDA driver API（cuModuleLoadData / cuLaunchKernel）。
-# libinfiniop.so 链接时没带 -lcuda，这些符号只能在运行时靠 DTK 的 CUDA 兼容层解析，
-# 否则 import infinicore 直接「undefined symbol: cuLaunchKernel」（11-07 08:31 那单）。
-# 重编 infiniop 要 38 分钟，改为 LD_PRELOAD 兼容层，秒级解决。
+# 九齿生成的算子源码直接调 CUDA driver API（cuModuleLoadData / cuModuleGetFunction
+# / cuDeviceGetAttribute / cuLaunchKernel / cuCtxGetId ...），但它内嵌的 kernel 其实是
+# ELF(AMDGPU) code object —— 这套代码本来就是给 HIP 用的，只是符号名写成了 cu*。
+# 于是 libinfiniop.so 留下 9 个未定义符号；其中 cuCtxGetId 连标准 CUDA 都没有，
+# DTK 的 libcuda 更不会提供（11-07 08:41 那单：8 个候选一个都不给）。
+# 重编 infiniop 要 38 分钟，所以运行时补一层薄壳，把这 9 个符号全部转发到 HIP。
+
+build_cuda_shim() {
+  local dir=$AFS/cudashim
+  local src=$dir/h3_cuda_shim.c
+  local so=$dir/libh3cuda.so
+  mkdir -p "$dir" 2>/dev/null || { say "  !! 建不了目录 $dir"; return 1; }
+
+  cat > "$src" <<'CEOF'
+/* h3_cuda_shim.c —— 把九齿生成算子用到的 CUDA driver API 转发到 HIP。
+ * 不包含任何头文件：不依赖 cuda.h 也不依赖 hip 头，任何 cc 都能编。 */
+typedef int CUresult;
+typedef void *CUmodule;
+typedef void *CUfunction;
+typedef void *CUcontext;
+typedef void *CUstream;
+
+extern int hipModuleLoadData(void **module, const void *image);
+extern int hipModuleGetFunction(void **func, void *module, const char *name);
+extern int hipModuleUnload(void *module);
+extern int hipModuleLaunchKernel(void *f,
+                                 unsigned int gx, unsigned int gy, unsigned int gz,
+                                 unsigned int bx, unsigned int by, unsigned int bz,
+                                 unsigned int shared, void *stream,
+                                 void **params, void **extra);
+extern int hipDeviceGetAttribute(int *pi, int attr, int dev);
+extern int hipGetDevice(int *dev);
+extern int hipFuncSetCacheConfig(void *func, int config);
+extern int hipFuncSetAttribute(void *func, int attr, int value);
+extern const char *hipGetErrorString(int err);
+
+CUresult cuInit(unsigned int flags) { (void)flags; return 0; }
+
+CUresult cuModuleLoadData(CUmodule *mod, const void *image) {
+  return hipModuleLoadData((void **)mod, image);
+}
+
+CUresult cuModuleGetFunction(CUfunction *fn, CUmodule mod, const char *name) {
+  return hipModuleGetFunction((void **)fn, mod, name);
+}
+
+CUresult cuModuleUnload(CUmodule mod) { return hipModuleUnload(mod); }
+
+CUresult cuLaunchKernel(CUfunction f,
+                        unsigned int gx, unsigned int gy, unsigned int gz,
+                        unsigned int bx, unsigned int by, unsigned int bz,
+                        unsigned int shared, CUstream stream,
+                        void **params, void **extra) {
+  return hipModuleLaunchKernel(f, gx, gy, gz, bx, by, bz, shared, stream, params, extra);
+}
+
+CUresult cuDeviceGetAttribute(int *pi, int attr, int dev) {
+  int v = -1;
+  if (!pi) return 1;
+  if (hipDeviceGetAttribute(&v, attr, dev) == 0 && v > 0) { *pi = v; return 0; }
+  /* CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN：DCU 上按 64 KB 兜底 */
+  *pi = (attr == 97) ? 65536 : 0;
+  return 0;
+}
+
+CUresult cuGetErrorString(int code, const char **str) {
+  const char *s = hipGetErrorString(code);
+  if (str) *str = s ? s : "unknown";
+  return 0;
+}
+
+/* 缓存 / 动态共享内存偏好只是 hint，失败也不该让主流程 exit */
+CUresult cuFuncSetCacheConfig(CUfunction f, int config) {
+  (void)hipFuncSetCacheConfig(f, config);
+  return 0;
+}
+
+CUresult cuFuncSetAttribute(CUfunction f, int attr, int value) {
+  (void)hipFuncSetAttribute(f, attr, value);
+  return 0;
+}
+
+/* 非标准 API（Triton 拿它当 kernel cache 的 key）。按当前设备给一个稳定 id。 */
+CUresult cuCtxGetId(CUcontext ctx, unsigned long long *id) {
+  int dev = 0;
+  (void)ctx;
+  if (hipGetDevice(&dev) != 0 || dev < 0) dev = 0;
+  if (id) *id = (unsigned long long)dev + 1ULL;
+  return 0;
+}
+CEOF
+
+  local cc=""
+  local c
+  for c in gcc cc clang "$DTK_ROOT/bin/clang" "$DTK_ROOT/bin/clang++"; do
+    [ -n "$c" ] || continue
+    if command -v "$c" >/dev/null 2>&1; then cc=$c; break; fi
+  done
+  if [ -z "$cc" ]; then
+    say "  !! 找不到 C 编译器（gcc / cc / clang 都没有），shim 编不出来"
+    return 1
+  fi
+
+  # 找得到 libamdhip64 就显式链上（记 DT_NEEDED + rpath）；
+  # 找不到就先留未定义符号，运行时由进程里已加载的 HIP 解析
+  local hipd="" hiplib="" f
+  for f in "$DTK_ROOT"/lib/libamdhip64.so "$DTK_ROOT"/lib64/libamdhip64.so \
+           "$DTK_ROOT"/hip/lib/libamdhip64.so "$DTK_ROOT"/hip/lib64/libamdhip64.so \
+           /opt/hyhal/lib/libamdhip64.so /opt/hyhal/lib64/libamdhip64.so; do
+    if [ -e "$f" ]; then hiplib=$f; hipd=$(dirname "$f"); break; fi
+  done
+  if [ -z "$hiplib" ]; then
+    f=$(ls "$DTK_ROOT"/lib/libamdhip64.so.* 2>/dev/null | head -1)
+    [ -n "$f" ] && { hiplib=$f; hipd=$(dirname "$f"); }
+  fi
+  if [ -z "$hiplib" ] && command -v ldconfig >/dev/null 2>&1; then
+    f=$(ldconfig -p 2>/dev/null | awk '/libamdhip64\.so/{print $NF; exit}')
+    [ -n "$f" ] && [ -e "$f" ] && { hiplib=$f; hipd=$(dirname "$f"); }
+  fi
+
+  local -a larg=()
+  [ -n "$hiplib" ] && larg=("$hiplib" "-Wl,-rpath,$hipd")
+
+  say "  编译 CUDA→HIP 薄壳（$(basename "$cc")）"
+  if ! "$cc" -O2 -fPIC -shared -o "$so" "$src" ${larg[@]+"${larg[@]}"} 2>"$dir/cc.log"; then
+    say "  !! shim 编译失败："
+    tail -8 "$dir/cc.log" 2>/dev/null | sed 's/^/    /'
+    return 1
+  fi
+  [ -s "$so" ] || { say "  !! shim 没产出（$so 为空）"; return 1; }
+  H3_CUDA_SHIM=$so
+  if [ -n "$hipd" ]; then
+    say "  shim 就位：$so  $(ls -lh "$so" 2>/dev/null | awk '{print $5}')（链接 $hipd/libamdhip64）"
+  else
+    say "  shim 就位：$so  $(ls -lh "$so" 2>/dev/null | awk '{print $5}')（HIP 符号留待运行时解析）"
+  fi
+
+  # 两道便宜的自检：依赖库是否找得到、ld.so 能否真的把它加载起来
+  if command -v ldd >/dev/null 2>&1; then
+    local miss
+    miss=$(ldd "$so" 2>/dev/null | grep 'not found' | head -4)
+    if [ -n "$miss" ]; then
+      say "  !! shim 缺依赖库："
+      printf '%s\n' "$miss" | sed 's/^/    /'
+    fi
+  fi
+  if [ -x /bin/true ]; then
+    if LD_PRELOAD="$so" /bin/true 2>"$dir/preload.log"; then
+      say "  预加载自检通过（ld.so 能加载，依赖齐）"
+    else
+      say "  !! 预加载自检失败："
+      tail -4 "$dir/preload.log" 2>/dev/null | sed 's/^/    /'
+    fi
+  fi
+  return 0
+}
+
+# 子脚本里那行 `[ -f "$PRELOAD" ] && export LD_PRELOAD=$PRELOAD` 会把我们的 shim
+# 直接顶掉。包目录是上个作业 uid 的只读树（改不了），所以在可写目录生成一份打过
+# 补丁的副本：shim 放最前、DTK libcuda 跟在后面；PYTHONPATH 改成追加，保证
+# overlay（带 lib/_infinicore.so 的那份）优先于只读包目录。
+patch_fl2va_launcher() {
+  local src=$PKG/scripts/run_fl2va_direct.sh
+  local dst=$AFS/ic_py/run_fl2va_patched.sh
+  [ -f "$src" ] || return 1
+  [ -n "${H3_CUDA_SHIM:-}" ] || return 1
+  mkdir -p "$AFS/ic_py" 2>/dev/null || return 1
+
+  local line out="" n=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      '[ -f "$PRELOAD" ] && export LD_PRELOAD=$PRELOAD')
+        out+='H3_SHIM='"$H3_CUDA_SHIM"$'\n'
+        out+='[ -f "$PRELOAD" ] || PRELOAD='$'\n'
+        out+='export LD_PRELOAD="$H3_SHIM${PRELOAD:+:$PRELOAD}${LD_PRELOAD:+:$LD_PRELOAD}"'$'\n'
+        n=$((n+1))
+        ;;
+      'export PYTHONPATH=$SS/InfiniCore/python:$SS/InfiniLM/python:$PYTHONPATH')
+        out+='export PYTHONPATH="$PYTHONPATH:$SS/InfiniCore/python:$SS/InfiniLM/python"'$'\n'
+        n=$((n+1))
+        ;;
+      *)
+        out+=$line$'\n'
+        ;;
+    esac
+  done < "$src"
+
+  if [ $n -lt 2 ]; then
+    say "  !! 启动器结构和预期不一致（只替换了 $n 处），不冒险，放弃打补丁"
+    return 1
+  fi
+  printf '%s' "$out" > "$dst" 2>/dev/null || return 1
+  chmod +x "$dst" 2>/dev/null
+  if ! bash -n "$dst" 2>/dev/null; then
+    say "  !! 补丁后的启动器语法不过，放弃"
+    rm -f "$dst"
+    return 1
+  fi
+  H3_LAUNCHER=$dst
+  say "  启动器已打补丁：$dst（shim 前置 / PYTHONPATH 追加）"
+  return 0
+}
+
 ensure_cuda_compat() {
   [ -n "${CUDA_COMPAT_OK:-}" ] && return 0
 
-  # 先把 libinfiniop.so 里所有未定义的 CUDA driver API 符号列出来
-  # （日志已经确认至少缺 cuLaunchKernel，但很可能不止一个）
-  local need="cuLaunchKernel"
+  # 1) 把 libinfiniop.so 里未定义的 cu* 符号列全（以实际符号表为准，不猜）
   local -a cuundef=()
+  local s u
   if command -v nm >/dev/null 2>&1 && [ -f "$INFINI/lib/libinfiniop.so" ]; then
-    local u s
-    u=$(nm -D --undefined-only "$INFINI/lib/libinfiniop.so" 2>/dev/null | awk '{print $NF}' | grep -E '^cu[A-Z]' | sort -u | head -24)
+    u=$(nm -D --undefined-only "$INFINI/lib/libinfiniop.so" 2>/dev/null \
+        | awk '{print $NF}' | grep -E '^cu[A-Z]' | sort -u)
     if [ -n "$u" ]; then
       while IFS= read -r s; do [ -n "$s" ] && cuundef+=("$s"); done <<< "$u"
-      need=${cuundef[0]}
-      say "  libinfiniop.so 未定义的 CUDA 符号 ${#cuundef[@]} 个：$(echo $u | cut -c1-160)"
     fi
   fi
-
-  local -a cands=()
-  local d f
-  for d in /opt/hyhal/lib /opt/hyhal/lib64 \
-           "$DTK_ROOT"/cuda/*/lib64 "$DTK_ROOT"/cuda/*/lib \
-           "$DTK_ROOT"/cuda/*/targets/x86_64-linux/lib \
-           "$DTK_ROOT"/cuda/*/compat \
-           "$DTK_ROOT"/lib "$DTK_ROOT"/lib64; do
-    for f in "$d"/libcuda.so "$d"/libcuda.so.1; do
-      [ -e "$f" ] && cands+=("$f")
-    done
-  done
-
-  if [ ${#cands[@]} -eq 0 ]; then
-    say "  !! DTK 里没找到 libcuda.so*；libinfiniop.so 需要 $need，import 会失败"
-    return 1
-  fi
-  say "  探测 CUDA 兼容层（缺 $need），候选 ${#cands[@]} 个"
-
-  local hit="" n=0
-  for f in "${cands[@]}"; do
-    n=$((n+1)); [ $n -gt 10 ] && break
-    if has_dynsym "$f" "$need"; then
-      say "    √ $f 提供 $need"
-      hit=$f
-      break
-    fi
-  done
-
-  if [ -z "$hit" ]; then
-    say "  !! 候选都不提供 $need，已试："
-    printf '    %s\n' "${cands[@]:0:8}"
-    say "  --- 线索（下次直接看这里）---"
-    ldconfig -p 2>/dev/null | grep -i 'libcuda' | head -5 | sed 's/^/    /'
-    find "$DTK_ROOT" -maxdepth 3 -name 'libcuda*' 2>/dev/null | head -8 | sed 's/^/    /'
-    return 1
-  fi
-
-  # 一个符号对上不代表全都对上，把未定义的 cu* 逐个核一遍
   if [ ${#cuundef[@]} -gt 0 ]; then
-    local miss=""
-    for s in "${cuundef[@]}"; do
-      has_dynsym "$hit" "$s" || miss="$miss $s"
-    done
-    if [ -n "$miss" ]; then
-      say "  !! 这个库还缺符号（import 仍会失败）：$miss"
-    else
-      say "  符号核对：${#cuundef[@]}/${#cuundef[@]} 全覆盖"
-    fi
+    say "  libinfiniop.so 未定义的 CUDA 符号 ${#cuundef[@]} 个：$(printf '%s ' "${cuundef[@]}" | cut -c1-220)"
   fi
 
-  # 不要 export LD_PRELOAD 到整个 shell：之后每条 ls/sed 都会去加载驱动库，
-  # 既慢又可能因为库的初始化副作用出怪问题。只存起来，启动推理进程时再拼进去。
-  export H3_CUDA_PRELOAD="$hit"
-  say "  预加载库（启动推理时生效）= $hit"
+  # 2) 编薄壳
+  if ! build_cuda_shim; then
+    say "  !! 薄壳没建起来，import 仍会报 undefined symbol"
+    return 1
+  fi
 
-  # Python 侧兜底：sitecustomize 在解释器启动时用 RTLD_GLOBAL 加载兼容层，
-  # 就算 run_fl2va_direct.sh 把 LD_PRELOAD 覆盖掉，符号也已经进全局符号表
+  # 3) 逐个核对覆盖（缺哪个一眼看到，不用再猜）
+  local miss=""
+  for s in ${cuundef[@]+"${cuundef[@]}"}; do
+    has_dynsym "$H3_CUDA_SHIM" "$s" || miss="$miss $s"
+  done
+  if [ -n "$miss" ]; then
+    say "  !! 薄壳还缺这些符号（需要补实现）：$miss"
+  elif [ ${#cuundef[@]} -gt 0 ]; then
+    say "  符号核对：${#cuundef[@]}/${#cuundef[@]} 全覆盖"
+  fi
+
+  # 4) 预加载：只放我们的薄壳。DTK 的 libcuda.so.1 由子脚本自己按原样加上，
+  #    顺序上正好排在薄壳后面（同名符号我们优先）
+  H3_CUDA_PRELOAD="$H3_CUDA_SHIM"
+  export H3_CUDA_PRELOAD
+
+  # 5) Python 侧兜底：万一子脚本把 LD_PRELOAD 冲掉，解释器启动时也用
+  #    RTLD_GLOBAL 把薄壳拉进全局符号表
   local ovl="${INFINICORE_OVERLAY:-$OVL}"
   if [ -d "$ovl" ]; then
     cat > "$ovl/sitecustomize.py" <<'PYEOF'
 import ctypes, os
-_p = os.environ.get("H3_LIBCUDA", "")
-if _p and os.path.exists(_p):
-    try:
-        ctypes.CDLL(_p, mode=ctypes.RTLD_GLOBAL)
-    except OSError:
-        pass
+for _p in os.environ.get("H3_CUDA_PRELOAD", "").split(":"):
+    if _p and os.path.exists(_p):
+        try:
+            ctypes.CDLL(_p, mode=ctypes.RTLD_GLOBAL)
+        except OSError:
+            pass
 PYEOF
-    export H3_LIBCUDA="$hit"
-    say "  Python 侧兜底：$ovl/sitecustomize.py"
+    say "  Python 兜底：$ovl/sitecustomize.py"
   fi
-  export CUDA_COMPAT_OK=1
 
-  # run_fl2va_direct.sh 里还有一段 PRELOAD=... 会覆盖 LD_PRELOAD，
-  # 那个路径若存在，检查它是否也提供符号；不提供就会把我们的预加载冲掉
-  local sub="$DTK_ROOT/cuda/cuda-12/targets/x86_64-linux/lib/libcuda.so.1"
-  if [ -f "$sub" ]; then
-    if has_dynsym "$sub" "$need"; then
-      say "  子脚本的 PRELOAD 路径也存在且提供 $need，覆盖无害"
-    else
-      say "  !! 子脚本会覆盖 LD_PRELOAD 成 $sub（不提供 $need），需要在子脚本里保留"
-    fi
-  fi
+  # 6) 打补丁启动器，保证 LD_PRELOAD 里薄壳始终在最前
+  patch_fl2va_launcher || say "  警告：启动器没补丁成，只能靠 sitecustomize 兜底"
+
+  export CUDA_COMPAT_OK=1
   return 0
 }
 
@@ -1194,6 +1352,29 @@ do_build() {
   say "build 完成"
 }
 
+# 只跑 import、不加载权重：这一关过了才值得花 50 分钟跑管线
+preflight_import() {
+  local py=python3
+  command -v python3 >/dev/null 2>&1 || py=python
+  say "  预检：import infinicore + _infinicore（不加载权重）"
+  local out
+  out=$(LD_PRELOAD="${H3_CUDA_PRELOAD:-}${LD_PRELOAD:+:$LD_PRELOAD}" "$py" - 2>&1 <<'PYEOF'
+import infinicore
+print("infinicore OK:", infinicore.__file__)
+from infinicore.lib import _infinicore
+print("_infinicore OK:", _infinicore.__file__)
+PYEOF
+)
+  local rc=$?
+  if [ $rc -eq 0 ]; then
+    printf '%s\n' "$out" | tail -3 | sed 's/^/    /'
+  else
+    say "  !! 预检失败，根因就在下面几行："
+    printf '%s\n' "$out" | tail -6 | sed 's/^/    /'
+  fi
+  return $rc
+}
+
 do_run() {
   local tag=$1
   [ -f "$PKG/scripts/run_fl2va_direct.sh" ] || die "缺 run_fl2va_direct.sh"
@@ -1207,7 +1388,7 @@ do_run() {
   # .so 必须在 infinicore/lib/ 下才能被 from infinicore.lib import _infinicore 找到；
   # 包目录只读，用 overlay 兜住（单独跑 smoke 没走 build 时也在这里补一次）
   ensure_infinicore_overlay || say "警告：infinicore overlay 没建起来，import 大概率失败"
-  ensure_cuda_compat || say "警告：CUDA 兼容层没接上，import 会报 undefined symbol: cuLaunchKernel"
+  ensure_cuda_compat || say "警告：CUDA→HIP 薄壳没建好，import 仍会报 undefined symbol"
   local pyic="$PKG/src/InfiniCore/python"
   [ -n "$INFINICORE_OVERLAY" ] && pyic="$INFINICORE_OVERLAY:$pyic"
   # overlay 放最前：既保证用的是新编的 infinicore，也让它的 sitecustomize.py 先生效
@@ -1224,12 +1405,24 @@ do_run() {
   export LD_LIBRARY_PATH
 
   if [ "$tag" = "smoke" ]; then export SMOKE=1; fi
+
+  # 便宜的自检：只 import，不加载权重。挂了 200 秒内就看到根因，不用等整条管线
+  preflight_import || say "  预检没过，仍继续启动完整管线（便于对比完整报错）"
+
+  local launcher=$PKG/scripts/run_fl2va_direct.sh
+  local patched=0
+  if [ -n "${H3_LAUNCHER:-}" ] && [ -f "$H3_LAUNCHER" ]; then launcher=$H3_LAUNCHER; patched=1; fi
   say "启动 $tag：GPUS=$GPUS  MODEL_ROOT=$MODEL_ROOT"
-  if [ -n "${H3_CUDA_PRELOAD:-}" ]; then
+  say "  启动器 = $launcher"
+  if [ $patched -eq 1 ]; then
+    # 补丁版自己会 export LD_PRELOAD（shim 最前），父进程不必再设，
+    # 免得 launcher 里每条 ls/sed 都去加载一遍 HIP 运行时
+    bash "$launcher"
+  elif [ -n "${H3_CUDA_PRELOAD:-}" ]; then
     say "  只为这条命令预加载：$H3_CUDA_PRELOAD"
-    LD_PRELOAD="$H3_CUDA_PRELOAD${LD_PRELOAD:+:$LD_PRELOAD}" bash "$PKG/scripts/run_fl2va_direct.sh"
+    LD_PRELOAD="$H3_CUDA_PRELOAD${LD_PRELOAD:+:$LD_PRELOAD}" bash "$launcher"
   else
-    bash "$PKG/scripts/run_fl2va_direct.sh"
+    bash "$launcher"
   fi
   local rc=$?
   echo
