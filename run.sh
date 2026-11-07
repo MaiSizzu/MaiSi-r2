@@ -1812,15 +1812,11 @@ H3CCLEOF
 write_proc_fix() {
   local dyn=$PYDEPS/dyn entry=$AFS/ic_py/h3_entry.py
   mkdir -p "$dyn" "$AFS/ic_py" 2>/dev/null || return 1
-  local stamp="procfix1"
-  if [ "$(cat "$dyn/.procfix_stamp" 2>/dev/null)" = "$stamp" ] \
-     && [ -s "$dyn/h3_proc_fix.py" ] && [ -s "$entry" ]; then
-    H3_ENTRY_PY=$entry
-    export H3_ENTRY_PY
-    return 0
-  fi
+  # 用内容比对而不是版本号：先前写死 "procfix1"，补丁内容改了但 AFS 上还是老文件，
+  # 结果新 run.sh 跑起来用的还是旧补丁。改成先写临时文件再 cmp，内容一变就换。
+  local tmpd=$dyn/.h3_proc_fix.new tmpe=$AFS/ic_py/.h3_entry.new changed=0
 
-  cat > "$dyn/h3_proc_fix.py" <<'PYEOF'
+  cat > "$tmpd" <<'PYEOF'
 """让 MiniMax-H3 的 processor 在缺少 torchvision 的容器里也能加载。
 
 transformers 给 Qwen3-VL 的 image processor 配了两套后端：
@@ -1829,22 +1825,40 @@ transformers 给 Qwen3-VL 的 image processor 配了两套后端：
                   "pil":        "Qwen2VLImageProcessorPil"})
 
 没有 torchvision 时 AutoImageProcessor 自动挑 pil 那套（Qwen2VLImageProcessorPil，
-只依赖 PIL + numpy），MiniMax-H3 的 keyframes 走的正是它，能力完全够用。
+PilBackend 是纯 PIL + numpy，一行 tvF 都不碰），MiniMax-H3 的 keyframes 走的正是它。
 
-真正卡死的是同级的 video_processor：define_import_structure 按文件名把
-video_processing_*.py 整类标成依赖 (vision, torch, torchvision)，torchvision 一缺，
-Qwen3VLVideoProcessor 就退化成 Dummy，AutoVideoProcessor.from_pretrained 直接抛
-ImportError。而 ProcessorMixin._get_arguments_from_pretrained 是逐个加载子组件的，
-video_processor 一抛，整个 Qwen3VLProcessor 都构造不出来，diffusers 于是把
-components.processor 置成 None，随后 encoders.py 里
+真正卡死的是一整条和 video_processor 有关的链：
 
-    vision = processor.image_processor(images=..., return_tensors="pt")
+1. `transformers/__init__.py` 里
 
-就 AttributeError: 'NoneType' object has no attribute 'image_processor'。
+       try:
+           if not is_torchvision_available():
+               raise OptionalDependencyNotAvailable()
+       except OptionalDependencyNotAvailable:
+           from .utils import dummy_torchvision_objects
+       else:
+           _import_structure["video_processing_utils"] = [...]
 
-MiniMax-H3 全程只喂 keyframes（图片），从不走视频分支，所以这里让
-AutoVideoProcessor 加载失败时返回一个空壳：它满足 isinstance(VideoProcessorMixin)
-（ProcessorMixin 的类型校验要过），真被调用（preprocess 视频）才报错。
+   于是 `transformers.VideoProcessorMixin` 是个 Dummy，hasattr 直接 False。
+
+2. `base_file_requirements` 又按文件名把 `video_processing_*.py` 整类标成依赖
+   (vision, torch, torchvision)，所以 `transformers.VIDEO_PROCESSOR_MAPPING` 也是
+   Dummy。
+
+3. `ProcessorMixin.check_argument_for_proper_class` 拿字符串 "VideoProcessorMixin"
+   去 `get_possibly_dynamic_module()`：第一步 hasattr 落空（第 1 条），就退到
+   lookup_locations 里翻 `*_MAPPING._extra_content`，翻到 VIDEO_PROCESSOR_MAPPING
+   时直接
+
+       AttributeError: type object 'VIDEO_PROCESSOR_MAPPING' has no attribute '_extra_content'
+
+   整个 Qwen3VLProcessor 就此构造失败，components.processor 变 None，
+   encoders.py:282 的 processor.image_processor(...) 跟着炸。
+
+MiniMax-H3 全程只喂 keyframes（图片），从不走视频分支，所以这里做三件事：
+  a. 把真·VideoProcessorMixin 塞回 transformers 顶层，让 hasattr 能命中；
+  b. AutoVideoProcessor 加载失败时返回一个继承真类的空壳；
+  c. 类型校验遇到空壳直接用真类判断，不再走那条会崩的查询链。
 
 本模块 import 即生效，幂等。
 """
@@ -1856,11 +1870,15 @@ import logging
 _LOG = logging.getLogger("h3.procfix")
 
 _APPLIED = False
+_VPM = None  # transformers.video_processing_utils.VideoProcessorMixin 的真类
 
 
 def _null_video_processor_class():
     """造一个只占位的 video_processor 类（继承 VideoProcessorMixin 才能过类型校验）。"""
+    global _VPM
     from transformers.video_processing_utils import VideoProcessorMixin
+
+    _VPM = VideoProcessorMixin
 
     class NullVideoProcessor(VideoProcessorMixin):
         # Qwen2-VL / Qwen3-VL 的 patch 参数；processor 侧只读 merge_size
@@ -1888,6 +1906,44 @@ def _null_video_processor_class():
     return NullVideoProcessor
 
 
+def _promote_video_processor_names():
+    """把被 torchvision 挡在门外的 video_processing 名字补回 transformers 顶层。
+
+    `get_possibly_dynamic_module()` 的第一步就是 hasattr(transformers, name)。把真对象
+    写进模块 __dict__ 之后，这一步直接命中，不会再退到会崩的 lookup_locations。
+
+    每个名字单独取，缺一个不影响别的（真实环境里 BaseVideoProcessor 是有的，但这里
+    不赌——少补一个也只是少一层保险，不该让整条兜底链跟着废掉）。
+    """
+    import transformers
+
+    aliases = {}
+    for name in ("VideoProcessorMixin", "BaseVideoProcessor"):
+        try:
+            module = __import__("transformers.video_processing_utils", fromlist=[name])
+            aliases[name] = getattr(module, name)
+        except Exception:  # noqa: BLE001
+            continue
+    try:
+        from transformers.models.auto.video_processing_auto import VIDEO_PROCESSOR_MAPPING
+
+        aliases["VIDEO_PROCESSOR_MAPPING"] = VIDEO_PROCESSOR_MAPPING
+    except Exception:  # noqa: BLE001
+        pass
+
+    names = []
+    for name, obj in aliases.items():
+        if transformers.__dict__.get(name) is obj:
+            continue
+        try:
+            setattr(transformers, name, obj)
+            names.append(name)
+        except Exception:  # noqa: BLE001
+            pass
+    if names:
+        _LOG.info("[h3] 已补回 transformers 顶层：%s", ", ".join(names))
+
+
 def _patch_auto_video_processor(null_cls):
     from transformers.models.auto.video_processing_auto import AutoVideoProcessor
 
@@ -1912,9 +1968,19 @@ def _patch_auto_video_processor(null_cls):
     AutoVideoProcessor.from_pretrained = classmethod(from_pretrained)
 
 
-def _patch_none_argument():
-    """ProcessorMixin 的类型校验不接受 None，这里给 None 放行（兜底，正常走不到）。"""
+def _patch_argument_check():
+    """类型校验遇到 video_processor 直接用真类判断，绕开会崩的查询链（见模块说明 3）。"""
+    global _VPM
     from transformers.processing_utils import ProcessorMixin
+
+    if _VPM is None:
+        # 空壳类那步万一没成，这里自己再取一次，别让校验补丁跟着废
+        try:
+            from transformers.video_processing_utils import VideoProcessorMixin
+
+            _VPM = VideoProcessorMixin
+        except Exception:  # noqa: BLE001
+            pass
 
     current = ProcessorMixin.check_argument_for_proper_class
     if getattr(current, "_h3_patched", False):
@@ -1924,6 +1990,8 @@ def _patch_none_argument():
     def check_argument_for_proper_class(self, argument_name, argument):
         if argument is None:
             return None
+        if _VPM is not None and isinstance(argument, _VPM):
+            return _VPM
         return original(self, argument_name, argument)
 
     check_argument_for_proper_class._h3_patched = True
@@ -1931,6 +1999,7 @@ def _patch_none_argument():
 
 
 def apply() -> bool:
+    """每一步独立成败：任何一步挂了，剩下的照装，绝不整体放弃。"""
     global _APPLIED
     if _APPLIED:
         return True
@@ -1941,22 +2010,32 @@ def apply() -> bool:
         print(f"[h3] 没装上 processor 兜底：import transformers 失败 {type(exc).__name__}: {exc}", flush=True)
         return False
 
-    try:
-        _patch_auto_video_processor(_null_video_processor_class())
-        _patch_none_argument()
-    except Exception as exc:  # noqa: BLE001
-        print(f"[h3] 没装上 processor 兜底：{type(exc).__name__}: {exc}", flush=True)
-        return False
+    def step(label, fn):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[h3] {label}没装上：{type(exc).__name__}: {exc}", flush=True)
+            return None
 
-    _APPLIED = True
-    print("[h3] processor 兜底已装：video_processor 缺失时挂空壳，image_processor 走 PIL 后端", flush=True)
-    return True
+    null_cls = step("空壳类", _null_video_processor_class)
+    step("顶层名字补全", _promote_video_processor_names)
+    if null_cls is not None:
+        step("AutoVideoProcessor 兜底", lambda: _patch_auto_video_processor(null_cls))
+    step("类型校验兜底", _patch_argument_check)
+
+    installed = null_cls is not None and getattr(_VPM, "__name__", "") == "VideoProcessorMixin"
+    _APPLIED = installed
+    if installed:
+        print("[h3] processor 兜底已装：video_processor 挂空壳，image_processor 走 PIL 后端", flush=True)
+    else:
+        print("[h3] processor 兜底只装上一部分，processor 可能仍然起不来", flush=True)
+    return installed
 
 
 apply()
 PYEOF
 
-  cat > "$entry" <<'PYEOF'
+  cat > "$tmpe" <<'PYEOF'
 """examples/minimax_h3.py 的薄包装：先给 transformers 装好 processor 兜底，再原样跑入口。
 
 FL2VA 的入口是 `python examples/minimax_h3.py fl2va --model-path=...`，而补丁必须赶在
@@ -1989,11 +2068,26 @@ sys.argv[0] = _script
 runpy.run_path(_script, run_name="__main__")
 PYEOF
 
+  # 内容一致就不动（省得每单都刷新 mtime）；不一致说明补丁升级了，换掉
+  if cmp -s "$tmpd" "$dyn/h3_proc_fix.py" 2>/dev/null; then
+    rm -f "$tmpd"
+  else
+    mv -f "$tmpd" "$dyn/h3_proc_fix.py" 2>/dev/null && changed=1
+  fi
+  if cmp -s "$tmpe" "$entry" 2>/dev/null; then
+    rm -f "$tmpe"
+  else
+    mv -f "$tmpe" "$entry" 2>/dev/null && changed=1
+  fi
+
   [ -s "$dyn/h3_proc_fix.py" ] && [ -s "$entry" ] || { say "  !! processor 兜底脚本没写出来"; return 1; }
-  echo "$stamp" > "$dyn/.procfix_stamp" 2>/dev/null
   H3_ENTRY_PY=$entry
   export H3_ENTRY_PY
-  say "  processor 兜底就位：$dyn/h3_proc_fix.py + $entry"
+  if [ $changed -eq 1 ]; then
+    say "  processor 兜底已更新：$dyn/h3_proc_fix.py + $entry"
+  else
+    say "  processor 兜底已是最新（内容未变）"
+  fi
   return 0
 }
 
