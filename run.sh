@@ -1128,6 +1128,651 @@ CEOF
   return 0
 }
 
+
+# TP>1 必须有 allreduce，但集群上编 InfiniCore 没开 --ccl：
+# infiniccl_cuda.h 走 INFINICCL_DEVICE_API_NOOP(cuda)，infinicclCommInitAll 固定返回
+# 5 = INFINI_STATUS_DEVICE_TYPE_NOT_SUPPORTED（11:45 那单的 Error Code 5 就是它）。
+# 开 --ccl 要 RCCL + nccl.h + 重编十几分钟，节点上也没有 rccl。
+# 换条路：InfiniLM 的 TP 是单进程 + 每卡一个 RankWorker 线程，八张卡在同一地址空间，
+# 所以用「线程栅栏 + hipMemcpy 汇聚」自己实现 allreduce，再用 LD_PRELOAD 覆盖同名符号。
+build_ccl_shim() {
+  local dir=$AFS/cudashim
+  local src=$dir/h3_ccl.c
+  local so=$dir/libh3ccl.so
+  mkdir -p "$dir" 2>/dev/null || { say "  !! 建不了目录 $dir"; return 1; }
+
+  cat > "$src" <<'H3CCLEOF'
+/* ====================================================================
+ * h3_ccl.c —— 自实现 InfiniCCL（线程栅栏 + hipMemcpy 汇聚）
+ *
+ * 背景：集群上编 InfiniCore 没开 --ccl，于是 infinicclCommInitAll 是
+ *       INFINICCL_DEVICE_API_NOOP 的空壳，固定返回 5
+ *       (INFINI_STATUS_DEVICE_TYPE_NOT_SUPPORTED)，TP=8 根本起不来。
+ *       开 --ccl 需要 RCCL + nccl.h + 重编十几分钟，节点上也没有 rccl。
+ *
+ * 思路：InfiniLM 的 TP 是「单进程 + 每张卡一个 RankWorker 线程」，
+ *       八张卡在同一地址空间、同一进程里并发跑 forward。所以集合通信
+ *       不需要网络，只要一条线程栅栏 + hipMemcpy 就够了：
+ *         各 rank 把自己的数据 D2H 到 host staging → 一个线程归约求和
+ *         → H2D 写回所有 rank 的 recvbuf。语义与 ncclAllReduce 一致：
+ *         阻塞、返回时 recvbuf 已就绪。
+ *
+ * 用 LD_PRELOAD 覆盖 libinfiniccl.so 里的同名符号（PLT 解析，先加载者优先）。
+ * ==================================================================== */
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+#ifdef _WIN32
+#include <windows.h>
+typedef CRITICAL_SECTION h3_mx;
+typedef CONDITION_VARIABLE h3_cv;
+#define H3_MX_INIT(m) InitializeCriticalSection(m)
+#define H3_MX_LOCK(m) EnterCriticalSection(m)
+#define H3_MX_UNLOCK(m) LeaveCriticalSection(m)
+#define H3_CV_INIT(c) InitializeConditionVariable(c)
+#define H3_CV_WAIT(c, m) do { while (!SleepConditionVariableCS((c), (m), INFINITE)) {} } while (0)
+#define H3_CV_BCAST(c) WakeAllConditionVariable(c)
+static long h3_xchg(volatile long *p, long v) { return InterlockedExchange(p, v); }
+static void h3_yield(void) { SwitchToThread(); }
+#else
+#include <pthread.h>
+#include <sched.h>
+typedef pthread_mutex_t h3_mx;
+typedef pthread_cond_t h3_cv;
+#define H3_MX_INIT(m) pthread_mutex_init((m), NULL)
+#define H3_MX_LOCK(m) pthread_mutex_lock(m)
+#define H3_MX_UNLOCK(m) pthread_mutex_unlock(m)
+#define H3_CV_INIT(c) pthread_cond_init((c), NULL)
+#define H3_CV_WAIT(c, m) pthread_cond_wait((c), (m))
+#define H3_CV_BCAST(c) pthread_cond_broadcast(c)
+static long h3_xchg(volatile long *p, long v) { return __atomic_exchange_n(p, v, __ATOMIC_ACQ_REL); }
+static void h3_yield(void) { sched_yield(); }
+#endif
+
+/* 只声明用到的 HIP 入口，不依赖 hip 头文件（编译环境干净） */
+extern int hipSetDevice(int dev);
+extern int hipDeviceSynchronize(void);
+extern int hipStreamSynchronize(void *stream);
+extern int hipMemcpy(void *dst, const void *src, size_t n, int kind);
+extern int hipGetDevice(int *dev);
+
+#define H3_MAXR 16
+#define H3_CHUNK 262144ULL /* 每次搬运的元素上限，控制 host 缓冲在几 MB */
+
+#define H3_D2H 2
+#define H3_H2D 1
+
+/* 日志：直接写 stderr，不经 printf 缓冲 */
+static void h3_log(const char *s) {
+    fputs(s, stderr);
+    fflush(stderr);
+}
+
+static char *h3_num(char *p, long v) {
+    char t[24];
+    int k = 0, i;
+    unsigned long long u;
+    if (v < 0) {
+        *p++ = '-';
+        u = (unsigned long long)(-v);
+    } else {
+        u = (unsigned long long)v;
+    }
+    do {
+        t[k++] = (char)('0' + (int)(u % 10ULL));
+        u /= 10ULL;
+    } while (u && k < 22);
+    for (i = k - 1; i >= 0; --i) *p++ = t[i];
+    return p;
+}
+
+static void h3_say(const char *a, long v, const char *b) {
+    char buf[256];
+    char *p = buf;
+    const char *q;
+    for (q = a; q && *q && p < buf + 200; ++q) *p++ = *q;
+    p = h3_num(p, v);
+    for (q = b; q && *q && p < buf + 240; ++q) *p++ = *q;
+    *p++ = '\n';
+    *p = 0;
+    h3_log(buf);
+}
+
+typedef struct {
+    int n;                     /* rank 数 */
+    int ids[H3_MAXR];          /* 各 rank 的 device id */
+    h3_mx mu;
+    h3_cv cv;
+    unsigned long long gen;    /* 集合通信代次 */
+    int arrive;                /* 本轮已到达的 rank 数 */
+    size_t count[H3_MAXR];
+    int dtype[H3_MAXR];
+    void *sbuf[H3_MAXR];
+    void *rbuf[H3_MAXR];
+    int op[H3_MAXR];
+    void *stage[H3_MAXR];      /* host 暂存，每 rank 一块 */
+    size_t cap;                /* stage 容量（元素数） */
+    size_t esz_cap;            /* 分配时的元素字节数 */
+    unsigned long long seq;
+    unsigned long long moved;  /* 累计搬运字节（用于报进度） */
+} h3grp;
+
+typedef struct {
+    int device_type;
+    int device_id;
+    int rank;
+    int world;
+    h3grp *grp;
+} h3comm;
+
+static int h3_esz(int t) {
+    switch (t) {
+    case 1: case 2: case 3: case 7: return 1;              /* BYTE BOOL I8 U8 */
+    case 4: case 8: case 12: case 19: return 2;           /* I16 U16 F16 BF16 */
+    case 5: case 9: case 13: return 4;                    /* I32 U32 F32 */
+    case 6: case 10: case 14: return 8;                   /* I64 U64 F64 */
+    default: return 0;
+    }
+}
+
+/* ---- 半精度/bf16 与 float 互换（无 F16C 依赖，纯整数位运算） ---- */
+static float h3_h2f(unsigned short h) {
+    unsigned int s = (h >> 15) & 1u, e = (h >> 10) & 0x1fu, m = h & 0x3ffu;
+    union { unsigned int u; float f; } x;
+    if (e == 0x1fu) {
+        x.u = (s << 31) | 0x7f800000u | (m << 13);
+        return x.f;
+    }
+    if (e == 0) {
+        double d = (double)m / 16777216.0;
+        return (float)(s ? -d : d);
+    }
+    x.u = ((e - 15u + 127u) << 23) | (m << 13);
+    return (s ? -1.0f : 1.0f) * x.f;
+}
+
+static unsigned short h3_f2h(float f) {
+    union { unsigned int u; float f; } x;
+    unsigned int u, s, e, m, r, rem;
+    int exp, shift;
+    x.f = f;
+    u = x.u;
+    s = (u >> 31) & 1u;
+    e = (u >> 23) & 0xffu;
+    m = u & 0x7fffffu;
+    if (e == 0xffu) {
+        if (m == 0) return (unsigned short)((s << 15) | 0x7c00u);
+        return (unsigned short)((s << 15) | 0x7e00u);
+    }
+    if (e == 0) return (unsigned short)(s << 15); /* 下溢到 0（够用） */
+    exp = (int)e - 127 + 15;
+    if (exp >= 0x1f) return (unsigned short)((s << 15) | 0x7c00u);
+    if (exp <= 0) {
+        if (exp < -10) return (unsigned short)(s << 15);
+        m |= 0x800000u;
+        shift = 14 - exp;
+        r = m >> shift;
+        rem = m & ((1u << shift) - 1u);
+        if (rem > (1u << (shift - 1)) || (rem == (1u << (shift - 1)) && (r & 1u))) r += 1u;
+        return (unsigned short)((s << 15) | r);
+    }
+    r = ((unsigned int)exp << 10) | (m >> 13);
+    rem = m & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (r & 1u))) r += 1u;
+    return (unsigned short)((s << 15) | r);
+}
+
+static float h3_bf2f(unsigned short v) {
+    union { unsigned int u; float f; } x;
+    x.u = ((unsigned int)v) << 16;
+    return x.f;
+}
+
+static unsigned short h3_f2bf(float f) {
+    union { unsigned int u; float f; } x;
+    unsigned int u;
+    x.f = f;
+    u = x.u;
+    if ((u & 0x7fffffffu) > 0x7f800000u) return (unsigned short)((u >> 16) | 0x0040u);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return (unsigned short)(u >> 16);
+}
+
+/* 归约：把 W 份 stage 逐元素求和（AVG 再除以 W），结果写回 stage[0]。
+ * 中间用 double 累加，避免 fp16 累加 8 次就掉精度；
+ * 写回时按目标 dtype 打包（fp16/bf16 要转回位型，不能直接强转）。 */
+static double h3_id_d(double a) { return a; }
+static double h3_wr_f16(double a) { return (double)h3_f2h((float)a); }
+static double h3_wr_bf16(double a) { return (double)h3_f2bf((float)a); }
+
+static int h3_reduce(h3grp *g, size_t n, int dtype, int op) {
+    int W = g->n, i;
+    size_t j;
+    const double sc = (op == 4) ? 1.0 / (double)(W > 0 ? W : 1) : 1.0;
+
+#define H3_CASE(TY, RD, WR)                                          \
+    do {                                                             \
+        const TY *s_[H3_MAXR];                                       \
+        TY *o_ = (TY *)g->stage[0];                                  \
+        for (i = 0; i < W; ++i) s_[i] = (const TY *)g->stage[i];     \
+        for (j = 0; j < n; ++j) {                                    \
+            double a_ = 0.0;                                         \
+            for (i = 0; i < W; ++i) a_ += RD((double)s_[i][j]);      \
+            o_[j] = (TY)WR(a_ * sc);                                 \
+        }                                                            \
+    } while (0)
+
+    switch (dtype) {
+    case 12: H3_CASE(unsigned short, h3_h2f, h3_wr_f16); break;  /* F16 */
+    case 19: H3_CASE(unsigned short, h3_bf2f, h3_wr_bf16); break; /* BF16 */
+    case 13: H3_CASE(float, h3_id_d, h3_id_d); break;
+    case 1: case 2: case 7: H3_CASE(unsigned char, h3_id_d, h3_id_d); break;
+    case 3: H3_CASE(signed char, h3_id_d, h3_id_d); break;
+    case 4: H3_CASE(short, h3_id_d, h3_id_d); break;
+    case 8: H3_CASE(unsigned short, h3_id_d, h3_id_d); break;
+    case 5: H3_CASE(int, h3_id_d, h3_id_d); break;
+    case 9: H3_CASE(unsigned int, h3_id_d, h3_id_d); break;
+    case 6: H3_CASE(long long, h3_id_d, h3_id_d); break;
+    case 10: H3_CASE(unsigned long long, h3_id_d, h3_id_d); break;
+    case 14: H3_CASE(double, h3_id_d, h3_id_d); break;
+    default: return 10;
+    }
+    return 0;
+}
+
+#undef H3_CASE
+
+/* stage 缓冲按「元素数×8 字节」分配：任何 dtype 都塞得下，且只增不减 */
+static int h3_ensure(h3grp *g, size_t chunk) {
+    int i;
+    size_t bytes;
+    if (g->cap >= chunk) return 0;
+    bytes = chunk * 8u + 64u;
+    for (i = 0; i < g->n; ++i) {
+        if (g->stage[i]) free(g->stage[i]);
+        g->stage[i] = malloc(bytes);
+        if (!g->stage[i]) {
+            g->cap = 0;
+            h3_say("[h3ccl] !! 分配汇聚缓冲失败 chunk=", (long)chunk, "");
+            return 1;
+        }
+    }
+    /* 归约结果统一由 stage[0] 向各 rank 广播 */
+    g->cap = chunk;
+    return 0;
+}
+
+static int h3_collective(h3grp *g, int rank, size_t count, int dtype, int op,
+                         void *sbuf, void *rbuf, void *stream, int kind) {
+    size_t esz = (size_t)h3_esz(dtype);
+    size_t chunk, off, n;
+    int i;
+    unsigned long long mygen;
+
+    if (!esz) {
+        h3_say("[h3ccl] !! 不支持的 dtype=", (long)dtype, "");
+        return 10;
+    }
+    if (count == 0) return 0;
+
+    /* 本卡算完，sendbuf 才是最终值 */
+    if (stream) hipStreamSynchronize(stream);
+    else hipDeviceSynchronize();
+
+    chunk = count > (size_t)H3_CHUNK ? (size_t)H3_CHUNK : count;
+
+    H3_MX_LOCK(&g->mu);
+
+    mygen = g->gen;
+    g->count[rank] = count;
+    g->dtype[rank] = dtype;
+    g->op[rank] = op;
+    g->sbuf[rank] = sbuf;
+    g->rbuf[rank] = rbuf;
+
+    if (++g->arrive < g->n) {
+        while (g->gen == mygen) H3_CV_WAIT(&g->cv, &g->mu);
+        H3_MX_UNLOCK(&g->mu);
+        return 0;
+    }
+
+    /* 最后一个到达的当 leader：所有 rank 的数据都已登记，独占做完归约 */
+    g->arrive = 0;
+    if (h3_ensure(g, chunk) != 0) {
+        g->gen++;
+        H3_CV_BCAST(&g->cv);
+        H3_MX_UNLOCK(&g->mu);
+        return 1;
+    }
+
+    for (off = 0; off < count; off += chunk) {
+        int src = (kind == 0) ? 0 : (kind - 1); /* 归约结果是 stage[0]；广播只有 root 有效 */
+        n = count - off;
+        if (n > chunk) n = chunk;
+        for (i = 0; i < g->n; ++i) {
+            if (kind != 0 && i != src) continue;
+            hipSetDevice(g->ids[i]);
+            hipMemcpy(g->stage[i], (char *)g->sbuf[i] + off * esz, n * esz, H3_D2H);
+        }
+        if (kind == 0) {
+            if (h3_reduce(g, n, dtype, op) != 0) break;
+        }
+        for (i = 0; i < g->n; ++i) {
+            hipSetDevice(g->ids[i]);
+            hipMemcpy((char *)g->rbuf[i] + off * esz, g->stage[src], n * esz, H3_H2D);
+        }
+        g->moved += (unsigned long long)(n * esz) * (unsigned long long)(g->n * 2);
+    }
+    if (g->n > 0) hipSetDevice(g->ids[rank]);
+
+    g->seq++;
+    if (g->seq <= 3 || (g->seq % 500ULL) == 0) {
+        char buf[256];
+        char *p = buf;
+        const char *q;
+        for (q = "[h3ccl] allreduce #"; *q; ++q) *p++ = *q;
+        p = h3_num(p, (long)g->seq);
+        for (q = "  count="; *q; ++q) *p++ = *q;
+        p = h3_num(p, (long)count);
+        for (q = "  dtype="; *q; ++q) *p++ = *q;
+        p = h3_num(p, (long)dtype);
+        for (q = "  ranks="; *q; ++q) *p++ = *q;
+        p = h3_num(p, (long)g->n);
+        *p++ = '\n';
+        *p = 0;
+        h3_log(buf);
+    }
+
+    g->gen++;
+    H3_CV_BCAST(&g->cv);
+    H3_MX_UNLOCK(&g->mu);
+    return 0;
+}
+
+static h3grp *h3_new_group(int n, const int *ids) {
+    h3grp *g = (h3grp *)calloc(1, sizeof(h3grp));
+    int i;
+    if (!g) return NULL;
+    g->n = n;
+    for (i = 0; i < n; ++i) g->ids[i] = ids ? ids[i] : i;
+    H3_MX_INIT(&g->mu);
+    H3_CV_INIT(&g->cv);
+    return g;
+}
+
+/* ---------------- 对外 C API（覆盖 libinfiniccl 同名符号） ---------------- */
+
+int infinicclCommInitAll(int device_type, void **comms, int ndevice, const int *device_ids) {
+    h3grp *g;
+    h3comm *c;
+    char buf[256];
+    char *p;
+    const char *q;
+    int i;
+
+    if (!comms || ndevice <= 0 || ndevice > H3_MAXR) {
+        h3_say("[h3ccl] !! commInitAll 参数不对 ndevice=", (long)ndevice, "");
+        return 3;
+    }
+    g = h3_new_group(ndevice, device_ids);
+    if (!g) return 1;
+    for (i = 0; i < ndevice; ++i) {
+        c = (h3comm *)calloc(1, sizeof(h3comm));
+        if (!c) return 1;
+        c->device_type = device_type;
+        c->device_id = g->ids[i];
+        c->rank = i;
+        c->world = ndevice;
+        c->grp = g;
+        comms[i] = (void *)c;
+    }
+    p = buf;
+    for (q = "[h3ccl] commInitAll 自实现 n="; *q; ++q) *p++ = *q;
+    p = h3_num(p, (long)ndevice);
+    for (q = "  device_type="; *q; ++q) *p++ = *q;
+    p = h3_num(p, (long)device_type);
+    for (q = "  ids="; *q; ++q) *p++ = *q;
+    for (i = 0; i < ndevice && p < buf + 230; ++i) {
+        p = h3_num(p, (long)g->ids[i]);
+        *p++ = ' ';
+    }
+    *p++ = '\n';
+    *p = 0;
+    h3_log(buf);
+    return 0;
+}
+
+int infinicclGetCommName(void *comm, char *comm_name, size_t comm_name_size) {
+    h3comm *c = (h3comm *)comm;
+    char tmp[48];
+    char *p = tmp;
+    const char *q;
+    size_t n;
+    if (!c || !comm_name) return 4;
+    for (q = "infiniccl-h3-"; *q; ++q) *p++ = *q;
+    p = h3_num(p, (long)c->device_id);
+    *p = 0;
+    n = (size_t)(p - tmp);
+    if (n + 1 > comm_name_size) return 3;
+    memcpy(comm_name, tmp, n + 1);
+    return 0;
+}
+
+int infinicclCommDestroy(void *comm) {
+    if (!comm) return 4;
+    /* group 由各 comm 共享，进程退出时统一回收 */
+    free(comm);
+    return 0;
+}
+
+int infinicclGroupStart(void *comm) {
+    (void)comm;
+    return 0;
+}
+
+int infinicclGroupEnd(void *comm) {
+    (void)comm;
+    return 0;
+}
+
+int infinicclAllReduce(void *sendbuf, void *recvbuf, size_t count, int datatype,
+                       int op, void *comm, void *stream) {
+    h3comm *c = (h3comm *)comm;
+    if (!c || !c->grp) return 4;
+    if (op != 0 && op != 4) {
+        h3_say("[h3ccl] !! 只支持 SUM/AVG，收到 op=", (long)op, "");
+        return 2;
+    }
+    return h3_collective(c->grp, c->rank, count, datatype, op, sendbuf, recvbuf, stream, 0);
+}
+
+int infinicclBroadcast(const void *sendbuf, void *recvbuf, size_t count, int datatype,
+                       int root, void *comm, void *stream) {
+    h3comm *c = (h3comm *)comm;
+    if (!c || !c->grp) return 4;
+    if (root < 0 || root >= c->grp->n) return 3;
+    return h3_collective(c->grp, c->rank, count, datatype, 0, recvbuf, recvbuf, stream, root + 1);
+}
+
+int infinicclSend(const void *sendbuf, size_t count, int datatype, int peer,
+                  void *comm, void *stream) {
+    (void)sendbuf; (void)count; (void)datatype; (void)peer; (void)comm; (void)stream;
+    h3_log("[h3ccl] !! Send 未实现（只在 pp>1 用到）\n");
+    return 2;
+}
+
+int infinicclRecv(void *recvbuf, size_t count, int datatype, int peer,
+                  void *comm, void *stream) {
+    (void)recvbuf; (void)count; (void)datatype; (void)peer; (void)comm; (void)stream;
+    h3_log("[h3ccl] !! Recv 未实现（只在 pp>1 用到）\n");
+    return 2;
+}
+
+int infinicclAllGather(void *sendbuf, void *recvbuf, size_t send_count, int datatype,
+                       void *comm, void *stream) {
+    (void)sendbuf; (void)recvbuf; (void)send_count; (void)datatype;
+    (void)comm; (void)stream;
+    h3_log("[h3ccl] !! AllGather 未实现（本路径未用到）\n");
+    return 2;
+}
+
+int infinicclAllGatherV(void *sendbuf, void *recvbuf, const size_t *recv_counts, int nranks,
+                        int datatype, void *comm, void *stream) {
+    (void)sendbuf; (void)recvbuf; (void)recv_counts; (void)nranks;
+    (void)datatype; (void)comm; (void)stream;
+    return 2;
+}
+
+int infinicclReduceScatter(void *sendbuf, void *recvbuf, size_t recv_count, int datatype,
+                           int op, void *comm, void *stream) {
+    (void)sendbuf; (void)recvbuf; (void)recv_count; (void)datatype;
+    (void)op; (void)comm; (void)stream;
+    h3_log("[h3ccl] !! ReduceScatter 未实现（本路径未用到）\n");
+    return 2;
+}
+
+int infinicclReduceScatterV(void *sendbuf, void *recvbuf, const size_t *send_counts, int nranks,
+                            int datatype, int op, void *comm, void *stream) {
+    (void)sendbuf; (void)recvbuf; (void)send_counts; (void)nranks;
+    (void)datatype; (void)op; (void)comm; (void)stream;
+    return 2;
+}
+
+int infinicclGetUniqueId(void *unique_id) {
+    char *p = (char *)unique_id;
+    if (!p) return 4;
+    memset(p, 0, 128);
+    memcpy(p, "h3ccl-id", 8);
+    return 0;
+}
+
+/* pp>1 才用；单进程内多线程 InitRank：按 unique_id 归组，等齐 nranks 再返回 */
+static h3grp *g_reg[4];
+static int g_reg_n[4];
+static int g_reg_ready[4];
+static int g_reg_cnt;
+static volatile long g_reg_lock;
+
+int infinicclCommInitRank(void **comm, int nranks, void *unique_id, int rank) {
+    h3grp *g = NULL;
+    h3comm *c;
+    int slot = -1, i, dev = 0;
+
+    if (!comm || nranks <= 0 || nranks > H3_MAXR) return 3;
+    while (h3_xchg(&g_reg_lock, 1) != 0) h3_yield();
+    for (i = 0; i < g_reg_cnt; ++i) {
+        if (g_reg_n[i] == nranks) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        int ids[H3_MAXR];
+        slot = g_reg_cnt++;
+        for (i = 0; i < nranks; ++i) ids[i] = i;
+        g_reg[slot] = h3_new_group(nranks, ids);
+        g_reg_n[slot] = nranks;
+        g_reg_ready[slot] = 0;
+    }
+    g = g_reg[slot];
+    h3_xchg(&g_reg_lock, 0);
+
+    hipGetDevice(&dev);
+    c = (h3comm *)calloc(1, sizeof(h3comm));
+    if (!c) return 1;
+    c->device_type = 8;
+    c->device_id = dev;
+    c->rank = rank;
+    c->world = nranks;
+    c->grp = g;
+
+    H3_MX_LOCK(&g->mu);
+    if (g->ids[rank] < 0) g->ids[rank] = dev;
+    g_reg_ready[slot]++;
+    if (g_reg_ready[slot] >= nranks) {
+        H3_CV_BCAST(&g->cv);
+    } else {
+        while (g_reg_ready[slot] < nranks) H3_CV_WAIT(&g->cv, &g->mu);
+    }
+    H3_MX_UNLOCK(&g->mu);
+
+    *comm = (void *)c;
+    h3_say("[h3ccl] CommInitRank 自实现 nranks=", (long)nranks, "");
+    return 0;
+}
+
+#if defined(__GNUC__) && !defined(_WIN32)
+__attribute__((constructor)) static void h3_ccl_boot(void) {
+    h3_log("[h3ccl] 自实现集合通信已加载（LD_PRELOAD 生效）\n");
+}
+#endif
+H3CCLEOF
+
+  local cc=""
+  local c
+  for c in gcc cc clang "$DTK_ROOT/bin/clang"; do
+    [ -n "$c" ] || continue
+    if command -v "$c" >/dev/null 2>&1; then cc=$c; break; fi
+  done
+  if [ -z "$cc" ]; then
+    say "  !! 找不到 C 编译器，集合通信补不了（TP>1 会继续报 Error Code 5）"
+    return 1
+  fi
+
+  local hipd="" hiplib="" f
+  for f in "$DTK_ROOT"/lib/libamdhip64.so "$DTK_ROOT"/lib64/libamdhip64.so \
+           "$DTK_ROOT"/hip/lib/libamdhip64.so "$DTK_ROOT"/hip/lib64/libamdhip64.so \
+           /opt/hyhal/lib/libamdhip64.so /opt/hyhal/lib64/libamdhip64.so; do
+    [ -e "$f" ] && { hiplib=$f; hipd=$(dirname "$f"); break; }
+  done
+  if [ -z "$hiplib" ] && command -v ldconfig >/dev/null 2>&1; then
+    f=$(ldconfig -p 2>/dev/null | awk '/libamdhip64\.so/{print $NF; exit}')
+    [ -n "$f" ] && [ -e "$f" ] && { hiplib=$f; hipd=$(dirname "$f"); }
+  fi
+
+  say "  编译集合通信薄壳（$(basename "$cc")，自实现 allreduce 不依赖 RCCL）"
+  local -a larg=(-pthread)
+  [ -n "$hiplib" ] && larg+=("$hiplib" "-Wl,-rpath,$hipd")
+  if ! "$cc" -O2 -fPIC -shared -o "$so" "$src" ${larg[@]+"${larg[@]}"} 2>"$dir/ccl_cc.log"; then
+    say "  !! 集合通信薄壳编译失败："
+    tail -12 "$dir/ccl_cc.log" 2>/dev/null | sed 's/^/    /'
+    return 1
+  fi
+  [ -s "$so" ] || { say "  !! 集合通信薄壳没产出（$so 为空）"; return 1; }
+
+  # 少一个符号就会在运行时炸，这里逐个核对
+  local want="infinicclCommInitAll infinicclAllReduce infinicclCommDestroy infinicclGetCommName infinicclGroupStart infinicclGroupEnd"
+  local miss="" s2
+  for s2 in $want; do has_dynsym "$so" "$s2" || miss="$miss $s2"; done
+  if [ -n "$miss" ]; then
+    say "  !! 集合通信薄壳缺符号：$miss"
+    return 1
+  fi
+  H3_CCL_SHIM=$so
+  if [ -n "$hipd" ]; then
+    say "  集合通信薄壳就位：$so  $(ls -lh "$so" 2>/dev/null | awk '{print $5}')（链 $hipd/libamdhip64）"
+  else
+    say "  集合通信薄壳就位：$so  $(ls -lh "$so" 2>/dev/null | awk '{print $5}')（HIP 符号留待运行时解析）"
+  fi
+
+  if LD_PRELOAD="$so" /bin/true 2>"$dir/ccl_preload.log"; then
+    say "  预加载自检通过（ld.so 能加载）"
+  else
+    say "  !! 集合通信薄壳预加载失败："
+    tail -4 "$dir/ccl_preload.log" 2>/dev/null | sed 's/^/    /'
+    return 1
+  fi
+  # 原生实现在哪：libinfiniccl.so 里（动态，最好）还是被静态链进了别的 .so
+  if [ -f "$INFINI/lib/libinfiniccl.so" ] && has_dynsym "$INFINI/lib/libinfiniccl.so" infinicclCommInitAll; then
+    say "  原生 infinicclCommInitAll 在 libinfiniccl.so 里 → 预加载可以覆盖它"
+  else
+    say "  提示：没在 libinfiniccl.so 里找到原生符号，可能被静态链进 _infinilm.so（预加载同样能覆盖）"
+  fi
+  return 0
+}
+
 # 子脚本里那行 `[ -f "$PRELOAD" ] && export LD_PRELOAD=$PRELOAD` 会把我们的 shim
 # 直接顶掉。包目录是上个作业 uid 的只读树（改不了），所以在可写目录生成一份打过
 # 补丁的副本：shim 放最前、DTK libcuda 跟在后面；PYTHONPATH 改成追加，保证
@@ -1143,7 +1788,7 @@ patch_fl2va_launcher() {
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
       '[ -f "$PRELOAD" ] && export LD_PRELOAD=$PRELOAD')
-        out+='H3_SHIM='"$H3_CUDA_SHIM"$'\n'
+        out+='H3_SHIM='"${H3_CUDA_PRELOAD:-$H3_CUDA_SHIM}"$'\n'
         if [ "${H3_DROP_LIBCUDA:-0}" = 1 ]; then
           # 实测：预加载 DTK 的 libcuda 会让 hip 看不到卡，这种情况只留薄壳
           out+='PRELOAD='$'\n'
@@ -1213,9 +1858,21 @@ ensure_cuda_compat() {
     say "  符号核对：${#cuundef[@]}/${#cuundef[@]} 全覆盖"
   fi
 
-  # 4) 预加载：只放我们的薄壳。DTK 的 libcuda.so.1 由子脚本自己按原样加上，
+  # 4) 集合通信薄壳：TP>1 的 allreduce 靠它（InfiniCore 没开 --ccl，原生是空壳）
+  local cclok=0
+  if build_ccl_shim; then
+    cclok=1
+  else
+    say "  !! 集合通信薄壳没建好：TP>1 会继续报 Error Code 5，只能退 TP=1（显存多半不够）"
+  fi
+
+  # 5) 预加载：只放我们的薄壳。DTK 的 libcuda.so.1 由子脚本自己按原样加上，
   #    顺序上正好排在薄壳后面（同名符号我们优先）
-  H3_CUDA_PRELOAD="$H3_CUDA_SHIM"
+  if [ $cclok -eq 1 ]; then
+    H3_CUDA_PRELOAD="$H3_CUDA_SHIM:$H3_CCL_SHIM"
+  else
+    H3_CUDA_PRELOAD="$H3_CUDA_SHIM"
+  fi
   export H3_CUDA_PRELOAD
 
   # 5) Python 侧兜底：万一子脚本把 LD_PRELOAD 冲掉，解释器启动时也用
@@ -2381,7 +3038,7 @@ do_run() {
     probe_dcu preload || pp=$?
     if [ $pp -eq 2 ] && [ $pc -eq 0 ]; then
       say "  !! plain 有卡但 preload 没卡 → 弃用 DTK libcuda，只留薄壳，重新打补丁"
-      H3_CUDA_PRELOAD=$H3_CUDA_SHIM
+      H3_CUDA_PRELOAD="$H3_CUDA_SHIM${H3_CCL_SHIM:+:$H3_CCL_SHIM}"
       H3_DROP_LIBCUDA=1
       export H3_CUDA_PRELOAD H3_DROP_LIBCUDA
       patch_fl2va_launcher >/dev/null 2>&1 || true
@@ -2457,6 +3114,15 @@ do_run() {
         echo "  预检没过：报错就在上面「预检失败」那几行里，改完再提"
         ;;
       *)
+        local lastlog
+        lastlog=$(ls -t "$OUT"/fl2va_${tag}_*.log 2>/dev/null | head -1)
+        if [ -n "$lastlog" ] && grep -q "Error Code 5" "$lastlog" 2>/dev/null; then
+          echo "  集合通信没接管（Error Code 5）：往上找「集合通信薄壳」那行，看是不是没编出来/没预加载"
+        elif [ -n "$lastlog" ] && grep -qi "out of memory\|OUT_OF_RESOURCES\|memory access fault" "$lastlog" 2>/dev/null; then
+          echo "  显存/访存出错 → 降 num_frames，或换 retry2"
+        elif [ -n "$lastlog" ] && grep -q "InfiniCore C API Error" "$lastlog" 2>/dev/null; then
+          echo "  InfiniCore 内部报错 → 往上翻 20 行看 C++ 侧打印的文件:行号"
+        fi
         echo "  常见原因与对策："
         echo "   · heads 不能被卡数整除 → 减少卡数：retry2"
         echo "   · 显存不足 → 降 num_frames"
