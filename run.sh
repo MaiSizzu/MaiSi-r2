@@ -1050,6 +1050,21 @@ CEOF
   local -a larg=()
   [ -n "$hiplib" ] && larg=("$hiplib" "-Wl,-rpath,$hipd")
 
+  # 薄壳依赖的 9 个 HIP 入口，先确认这份运行时里真的都有
+  if [ -n "$hiplib" ] && command -v nm >/dev/null 2>&1; then
+    local m="" hs
+    for hs in hipModuleLoadData hipModuleGetFunction hipModuleUnload hipModuleLaunchKernel \
+              hipDeviceGetAttribute hipGetDevice hipFuncSetCacheConfig hipFuncSetAttribute \
+              hipGetErrorString; do
+      has_dynsym "$hiplib" "$hs" || m="$m $hs"
+    done
+    if [ -n "$m" ]; then
+      say "  !! $(basename "$hiplib") 里没有这些 HIP 入口：$m"
+    else
+      say "  HIP 入口核对：9/9 都在 $(basename "$hiplib")"
+    fi
+  fi
+
   say "  编译 CUDA→HIP 薄壳（$(basename "$cc")）"
   if ! "$cc" -O2 -fPIC -shared -o "$so" "$src" ${larg[@]+"${larg[@]}"} 2>"$dir/cc.log"; then
     say "  !! shim 编译失败："
