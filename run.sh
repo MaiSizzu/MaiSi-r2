@@ -2077,14 +2077,23 @@ ensure_media_encoder() {
   cv=$(PYTHONPATH="$PYDEPS/dyn:$PYDEPS" "$py" -c "import cv2; print(cv2.__version__)" 2>/dev/null | tail -1)
   say "  出片编码器 = PyAV 缺失，走兜底：ffmpeg=${ff:-<无>}  cv2=${cv:-<无>}"
 
-  # 有网就顺手装上 av，原生路径最稳；没网立刻放弃，不干等
+  # 有网就顺手装上：先 av（原生路径，带音轨），不行退 imageio-ffmpeg（自带 ffmpeg 可执行文件）
   if [ -z "$ff" ] && [ -z "$cv" ]; then
-    if pip_heal av; then
-      avout=$(PYTHONPATH="$PYDEPS/dyn:$PYDEPS" "$py" -c "import av; print(av.__version__)" 2>/dev/null)
-      if [ -n "$avout" ]; then
-        say "  装上了 PyAV $avout，用原生路径"
-        return 0
+    if net_ok; then
+      if pyfetch_install av; then
+        avout=$(PYTHONPATH="$PYDEPS/dyn:$PYDEPS" "$py" -c "import av; print(av.__version__)" 2>/dev/null)
+        if [ -n "$avout" ]; then
+          say "  PyAV $avout 可用（wheel 解压装上的），走原生出片"
+          return 0
+        fi
       fi
+      say "  PyAV 没成，退一步装 imageio-ffmpeg（自带 ffmpeg 二进制）"
+      if pyfetch_install imageio-ffmpeg; then
+        ff=$(PYTHONPATH="$PYDEPS/dyn:$PYDEPS" "$py" -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())" 2>/dev/null | tail -1)
+        [ -n "$ff" ] && say "  兜底 ffmpeg = $ff" && { patch_encode_video || true; return 0; }
+      fi
+    else
+      say "  !! 这台机器连不上 PyPI（离线），只能靠自带实现"
     fi
     say "  !! 没有 av / ffmpeg / cv2 —— 最后只能存 PNG 序列，报告里要说明"
   fi
@@ -2142,17 +2151,117 @@ print("MISSING=" + " ".join(missing))
 PYEOF
 }
 
-# 依赖表还有缺的才走这条路：先 8 秒探通网络，再 pip --target，绝不干等 DNS 超时
+net_ok() {
+  command -v curl >/dev/null 2>&1 || return 1
+  curl -sS -m 8 -o /dev/null https://pypi.tuna.tsinghua.edu.cn/simple/ 2>/dev/null
+}
+
+# 直接从镜像下 wheel 解压。pip 在容器里会崩在 /etc/debian_version（PermissionError，
+# 11:55 那单实测 rc=2），而 wheel 本身就是个 zip，解压到 PYTHONPATH 目录即可用。
+pyfetch_install() {   # $@ = PyPI 包名
+  local pd=$PYDEPS/dyn py=python3
+  command -v python3 >/dev/null 2>&1 || py=python
+  mkdir -p "$pd" 2>/dev/null || return 1
+  say "  直接下 wheel 解压（绕开 pip）：$*"
+  "$py" - "$pd" "$@" <<'PYEOF'
+import os
+import re
+import subprocess
+import sys
+import zipfile
+
+pd = sys.argv[1]
+pkgs = sys.argv[2:]
+BASE = "https://pypi.tuna.tsinghua.edu.cn"
+CP = "cp%d%d" % sys.version_info[:2]
+
+
+def fetch(url, out):
+    """先 urllib，失败退 curl —— 容器里证书/代理经常只给 curl 配好了。"""
+    try:
+        import urllib.request
+
+        with urllib.request.urlopen(url, timeout=120) as resp:
+            data = resp.read()
+        with open(out, "wb") as fh:
+            fh.write(data)
+        return os.path.getsize(out) > 0
+    except Exception:
+        pass
+    try:
+        rc = subprocess.call(["curl", "-sS", "-L", "-m", "300", "-o", out, url])
+        return rc == 0 and os.path.getsize(out) > 0
+    except Exception:
+        return False
+
+
+def pick(pkg):
+    idx = os.path.join(pd, ".idx_%s.html" % pkg.replace("-", "_"))
+    if not fetch("%s/simple/%s/" % (BASE, pkg), idx):
+        print("  !! %s：索引页拿不到" % pkg)
+        return None
+    text = open(idx, encoding="utf-8", errors="ignore").read()
+    from urllib.parse import urljoin
+
+    best = None
+    for href in re.findall(r'href="([^"#]+\.whl)', text):
+        name = href.rsplit("/", 1)[-1]
+        if "none-any" in name:
+            score = 1
+        elif CP in name and "x86_64" in name and ("manylinux" in name or "linux_x86_64" in name):
+            score = 3
+        else:
+            continue
+        url = urljoin("%s/simple/%s/" % (BASE, pkg), href)
+        if best is None or score > best[0]:
+            best = (score, name, url)
+    if best is None:
+        print("  !! %s：镜像里没有适配 %s 的 wheel" % (pkg, CP))
+    return best
+
+
+ok = 0
+for pkg in pkgs:
+    got = pick(pkg)
+    if not got:
+        continue
+    _, name, url = got
+    print("     %s" % name)
+    whl = os.path.join(pd, ".dl.whl")
+    if not fetch(url, whl):
+        print("  !! %s 下载失败" % name)
+        continue
+    try:
+        with zipfile.ZipFile(whl) as zf:
+            zf.extractall(pd)
+        ok += 1
+        print("     解开 → %s" % pd)
+    except Exception as exc:
+        print("  !! %s 解压失败: %s" % (name, exc))
+    finally:
+        try:
+            os.remove(whl)
+        except OSError:
+            pass
+sys.exit(0 if ok else 1)
+PYEOF
+}
+
+# 依赖表还有缺的才走这条路：先 8 秒探通网络，再下 wheel（pip 只作最后兜底）
 pip_heal() {
   local pd=$PYDEPS/dyn py=python3
   command -v python3 >/dev/null 2>&1 || py=python
-  "$py" -m pip --version >/dev/null 2>&1 || { say "  !! 没有 pip，无法联网补齐"; return 1; }
   mkdir -p "$pd" 2>/dev/null || return 1
-  if command -v curl >/dev/null 2>&1; then
-    curl -sS -m 8 -o /dev/null https://pypi.tuna.tsinghua.edu.cn/simple/ 2>/dev/null \
-      || { say "  !! 这台机器连不上 PyPI（离线），只能靠自带实现"; return 1; }
+  net_ok || { say "  !! 这台机器连不上 PyPI（离线），只能靠自带实现"; return 1; }
+
+  # 先走 wheel 解压：不依赖 pip 的发行版探测，容器里更可靠
+  if pyfetch_install "$@"; then
+    say "  补齐成功（wheel 解压）"
+    return 0
   fi
-  say "  联网补齐：$* → $pd"
+
+  "$py" -m pip --version >/dev/null 2>&1 || { say "  !! wheel 没成，也没有 pip 兜底"; return 1; }
+  say "  wheel 没成，退 pip：$* → $pd"
   local tmo="" log rc
   command -v timeout >/dev/null 2>&1 && tmo="timeout 240"
   log=$($tmo "$py" -m pip install -q --no-input --no-cache-dir --disable-pip-version-check \
@@ -2296,6 +2405,9 @@ do_run() {
   [ -n "${INFINICORE_OVERLAY:-}" ] && pyic="$INFINICORE_OVERLAY:$pyic"
   # overlay 放最前：既保证用的是新编的 infinicore，也让它的 sitecustomize.py 先生效
   export PYTHONPATH="$pyic:$PYLIBS:$PYDEPS/dyn:$PYDEPS:$PKG/src/InfiniLM/python"
+  # 启动器把 python 的 stdout 接进 `| tee`，管道 → 块缓冲（8KB），print 全憋在内存里，
+  # 日志看起来"半天不动"，其实在跑。11:45 那单停在「张量并行度 = 8」就是这个原因。
+  export PYTHONUNBUFFERED=1
 
   if [ "$tag" = "smoke" ]; then export SMOKE=1; fi
 
@@ -2324,8 +2436,17 @@ do_run() {
   local rc=$?
   echo
   if [ $rc -eq 0 ]; then
-    say "$tag 成功，产物："
-    ls -lh "$OUT"/*.mp4 2>/dev/null | tail -3
+    if ls "$OUT"/*.mp4 >/dev/null 2>&1; then
+      say "$tag 成功，产物："
+      ls -lh "$OUT"/*.mp4 2>/dev/null | tail -3
+    else
+      # 退出码 0 但没 mp4：说明出片那一步退化成 PNG 序列了，别当成成功
+      say "$tag 退出码 0，但没有 mp4 —— 视频没编码出来"
+      ls -d "$OUT"/*_frames 2>/dev/null | tail -2 | while read -r d; do
+        echo "  PNG 序列：$d（$(ls "$d" 2>/dev/null | wc -l) 帧）"
+      done
+      echo "  原因：PyAV / ffmpeg / cv2 三样都缺。帧是真算出来了，只是没封装成视频"
+    fi
   else
     say "$tag 失败 rc=$rc"
     case "$rc" in
