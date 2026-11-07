@@ -80,6 +80,14 @@ say() { echo "[$(date +%H:%M:%S) +$((SECONDS))s] $*"; }
 die() { echo; echo "!!! $*"; echo "!!! 日志: $LOG"; exit 1; }
 
 echo "############ run.sh mode=$MODE gpu=$WANT_GPU  $(date '+%F %T') ############"
+# 版本自报：不用登录终端，日志第一屏就能确认跑的是哪个文件（md5 可与我给的核对）
+_self=${BASH_SOURCE[0]:-$0}
+if [ -f "$_self" ]; then
+  _sz=$(wc -c < "$_self" 2>/dev/null | tr -d ' ')
+  echo "SELF = $(md5sum "$_self" 2>/dev/null | awk '{print $1}')  ${_sz:-?} 字节  $_self"
+else
+  echo "SELF = (拿不到脚本自身路径：$_self)"
+fi
 echo "AFS  = $AFS"
 echo "PKG  = $PKG"
 echo "LOG  = $LOG"
