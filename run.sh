@@ -38,6 +38,19 @@ if [ -z "$AFS" ]; then
 fi
 AFS=${AFS:-$HOME}
 
+# ---------- 临时目录 ----------
+# 平台的 TMPDIR 指向 /dev/shm，而这台机器 /dev/shm 只有几十 MB。
+# 48 路并行编译的临时文件会把它占满，之后 HIP 初始化就拿不到设备了
+# （11-07 10:33 那单：+20s 时 torch 还能看到 8 卡，编完 21 分钟后变成 0 卡）。
+# 所以编译/解包的临时文件一律挪到 AFS，/dev/shm 只留给运行时自己用。
+if [ -z "${H3_TMP_FIXED:-}" ]; then
+  ORIG_TMP=${TMPDIR:-/tmp}
+  if mkdir -p "$AFS/tmp" 2>/dev/null && [ -w "$AFS/tmp" ]; then
+    export TMPDIR=$AFS/tmp
+  fi
+  export H3_TMP_FIXED=1 ORIG_TMP
+fi
+
 # ---------- 容器里的工具约束 ----------
 # 1) xmake 以 root 运行会自锁，必须显式放行
 export XMAKE_ROOT=y
@@ -1123,7 +1136,12 @@ patch_fl2va_launcher() {
     case "$line" in
       '[ -f "$PRELOAD" ] && export LD_PRELOAD=$PRELOAD')
         out+='H3_SHIM='"$H3_CUDA_SHIM"$'\n'
-        out+='[ -f "$PRELOAD" ] || PRELOAD='$'\n'
+        if [ "${H3_DROP_LIBCUDA:-0}" = 1 ]; then
+          # 实测：预加载 DTK 的 libcuda 会让 hip 看不到卡，这种情况只留薄壳
+          out+='PRELOAD='$'\n'
+        else
+          out+='[ -f "$PRELOAD" ] || PRELOAD='$'\n'
+        fi
         out+='export LD_PRELOAD="$H3_SHIM${PRELOAD:+:$PRELOAD}${LD_PRELOAD:+:$LD_PRELOAD}"'$'\n'
         n=$((n+1))
         ;;
@@ -1382,15 +1400,44 @@ do_build() {
 #   xmake.lua 把 .so 装到 python/infinilm/，而 lib/__init__.py 只往
 #   python/infinilm/lib/ 里找（和 _infinicore 同一个坑），所以两头都补。
 # =============================================================================
+# InfiniCore 的 install 只装了 infiniop/infinirt，cpp_api 和 infiniccl 留在 build 目录，
+# 头文件也没装全。这里把它们补进 $INFINI，让编译和运行共用同一棵 INFINI_ROOT。
+ensure_infini_root() {
+  local iroot=$INFINI l f base item
+  mkdir -p "$iroot/lib" "$iroot/include" 2>/dev/null || { say "  !! $iroot 不可写"; return 1; }
+  for l in libinfinicore_cpp_api.so libinfiniop.so libinfinirt.so libinfiniccl.so; do
+    [ -f "$iroot/lib/$l" ] && continue
+    f=$(ls "$IC/build/linux/x86_64/release/$l" 2>/dev/null | head -1)
+    [ -n "$f" ] || f=$(find "$IC/build" -maxdepth 4 -name "$l" 2>/dev/null | head -1)
+    if [ -n "$f" ]; then cp -f "$f" "$iroot/lib/" 2>/dev/null; else say "  !! 缺 $l（链接 _infinilm 会失败）"; fi
+  done
+  for item in infinicore infiniop infinicore.h infinicore.hpp infiniop.h infinirt.h infiniccl.h; do
+    [ -e "$iroot/include/$item" ] && continue
+    for base in "$IC/include" "$INFINI/include"; do
+      [ -e "$base/$item" ] || continue
+      ln -sfn "$base/$item" "$iroot/include/$item" 2>/dev/null
+      # 少数文件系统不让建软链，退化成拷贝（头文件很小）
+      [ -e "$iroot/include/$item" ] || cp -a "$base/$item" "$iroot/include/" 2>/dev/null
+      break
+    done
+    [ -e "$iroot/include/$item" ] || say "  !! 缺头文件 $item"
+  done
+  return 0
+}
+
 ensure_infinilm() {
   [ -n "${INFINILM_OK:-}" ] && return 0
   local src=$PKG/src/InfiniLM
-  local root=$AFS/il_root
+  local root=$AFS/il_root     # 只用来存 _infinilm.so 成品
+  local iroot=$INFINI         # 编译和运行共用同一个 INFINI_ROOT，不再另起一棵树
   local ovl=${INFINICORE_OVERLAY:-$OVL}
   [ -d "$src/csrc" ] || { say "  !! 找不到 $src/csrc"; return 1; }
   [ -d "$ovl" ] || { say "  !! overlay 没建好，先跑 ensure_infinicore_overlay"; return 1; }
 
-  # 1) 之前编过就直接摆到位（overlay 若在 /dev/shm，每轮要重新拷一次）
+  # 1) 库和头文件先备齐（复用旧 .so 时同样要做，所以放在复用判断之前）
+  ensure_infini_root || say "  !! INFINI_ROOT 没备齐，链接/加载可能失败"
+
+  # 2) 之前编过就直接摆到位（overlay 若在 /dev/shm，每轮要重新拷一次）
   local so
   so=$(ls "$root"/_infinilm*.so 2>/dev/null | head -1)
   if [ -n "$so" ] && [ -f "$OUT/.stamp_infinilm" ]; then
@@ -1400,30 +1447,6 @@ ensure_infinilm() {
     say "  _infinilm.so 复用：$(basename "$so")  $(ls -lh "$so" 2>/dev/null | awk '{print $5}')"
     return 0
   fi
-
-  # 2) 准备一个 InfiniLM 能直接用的 INFINI_ROOT：四个库 + 头文件
-  #    （InfiniCore 的 install 只装了 infiniop/infinirt，cpp_api 和 infiniccl 留在 build 里）
-  mkdir -p "$root/lib" "$root/include" 2>/dev/null || { say "  !! $root 不可写"; return 1; }
-  local l f base item
-  for l in libinfinicore_cpp_api.so libinfiniop.so libinfinirt.so libinfiniccl.so; do
-    [ -f "$root/lib/$l" ] && continue
-    if [ -f "$INFINI/lib/$l" ]; then cp -f "$INFINI/lib/$l" "$root/lib/" 2>/dev/null && continue; fi
-    f=$(ls "$IC/build/linux/x86_64/release/$l" 2>/dev/null | head -1)
-    if [ -z "$f" ]; then f=$(find "$IC/build" -maxdepth 4 -name "$l" 2>/dev/null | head -1); fi
-    if [ -n "$f" ]; then cp -f "$f" "$root/lib/" 2>/dev/null; else say "  !! 缺 $l（链接 _infinilm 会失败）"; fi
-  done
-  for item in infinicore infiniop infinicore.h infinicore.hpp infiniop.h infinirt.h infiniccl.h; do
-    [ -e "$root/include/$item" ] && continue
-    for base in "$INFINI/include" "$IC/include"; do
-      if [ -e "$base/$item" ]; then
-        ln -sfn "$base/$item" "$root/include/$item" 2>/dev/null
-        # 少数文件系统不让建软链，退化成拷贝（头文件很小）
-        [ -e "$root/include/$item" ] || cp -a "$base/$item" "$root/include/" 2>/dev/null
-        break
-      fi
-    done
-    [ -e "$root/include/$item" ] || say "  !! 缺头文件 $item"
-  done
 
   # 3) 编译目录：包目录可写就就地编（对象落在 AFS，下轮增量）；
   #    不可写才用软链树（源码只读、只让 build/ 落盘），避免再花 6 分钟拷 1752 个文件
@@ -1460,7 +1483,7 @@ ensure_infinilm() {
   say "  编译 _infinilm（$work，$j 并发，日志 $(basename "$log")）"
   (
     cd "$work" || exit 1
-    export INFINI_ROOT=$root
+    export INFINI_ROOT=$iroot
     export PYBIND11_INCLUDE=$pb
     export PYTHON_INCLUDE=$pyinc
     export XMAKE_GLOBALDIR=${XMAKE_GLOBALDIR:-$AFS/.xmake_global}
@@ -1500,10 +1523,84 @@ ensure_infinilm() {
   return 0
 }
 
+# =============================================================================
+# 卡在不在，决定这一单还值不值得跑
+#   10:33 那单的教训：+20s 时 torch 还能看到 8 卡，编了 21 分钟之后 HIP 一张都看不到，
+#   等于后面 40 分钟全白烧。所以先花 10 秒探一次，并把 /dev/shm 余量打出来
+#   ——平台的 TMPDIR 就在 /dev/shm 上，并行编译最容易把它写满。
+# =============================================================================
+hip_count() {   # $1=要预加载的库（可空）；输出 数字 / errN / na
+  local py=python3
+  command -v python3 >/dev/null 2>&1 || py=python
+  LD_PRELOAD=${1:-} "$py" - "$DTK_ROOT/lib/libamdhip64.so" "$DTK_ROOT/lib64/libamdhip64.so" \
+      "$DTK_ROOT/hip/lib/libamdhip64.so" "$DTK_ROOT/hip/lib64/libamdhip64.so" 2>/dev/null <<'PYEOF'
+import ctypes, sys
+names = ["libamdhip64.so", "libamdhip64.so.6", "libamdhip64.so.5", "libamdhip64.so.4"]
+names += [p for p in sys.argv[1:] if p]
+lib = None
+for nm in names:
+    try:
+        lib = ctypes.CDLL(nm)
+        break
+    except OSError:
+        pass
+if lib is None:
+    print("na")
+else:
+    n = ctypes.c_int(-1)
+    rc = lib.hipGetDeviceCount(ctypes.byref(n))
+    print(n.value if rc == 0 else "err%d" % rc)
+PYEOF
+}
+
+shm_free_mb() { df -k /dev/shm 2>/dev/null | awk 'NR==2{print int($4/1024)}'; }
+
+# /dev/shm 在这台机器上很小（早期实测不足 200MB），HIP 初始化和 IPC 都要用它。
+# 编译临时文件已经挪到 AFS，这里只清我们自己早几轮留下的残留，绝不碰在用的 overlay。
+free_shm() {
+  local d b
+  for d in /dev/shm/songshan_pkg /dev/shm/songshan_tar; do
+    [ -d "$d" ] || continue
+    case "$PKG" in "$d"*) say "  $d 正在用，不清理"; continue ;; esac
+    case "${OVL:-}${INFINICORE_OVERLAY:-}" in *"$d"*) say "  $d 正在用，不清理"; continue ;; esac
+    b=$(du -sm "$d" 2>/dev/null | awk '{print $1}')
+    rm -rf "$d" 2>/dev/null && say "  腾出 /dev/shm：清掉 $d（${b:-?}MB）"
+  done
+  say "  /dev/shm 余量 $(shm_free_mb)MB"
+}
+
+probe_dcu() {   # $1=plain|preload → 0 有卡 / 2 没卡 / 3 判断不了
+  local mode=${1:-plain} pre="" n shm info
+  [ "$mode" = preload ] && pre=${H3_CUDA_PRELOAD:-}
+  shm=$(shm_free_mb)
+  info="kfd=$([ -e /dev/kfd ] && echo y || echo n) dri=$([ -d /dev/dri ] && echo y || echo n)"
+  n=$(hip_count "$pre")
+  case "$n" in
+    na)
+      say "    HIP 探测($mode)：加载不到 libamdhip64，判断不了  /dev/shm ${shm:-?}MB  $info"
+      return 3
+      ;;
+    err*)
+      say "    HIP 探测($mode)：hipGetDeviceCount 返回 $n  /dev/shm ${shm:-?}MB  $info"
+      return 2
+      ;;
+  esac
+  if ! [ "$n" -ge 1 ] 2>/dev/null; then
+    say "    HIP 探测($mode)：0 张卡  /dev/shm ${shm:-?}MB  $info"
+    return 2
+  fi
+  say "    HIP 探测($mode)：$n 张卡  /dev/shm ${shm:-?}MB  $info"
+  DCU_COUNT=$n
+  return 0
+}
+
 preflight_import() {
   local py=python3
   command -v python3 >/dev/null 2>&1 || py=python
   say "  预检：import infinicore + _infinicore + _infinilm（不加载权重）"
+  local pl
+  pl=$(printf '%s' "${H3_CUDA_PRELOAD:-}" | tr ':' '\n' | while read -r x; do [ -n "$x" ] && basename "$x"; done | tr '\n' ' ')
+  say "    环境 INFINI_ROOT=${INFINI_ROOT:-?}  LD_PRELOAD=${pl:-<空>}  /dev/shm 余量 $(shm_free_mb)MB"
   local out
   out=$(LD_PRELOAD="${H3_CUDA_PRELOAD:-}${LD_PRELOAD:+:$LD_PRELOAD}" "$py" - 2>&1 <<'PYEOF'
 import infinicore
@@ -1518,8 +1615,8 @@ PYEOF
   if [ $rc -eq 0 ]; then
     printf '%s\n' "$out" | tail -4 | sed 's/^/    /'
   else
-    say "  !! 预检失败，根因就在下面几行："
-    printf '%s\n' "$out" | tail -6 | sed 's/^/    /'
+    say "  !! 预检失败，根因就在下面几行（末尾 20 行）："
+    printf '%s\n' "$out" | tail -20 | sed 's/^/    /'
   fi
   return $rc
 }
@@ -1531,35 +1628,73 @@ do_run() {
   [ -f "$INFINI/lib/libinfiniop.so" ] || say "警告：libinfiniop.so 还没编译，import infinicore 大概率失败（先跑 build）"
   ensure_first_frame
 
+  # 库路径先备好：探卡要靠它找到 libamdhip64 及其依赖库
   export PKG SS INFINI_ROOT=$INFINI
   export MODEL_ROOT FIRST_FRAME OUTPUT_DIR=$OUT
+  export LD_LIBRARY_PATH="$INFINI/lib:$DTK_ROOT/lib:/opt/hyhal/lib:/opt/hyhal/lib64:${LD_LIBRARY_PATH:-}"
+  local cudalib
+  for cudalib in "$DTK_ROOT"/cuda/*/lib64 "$DTK_ROOT"/cuda/*/targets/x86_64-linux/lib; do
+    [ -d "$cudalib" ] && LD_LIBRARY_PATH="$cudalib:$LD_LIBRARY_PATH"
+  done
+  [ -d "$IC/build/linux/x86_64/release" ] && LD_LIBRARY_PATH="$IC/build/linux/x86_64/release:$LD_LIBRARY_PATH"
+  [ -n "$CUDA_COMPAT" ] && [ -d "$CUDA_COMPAT/lib64" ] && LD_LIBRARY_PATH="$CUDA_COMPAT/lib64:$LD_LIBRARY_PATH"
+  export LD_LIBRARY_PATH
+
+  # 先确认这一单真有卡：没卡的话，后面编 20 分钟 + 加载 73G 全是白烧
+  say "探测可见 DCU（有卡才往下跑）"
+  local pc=0
+  probe_dcu plain || pc=$?
+  if [ $pc -eq 2 ]; then
+    say "  !! 这一单 HIP 看不到任何 DCU —— 不是代码问题，别在这里耗卡时"
+    say "     常见原因：作业没拿到卡 / 卡被别的作业占着 / /dev/shm 被写满（见上面余量）"
+    say "     处理：直接重提一单（smoke / 8 卡）；反复出现就把这几行贴我"
+    return 2
+  fi
+  if [ -n "${DCU_COUNT:-}" ] && [ "${WANT_GPU:-0}" -gt "$DCU_COUNT" ] 2>/dev/null; then
+    say "  只探到 $DCU_COUNT 张卡（原计划 $WANT_GPU 张），按实际卡数跑"
+    WANT_GPU=$DCU_COUNT
+  fi
+
   export GPUS=$(seq -s, 0 $((WANT_GPU - 1)))
   # .so 必须在 infinicore/lib/ 下才能被 from infinicore.lib import _infinicore 找到；
   # 包目录只读，用 overlay 兜住（单独跑 smoke 没走 build 时也在这里补一次）
   ensure_infinicore_overlay || say "警告：infinicore overlay 没建起来，import 大概率失败"
   ensure_cuda_compat || say "警告：CUDA→HIP 薄壳没建好，import 仍会报 undefined symbol"
+  # 预加载会不会把卡弄丢（10:33 那单的疑点）：探一次就能分辨，并能自动降级
+  if [ -n "${H3_CUDA_PRELOAD:-}" ]; then
+    local pp=0
+    probe_dcu preload || pp=$?
+    if [ $pp -eq 2 ] && [ $pc -eq 0 ]; then
+      say "  !! plain 有卡但 preload 没卡 → 弃用 DTK libcuda，只留薄壳，重新打补丁"
+      H3_CUDA_PRELOAD=$H3_CUDA_SHIM
+      H3_DROP_LIBCUDA=1
+      export H3_CUDA_PRELOAD H3_DROP_LIBCUDA
+      patch_fl2va_launcher >/dev/null 2>&1 || true
+      probe_dcu preload || say "  !! 只留薄壳也看不到卡，问题不在预加载"
+    fi
+  fi
   ensure_infinilm || say "警告：_infinilm 没编出来，import infinilm.cache 会失败"
+  # 干完重活再探一次：10:33 那单的卡就是在 21 分钟编译过程中丢的，这里能立刻看见
+  local pd=0
+  probe_dcu preload || pd=$?
+  if [ $pd -eq 2 ]; then
+    say "  !! 编译后卡不见了（开工时 ${DCU_COUNT:-?} 张）—— 这一单的卡在作业中途丢了"
+    say "     不是代码问题：重提一单即可；每单都这样就是平台侧问题，把上面几行贴我"
+    return 2
+  fi
   local pyic="$PKG/src/InfiniCore/python"
-  [ -n "$INFINICORE_OVERLAY" ] && pyic="$INFINICORE_OVERLAY:$pyic"
+  [ -n "${INFINICORE_OVERLAY:-}" ] && pyic="$INFINICORE_OVERLAY:$pyic"
   # overlay 放最前：既保证用的是新编的 infinicore，也让它的 sitecustomize.py 先生效
   export PYTHONPATH="$pyic:$PYLIBS:$PKG/src/InfiniLM/python"
-  export LD_LIBRARY_PATH="$INFINI/lib:$DTK_ROOT/lib:/opt/hyhal/lib:/opt/hyhal/lib64:$LD_LIBRARY_PATH"
-  # DTK 的 CUDA 兼容层（libcudart / libcuda stub）在 cuda-12/lib64
-  local cudalib
-  for cudalib in "$DTK_ROOT"/cuda/*/lib64 "$DTK_ROOT"/cuda/*/targets/x86_64-linux/lib; do
-    [ -d "$cudalib" ] && LD_LIBRARY_PATH="$cudalib:$LD_LIBRARY_PATH"
-  done
-  # libinfinicore_cpp_api.so / libinfiniccl.so 只编在 build 目录里，没 install 到 infini/lib
-  [ -d "$IC/build/linux/x86_64/release" ] && LD_LIBRARY_PATH="$IC/build/linux/x86_64/release:$LD_LIBRARY_PATH"
-  # _infinilm.so 链接的是 $AFS/il_root/lib 里那四个库
-  [ -d "$AFS/il_root/lib" ] && LD_LIBRARY_PATH="$AFS/il_root/lib:$LD_LIBRARY_PATH"
-  [ -n "$CUDA_COMPAT" ] && [ -d "$CUDA_COMPAT/lib64" ] && LD_LIBRARY_PATH="$CUDA_COMPAT/lib64:$LD_LIBRARY_PATH"
-  export LD_LIBRARY_PATH
 
   if [ "$tag" = "smoke" ]; then export SMOKE=1; fi
 
   # 便宜的自检：只 import，不加载权重。挂了 200 秒内就看到根因，不用等整条管线
-  preflight_import || say "  预检没过，仍继续启动完整管线（便于对比完整报错）"
+  free_shm
+  preflight_import || {
+    say "  !! 预检没过，直接中止：这条链已经断了，再加载 73G 权重也必然失败，不烧这 40 分钟"
+    return 3
+  }
 
   local launcher=$PKG/scripts/run_fl2va_direct.sh
   local patched=0
@@ -1583,10 +1718,19 @@ do_run() {
     ls -lh "$OUT"/*.mp4 2>/dev/null | tail -3
   else
     say "$tag 失败 rc=$rc"
-    echo "  常见原因与对策："
-    echo "   · heads 不能被卡数整除 → 减少卡数：full 2"
-    echo "   · import infinicore 失败 → 先跑 build"
-    echo "   · 显存不足 → 降 num_frames"
+    case "$rc" in
+      2)
+        echo "  这一单 HIP 看不到 DCU（不是代码问题）：重提一单即可；反复出现把探测那几行贴我"
+        ;;
+      3)
+        echo "  预检没过：报错就在上面「预检失败」那几行里，改完再提"
+        ;;
+      *)
+        echo "  常见原因与对策："
+        echo "   · heads 不能被卡数整除 → 减少卡数：retry2"
+        echo "   · 显存不足 → 降 num_frames"
+        ;;
+    esac
   fi
   return $rc
 }
