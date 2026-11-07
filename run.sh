@@ -1841,6 +1841,257 @@ PYEOF
   return 1
 }
 
+# =============================================================================
+# 5.6 出片编码兜底
+# =============================================================================
+# 入口脚本最后一步是 diffusers 的 encode_video()，它内部 `import av`（PyAV）——
+# 离线 pylibs 里没有 av，真跑起来会"生成完 40 分钟、最后一步写 mp4 才炸"。
+# 所以先写好一份同签名的兜底实现（ffmpeg 命令行 → cv2 → PNG 序列），
+# 再把 diffusers 里 `av = _import_av()` 改成 try/except 转过来。有 av 时一行不改。
+write_media_fallback() {
+  local pd=$PYDEPS
+  mkdir -p "$pd" 2>/dev/null || return 1
+  local stamp="media1"
+  if [ "$(cat "$pd/.media_stamp" 2>/dev/null)" = "$stamp" ] && [ -s "$pd/media_fallback.py" ]; then
+    return 0
+  fi
+  cat > "$pd/media_fallback.py" <<'PYEOF'
+"""encode_video 的兜底实现（PyAV 不在时顶上）。
+
+签名、入参格式与 diffusers.utils.export_utils.encode_video 完全一致：
+  video: list[PIL.Image] | np.ndarray | torch.Tensor([T,H,W,C])
+  audio: torch.Tensor / np.ndarray
+出片优先级：ffmpeg 命令行（带音轨） → OpenCV mp4v（无音轨） → PNG 序列（最坏情况留证据）。
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import tempfile
+import wave
+
+import numpy as np
+
+__version__ = "h3fallback-1"
+
+
+def _to_uint8_frames(video):
+    """统一成 [T,H,W,3] uint8。"""
+    if hasattr(video, "detach") or isinstance(video, np.ndarray):
+        arr = video
+        if hasattr(arr, "detach"):
+            arr = arr.detach().to("cpu").float().numpy()
+        arr = np.asarray(arr)
+    else:
+        frames = []
+        for f in video:
+            if hasattr(f, "convert"):
+                frames.append(np.asarray(f.convert("RGB")))
+            else:
+                arr_f = f
+                if hasattr(arr_f, "detach"):
+                    arr_f = arr_f.detach().to("cpu").float().numpy()
+                frames.append(np.asarray(arr_f))
+        arr = np.stack(frames, 0)
+
+    if arr.ndim != 4:
+        raise ValueError("video 形状应为 [T,H,W,C]，实际 %r" % (arr.shape,))
+    if arr.shape[-1] == 1:
+        arr = np.repeat(arr, 3, axis=-1)
+    if arr.shape[-1] == 4:
+        arr = arr[..., :3]
+    if arr.dtype != np.uint8:
+        lo = float(arr.min()) if arr.size else 0.0
+        hi = float(arr.max()) if arr.size else 0.0
+        if 0.0 <= lo and hi <= 1.001:
+            arr = arr * 255.0
+        arr = np.clip(np.rint(arr.astype(np.float32)), 0, 255).astype(np.uint8)
+    return arr
+
+
+def _write_wav(path, audio, sample_rate):
+    a = audio
+    if hasattr(a, "detach"):
+        a = a.detach().to("cpu").float().numpy()
+    a = np.asarray(a, dtype=np.float32)
+    if a.ndim == 2 and a.shape[0] <= 8 and a.shape[0] < a.shape[1]:
+        a = a.T                      # [ch, n] → [n, ch]
+    if a.ndim == 2 and a.shape[1] == 1:
+        a = a[:, 0]
+    if a.size and float(np.max(np.abs(a))) > 1.5:
+        a = a / 32768.0              # 已经是整型量纲
+    a = np.clip(a, -1.0, 1.0)
+    a = np.nan_to_num(a)
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1 if a.ndim == 1 else int(a.shape[1]))
+        w.setsampwidth(2)
+        w.setframerate(int(sample_rate))
+        w.writeframes((a * 32767.0).astype("<i2").tobytes())
+
+
+def _ffmpeg_bin():
+    ff = shutil.which("ffmpeg")
+    if ff:
+        return ff
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def _encode_ffmpeg(frames, fps, out_path, wav):
+    ff = _ffmpeg_bin()
+    if not ff:
+        return False
+    t, h, w, _ = frames.shape
+    if h % 2:
+        frames, h = frames[:, : h - 1], h - 1
+    if w % 2:
+        frames, w = frames[:, :, : w - 1], w - 1
+    cmd = [
+        ff, "-y", "-loglevel", "error",
+        "-f", "rawvideo", "-pix_fmt", "rgb24",
+        "-s", "%dx%d" % (w, h), "-r", str(int(round(fps))), "-i", "-",
+    ]
+    if wav:
+        cmd += ["-i", wav]
+    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p"]
+    if wav:
+        cmd += ["-c:a", "aac", "-b:a", "192k", "-shortest"]
+    cmd += ["-movflags", "+faststart", out_path]
+
+    print("[media] ffmpeg 出片：%d 帧 %dx%d @%sfps%s" % (t, w, h, fps, " + 音轨" if wav else ""))
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    try:
+        for frame in frames:
+            proc.stdin.write(frame.tobytes())
+        proc.stdin.close()
+    except (BrokenPipeError, OSError):
+        pass
+    err = proc.stderr.read().decode("utf-8", "ignore")
+    rc = proc.wait()
+    if rc != 0:
+        print("[media] !! ffmpeg 失败 rc=%d: %s" % (rc, err.strip()[-400:]))
+        return False
+    return os.path.isfile(out_path) and os.path.getsize(out_path) > 0
+
+
+def _encode_cv2(frames, fps, out_path):
+    try:
+        import cv2
+    except Exception:
+        return False
+    h, w = frames.shape[1], frames.shape[2]
+    writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), float(fps), (w, h))
+    if not writer.isOpened():
+        return False
+    for frame in frames:
+        writer.write(frame[:, :, ::-1])          # RGB → BGR
+    writer.release()
+    print("[media] cv2 出片（mp4v，无音轨）：%s" % out_path)
+    return os.path.isfile(out_path) and os.path.getsize(out_path) > 0
+
+
+def encode_video(video, fps, output_path, audio=None, audio_sample_rate=None, video_chunks_number=1):
+    frames = _to_uint8_frames(video)
+    print("[media] PyAV 不可用 → 走兜底出片：%d 帧 %dx%d" % (frames.shape[0], frames.shape[2], frames.shape[1]))
+    wav = None
+    if audio is not None:
+        if not audio_sample_rate:
+            print("[media] !! 给了音频但没有采样率，这一版不带音轨")
+        else:
+            try:
+                tmpdir = tempfile.mkdtemp(prefix="h3aud_")
+                wav = os.path.join(tmpdir, "audio.wav")
+                _write_wav(wav, audio, audio_sample_rate)
+            except Exception as exc:      # 音频坏了也别把画面一起赔掉
+                print("[media] !! 写 wav 失败（%s），改为无声出片" % exc)
+                wav = None
+    if _encode_ffmpeg(frames, fps, output_path, wav):
+        print("[media] 出片完成：%s" % output_path)
+        return
+    if _encode_cv2(frames, fps, output_path):
+        print("[media] 出片完成（无音轨）：%s" % output_path)
+        return
+    png_dir = os.path.splitext(output_path)[0] + "_frames"
+    os.makedirs(png_dir, exist_ok=True)
+    from PIL import Image
+
+    for i, frame in enumerate(frames):
+        Image.fromarray(frame).save(os.path.join(png_dir, "f%05d.png" % i))
+    print("[media] !! 既没有 ffmpeg 也没有 cv2，PNG 序列已存：%s（%d 帧）" % (png_dir, frames.shape[0]))
+PYEOF
+  echo "$stamp" > "$pd/.media_stamp" 2>/dev/null
+  return 0
+}
+
+# 把 diffusers 里 `av = _import_av()` 换成 try/except：没有 av 时转兜底实现
+patch_encode_video() {
+  local f=$PYLIBS/diffusers/utils/export_utils.py
+  [ -f "$f" ] || { say "  !! 找不到 $f，出片兜底没法挂钩"; return 1; }
+  grep -q "media_fallback" "$f" && return 0
+  local py=python3
+  command -v python3 >/dev/null 2>&1 || py=python
+  "$py" - "$f" <<'PYEOF'
+import io
+import sys
+
+path = sys.argv[1]
+src = io.open(path, encoding="utf-8").read()
+old = "    av = _import_av()\n"
+new = (
+    "    try:\n"
+    "        av = _import_av()\n"
+    "    except ImportError:\n"
+    "        from media_fallback import encode_video as _h3_fallback_encode_video\n"
+    "        return _h3_fallback_encode_video(\n"
+    "            video, fps, output_path, audio, audio_sample_rate, video_chunks_number\n"
+    "        )\n"
+)
+if old not in src:
+    print("  !! export_utils.py 里没找到 'av = _import_av()'，跳过")
+    sys.exit(1)
+io.open(path, "w", encoding="utf-8").write(src.replace(old, new, 1))
+print("  diffusers.encode_video 已挂上兜底：%s" % path)
+PYEOF
+}
+
+ensure_media_encoder() {
+  write_media_fallback || { say "  !! 兜底出片模块没写出来"; return 1; }
+  local py=python3
+  command -v python3 >/dev/null 2>&1 || py=python
+
+  local avout
+  avout=$(PYTHONPATH="$PYDEPS/dyn:$PYDEPS" "$py" -c "import av; print(av.__version__)" 2>&1)
+  if [ $? -eq 0 ]; then
+    say "  出片编码器 = PyAV $avout（diffusers 原生路径，不需要兜底）"
+    return 0
+  fi
+
+  local ff cv
+  ff=$(command -v ffmpeg 2>/dev/null || true)
+  cv=$(PYTHONPATH="$PYDEPS/dyn:$PYDEPS" "$py" -c "import cv2; print(cv2.__version__)" 2>/dev/null | tail -1)
+  say "  出片编码器 = PyAV 缺失，走兜底：ffmpeg=${ff:-<无>}  cv2=${cv:-<无>}"
+
+  # 有网就顺手装上 av，原生路径最稳；没网立刻放弃，不干等
+  if [ -z "$ff" ] && [ -z "$cv" ]; then
+    if pip_heal av; then
+      avout=$(PYTHONPATH="$PYDEPS/dyn:$PYDEPS" "$py" -c "import av; print(av.__version__)" 2>/dev/null)
+      if [ -n "$avout" ]; then
+        say "  装上了 PyAV $avout，用原生路径"
+        return 0
+      fi
+    fi
+    say "  !! 没有 av / ffmpeg / cv2 —— 最后只能存 PNG 序列，报告里要说明"
+  fi
+  patch_encode_video || say "  !! 兜底没挂上，出片那一步仍会报 PyAV 缺失"
+  return 0
+}
+
 # 依赖表：把这条链真正会 import 的顶层包一次列全，别一轮一轮试错
 dep_table() {
   local py=python3
@@ -1865,8 +2116,10 @@ NEED = [
     ("工具", "yaml", True, "pyyaml"),
     ("工具", "regex", True, "regex"),
     ("工具", "psutil", False, "psutil"),
+    ("出片", "av", False, "av"),
+    ("出片", "cv2", False, "opencv-python-headless"),
+    ("出片", "imageio_ffmpeg", False, "imageio-ffmpeg"),
     ("工具", "imageio", False, "imageio"),
-    ("工具", "imageio_ffmpeg", False, "imageio-ffmpeg"),
 ]
 
 missing = []
@@ -2029,6 +2282,8 @@ do_run() {
   ensure_infinilm || say "警告：_infinilm 没编出来，import infinilm.cache 会失败"
   # janus / xxhash 不在离线 pylibs 里，得先补上，否则 import infinilm 第 13 行就断
   ensure_pydeps || say "警告：janus/xxhash 没补上，import infinilm 会报 ModuleNotFoundError"
+  # 出片那一步靠 PyAV，离线环境多半没有：先备好 ffmpeg/cv2 兜底，别等生成完才炸
+  ensure_media_encoder || say "警告：出片兜底没备好，最后写 mp4 可能失败"
   # 干完重活再探一次：10:33 那单的卡就是在 21 分钟编译过程中丢的，这里能立刻看见
   local pd=0
   probe_dcu preload || pd=$?
