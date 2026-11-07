@@ -1,0 +1,2 @@
+-          return cuLaunchKernel(swiglu_2_INFINI_DTYPE_BF16_1024_334f5d42_0d123d4d5d678d9d10d111213d14d_func, gX, gY, gZ, 4 * 32, 1, 1, 0, stream, args, NULL);
++          return cuLaunchKernel(swiglu_2_INFINI_DTYPE_BF16_1024_334f5d42_0d123d4d5d678d9d10d111213d14d_func, gX, gY, gZ, 4 * 64, 1, 1, 0, stream, args, NULL);

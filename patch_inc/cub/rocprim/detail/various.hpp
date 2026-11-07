@@ -1,0 +1,318 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#ifndef ROCPRIM_DETAIL_VARIOUS_HPP_
+#define ROCPRIM_DETAIL_VARIOUS_HPP_
+
+#include <type_traits>
+
+#include "../config.hpp"
+#include "../types.hpp"
+#include "../type_traits.hpp"
+
+
+
+BEGIN_ROCPRIM_NAMESPACE
+namespace detail
+{
+
+struct empty_storage_type
+{
+
+};
+
+template<class T>
+ROCPRIM_HOST_DEVICE inline
+constexpr bool is_power_of_two(const T x)
+{
+    static_assert(::rocprim::is_integral<T>::value, "T must be integer type");
+    return (x > 0) && ((x & (x - 1)) == 0);
+}
+
+template<class T>
+ROCPRIM_HOST_DEVICE inline
+constexpr T next_power_of_two(const T x, const T acc = 1)
+{
+    static_assert(::rocprim::is_unsigned<T>::value, "T must be unsigned type");
+    return acc >= x ? acc : next_power_of_two(x, 2 * acc);
+}
+
+template <
+    typename T,
+    typename U,
+    std::enable_if_t<::rocprim::is_integral<T>::value && ::rocprim::is_unsigned<U>::value, int> = 0>
+ROCPRIM_HOST_DEVICE inline constexpr auto ceiling_div(const T a, const U b)
+{
+    return a / b + (a % b > 0 ? 1 : 0);
+}
+
+ROCPRIM_HOST_DEVICE inline
+size_t align_size(size_t size, size_t alignment = 256)
+{
+    return ceiling_div(size, alignment) * alignment;
+}
+
+
+
+template<class T>
+ROCPRIM_HOST_DEVICE inline
+constexpr T warp_size_in_class(const T warp_size)
+{
+    return warp_size;
+}
+
+
+
+template<class T>
+ROCPRIM_HOST_DEVICE inline
+constexpr T get_min_warp_size(const T block_size, const T max_warp_size)
+{
+    static_assert(::rocprim::is_unsigned<T>::value, "T must be unsigned type");
+    return block_size >= max_warp_size ? max_warp_size : next_power_of_two(block_size);
+}
+
+template<unsigned int WarpSize>
+struct is_warpsize_shuffleable {
+    static const bool value = detail::is_power_of_two(WarpSize);
+};
+
+
+
+template<class T, unsigned int N>
+struct match_vector_type
+{
+    static constexpr unsigned int size = sizeof(T) * N;
+    using vector_base_type =
+        typename std::conditional<
+            sizeof(T) >= 4,
+            int,
+            typename std::conditional<
+                sizeof(T) >= 2,
+                short,
+                char
+            >::type
+        >::type;
+
+    using vector_4 = typename make_vector_type<vector_base_type, 4>::type;
+    using vector_2 = typename make_vector_type<vector_base_type, 2>::type;
+    using vector_1 = typename make_vector_type<vector_base_type, 1>::type;
+
+    using type =
+        typename std::conditional<
+            size % sizeof(vector_4) == 0,
+            vector_4,
+            typename std::conditional<
+                size % sizeof(vector_2) == 0,
+                vector_2,
+                vector_1
+            >::type
+        >::type;
+};
+
+
+template<class T, unsigned int Items>
+struct is_vectorizable : std::integral_constant<bool, (Items % 2 == 0) &&(sizeof(T) < sizeof(typename match_vector_type<T, Items>::type))> {};
+
+
+ROCPRIM_HOST_DEVICE
+constexpr unsigned int get_lds_banks_no()
+{
+
+    return 32;
+}
+
+
+
+template<class T>
+struct match_fundamental_type
+{
+    using type =
+        typename std::conditional<
+            sizeof(T)%8 == 0,
+            unsigned long long,
+            typename std::conditional<
+                sizeof(T)%4 == 0,
+                unsigned int,
+                typename std::conditional<
+                    sizeof(T)%2 == 0,
+                    unsigned short,
+                    unsigned char
+                >::type
+            >::type
+        >::type;
+};
+
+template<class T>
+ROCPRIM_DEVICE ROCPRIM_INLINE
+auto store_volatile(T * output, T value)
+    -> typename std::enable_if<std::is_fundamental<T>::value>::type
+{
+
+
+#if !(defined(__HIP_CPU_RT__ ) && defined(__GNUC__))
+    *const_cast<volatile T*>(output) = value;
+#else
+    *output = value;
+#endif
+}
+
+template<class T>
+ROCPRIM_DEVICE ROCPRIM_INLINE
+auto store_volatile(T * output, T value)
+    -> typename std::enable_if<!std::is_fundamental<T>::value>::type
+{
+    using fundamental_type = typename match_fundamental_type<T>::type;
+    constexpr unsigned int n = sizeof(T) / sizeof(fundamental_type);
+
+    auto input_ptr = reinterpret_cast<volatile fundamental_type*>(&value);
+    auto output_ptr = reinterpret_cast<volatile fundamental_type*>(output);
+
+    ROCPRIM_UNROLL
+    for(unsigned int i = 0; i < n; i++)
+    {
+        output_ptr[i] = input_ptr[i];
+    }
+}
+
+template<class T>
+ROCPRIM_DEVICE ROCPRIM_INLINE
+auto load_volatile(T * input)
+    -> typename std::enable_if<std::is_fundamental<T>::value, T>::type
+{
+
+
+#if !(defined(__HIP_CPU_RT__ ) && defined(__GNUC__))
+    T retval = *const_cast<volatile T*>(input);
+    return retval;
+#else
+    return *input;
+#endif
+}
+
+template<class T>
+ROCPRIM_DEVICE ROCPRIM_INLINE
+auto load_volatile(T * input)
+    -> typename std::enable_if<!std::is_fundamental<T>::value, T>::type
+{
+    using fundamental_type = typename match_fundamental_type<T>::type;
+    constexpr unsigned int n = sizeof(T) / sizeof(fundamental_type);
+
+    T retval;
+    auto output_ptr = reinterpret_cast<volatile fundamental_type*>(&retval);
+    auto input_ptr = reinterpret_cast<volatile fundamental_type*>(input);
+
+    ROCPRIM_UNROLL
+    for(unsigned int i = 0; i < n; i++)
+    {
+        output_ptr[i] = input_ptr[i];
+    }
+    return retval;
+}
+
+
+template <typename T>
+struct raw_storage
+{
+
+    typedef typename detail::match_fundamental_type<T>::type device_word;
+
+
+    device_word storage[sizeof(T) / sizeof(device_word)];
+
+
+    ROCPRIM_HOST_DEVICE T& get()
+    {
+        return reinterpret_cast<T&>(*this);
+    }
+};
+
+
+template<class Iterator1, class Iterator2>
+inline
+bool are_iterators_equal(Iterator1, Iterator2)
+{
+    return false;
+}
+
+template<class Iterator>
+inline
+bool are_iterators_equal(Iterator iter1, Iterator iter2)
+{
+    return iter1 == iter2;
+}
+
+template<class...>
+using void_t = void;
+
+template<typename T>
+struct type_identity {
+    using type = T;
+};
+
+template<class T, class = void>
+struct extract_type_impl : type_identity<T> { };
+
+template<class T>
+struct extract_type_impl<T, void_t<typename T::type> > : extract_type_impl<typename T::type> { };
+
+template <typename T>
+using extract_type = typename extract_type_impl<T>::type;
+
+template<bool Value, class T>
+struct select_type_case
+{
+    static constexpr bool value = Value;
+    using type = T;
+};
+
+template<class Case, class... OtherCases>
+struct select_type_impl
+    : std::conditional<
+        Case::value,
+        type_identity<extract_type<typename Case::type>>,
+        select_type_impl<OtherCases...>
+    >::type { };
+
+template<class T>
+struct select_type_impl<select_type_case<true, T>> : type_identity<extract_type<T>> { };
+
+template<class T>
+struct select_type_impl<select_type_case<false, T>>
+{
+    static_assert(
+        sizeof(T) == 0,
+        "Cannot select any case. "
+        "The last case must have true condition or be a fallback type."
+    );
+};
+
+template<class Fallback>
+struct select_type_impl<Fallback> : type_identity<extract_type<Fallback>> { };
+
+template <typename... Cases>
+using select_type = typename select_type_impl<Cases...>::type;
+
+template <bool Value>
+using bool_constant = std::integral_constant<bool, Value>;
+
+}
+END_ROCPRIM_NAMESPACE
+
+#endif

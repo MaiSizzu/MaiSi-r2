@@ -1,0 +1,324 @@
+diff --git a/scripts/install.py b/scripts/install.py
+index 98a4482..f49fa6f 100644
+--- a/scripts/install.py
++++ b/scripts/install.py
+@@ -1,22 +1,19 @@
+ import os
+ import subprocess
+-import platform
+ import sys
+-from set_env import (
+-    set_env,
+-    set_env_by_config,
+-)
++from set_env import set_env, set_env_by_config
+ 
+ PROJECT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+ os.chdir(PROJECT_DIR)
+ 
++
+ def run_cmd(cmd):
+     subprocess.run(cmd, text=True, encoding="utf-8", check=True, shell=True)
+ 
+ 
+ def install(xmake_config_flags=""):
+     set_env_by_config(xmake_config_flags)
+-    run_cmd(f"xmake f -y {xmake_config_flags} -cv")
++    run_cmd("xmake f -y %s -cv" % xmake_config_flags)
+     run_cmd("xmake -y")
+     run_cmd("xmake install -y")
+     run_cmd("xmake build -y infiniop-test")
+diff --git a/src/infiniop/ninetoothed/build.py b/src/infiniop/ninetoothed/build.py
+index 153e6b9..ef7a374 100644
+--- a/src/infiniop/ninetoothed/build.py
++++ b/src/infiniop/ninetoothed/build.py
+@@ -20,7 +20,7 @@ def build(premake, constexpr_param_grid, caller, op_name, output_dir):
+     combinations = []
+     launches = []
+ 
+-    with concurrent.futures.ProcessPoolExecutor() as executor:
++    with concurrent.futures.ProcessPoolExecutor(max_workers=2) as executor:
+         futures = []
+ 
+         for combination in tuple(
+@@ -106,6 +106,8 @@ def _make(premake, combination, caller, op_name, output_dir):
+         caller=caller,
+         kernel_name=kernel_name,
+         output_dir=output_dir,
++        num_warps=4,
++        num_stages=3,
+     )
+ 
+     header = output_dir / f"{kernel_name}.h"
+diff --git a/src/infiniop/ops/gaussian_nll_loss/operator.cc b/src/infiniop/ops/gaussian_nll_loss/operator.cc
+index 0633198..6bfea81 100644
+--- a/src/infiniop/ops/gaussian_nll_loss/operator.cc
++++ b/src/infiniop/ops/gaussian_nll_loss/operator.cc
+@@ -57,7 +57,6 @@ __INFINI_C infiniStatus_t infiniopCreateGaussianNllLossDescriptor(
+         CREATE(INFINI_DEVICE_MOORE, moore);
+ #endif
+ #ifdef ENABLE_HYGON_API
+-        CREATE(INFINI_DEVICE_HYGON, nvidia);
+ #endif
+ 
+     default:
+@@ -91,7 +90,6 @@ __INFINI_C infiniStatus_t infiniopGetGaussianNllLossWorkspaceSize(infiniopGaussi
+         GET(INFINI_DEVICE_MOORE, moore)
+ #endif
+ #ifdef ENABLE_HYGON_API
+-        GET(INFINI_DEVICE_HYGON, nvidia)
+ #endif
+     default:
+         return INFINI_STATUS_DEVICE_TYPE_NOT_SUPPORTED;
+@@ -134,7 +132,6 @@ __INFINI_C infiniStatus_t infiniopGaussianNllLoss(
+         CALCULATE(INFINI_DEVICE_MOORE, moore);
+ #endif
+ #ifdef ENABLE_HYGON_API
+-        CALCULATE(INFINI_DEVICE_HYGON, nvidia);
+ #endif
+ 
+     default:
+@@ -170,7 +167,6 @@ infiniopDestroyGaussianNllLossDescriptor(infiniopGaussianNllLossDescriptor_t des
+         DELETE(INFINI_DEVICE_MOORE, moore);
+ #endif
+ #ifdef ENABLE_HYGON_API
+-        DELETE(INFINI_DEVICE_HYGON, nvidia);
+ #endif
+ 
+     default:
+diff --git a/src/infiniop/ops/quant/per_channel_quant_int8/cuda/kernel.cuh b/src/infiniop/ops/quant/per_channel_quant_int8/cuda/kernel.cuh
+index d575327..a3ba76b 100644
+--- a/src/infiniop/ops/quant/per_channel_quant_int8/cuda/kernel.cuh
++++ b/src/infiniop/ops/quant/per_channel_quant_int8/cuda/kernel.cuh
+@@ -49,7 +49,7 @@ __device__ void blockPerChannelQuantI8Kernel(
+     for (int ind = threadIdx.x; ind < K; ind += BLOCK_SIZE) {
+         thread_min = fminf(thread_min, (float)x[tid + ind]);
+     }
+-#if defined(INFINIOP_HYGON_GFX906)
++#if defined(ENABLE_HYGON_API)
+     float local_min = BlockReduce(temp_storage).Reduce(thread_min, per_channel_quant_int8_detail::CubMinFallback());
+ #elif CUDART_VERSION >= 12090
+     float local_min = BlockReduce(temp_storage).Reduce(thread_min, ::cuda::minimum());
+@@ -109,7 +109,7 @@ __device__ void blockPerChannelQuantI8SymKernel(
+     for (int ind = threadIdx.x; ind < K; ind += BLOCK_SIZE) {
+         thread_max = fmaxf(thread_max, fabs((float)x[tid + ind]));
+     }
+-#if defined(INFINIOP_HYGON_GFX906)
++#if defined(ENABLE_HYGON_API)
+     float local_max = BlockReduce(temp_storage).Reduce(thread_max, per_channel_quant_int8_detail::CubMaxFallback());
+ #elif CUDART_VERSION >= 12090
+     float local_max = BlockReduce(temp_storage).Reduce(thread_max, ::cuda::maximum());
+diff --git a/src/infiniop/ops/relu/ninetoothed/build.py b/src/infiniop/ops/relu/ninetoothed/build.py
+index b8d7473..1ea2fd2 100644
+--- a/src/infiniop/ops/relu/ninetoothed/build.py
++++ b/src/infiniop/ops/relu/ninetoothed/build.py
+@@ -1,12 +1,9 @@
+ import ninetoothed
+-from ntops.kernels import relu
+-
+ import infiniop.ninetoothed.build
+-
++from ntops.kernels import relu
+ 
+ def build():
+     MAX_NDIM = 5
+-
+     ndim_values = range(1, MAX_NDIM + 1)
+     dtype_values = (
+         ninetoothed.float16,
+@@ -14,13 +11,11 @@ def build():
+         ninetoothed.float32,
+         ninetoothed.float64,
+     )
+-
+     constexpr_param_grid = {
+         "ndim": ndim_values,
+         "dtype": dtype_values,
+         "block_size": (1024,),
+     }
+-
+     infiniop.ninetoothed.build.build(
+         relu.premake,
+         constexpr_param_grid,
+diff --git a/src/infiniop/ops/swiglu/operator.cc b/src/infiniop/ops/swiglu/operator.cc
+index b43cd47..e012348 100644
+--- a/src/infiniop/ops/swiglu/operator.cc
++++ b/src/infiniop/ops/swiglu/operator.cc
+@@ -8,6 +8,9 @@
+ #if defined(ENABLE_NVIDIA_API) || defined(ENABLE_ILUVATAR_API) || defined(ENABLE_QY_API) || defined(ENABLE_HYGON_API) || defined(ENABLE_ALI_API)
+ #include "nvidia/swiglu_nvidia_cuda.cuh"
+ #endif
++#if defined(ENABLE_HYGON_API)
++#include "ninetoothed/swiglu.h"
++#endif
+ #ifdef ENABLE_KUNLUN_API
+ #include "kunlun/swiglu_kunlun.h"
+ #endif
+@@ -75,7 +78,7 @@ __INFINI_C infiniStatus_t infiniopCreateSwiGLUDescriptor(
+         CREATE_CUDA(INFINI_DEVICE_QY, nvidia);
+ #endif
+ #ifdef ENABLE_HYGON_API
+-        CREATE_CUDA(INFINI_DEVICE_HYGON, nvidia);
++        CREATE(INFINI_DEVICE_HYGON, ninetoothed);
+ #endif
+ #ifdef ENABLE_KUNLUN_API
+         CREATE(INFINI_DEVICE_KUNLUN, kunlun);
+@@ -139,7 +142,7 @@ __INFINI_C infiniStatus_t infiniopGetSwiGLUWorkspaceSize(infiniopSwiGLUDescripto
+         GET_CUDA(INFINI_DEVICE_QY, nvidia);
+ #endif
+ #ifdef ENABLE_HYGON_API
+-        GET_CUDA(INFINI_DEVICE_HYGON, nvidia);
++        GET(INFINI_DEVICE_HYGON, ninetoothed);
+ #endif
+ #ifdef ENABLE_KUNLUN_API
+         GET(INFINI_DEVICE_KUNLUN, kunlun);
+@@ -209,7 +212,7 @@ __INFINI_C infiniStatus_t infiniopSwiGLU(
+         CALCULATE_CUDA(INFINI_DEVICE_QY, nvidia);
+ #endif
+ #ifdef ENABLE_HYGON_API
+-        CALCULATE_CUDA(INFINI_DEVICE_HYGON, nvidia);
++        CALCULATE(INFINI_DEVICE_HYGON, ninetoothed);
+ #endif
+ #ifdef ENABLE_KUNLUN_API
+         CALCULATE(INFINI_DEVICE_KUNLUN, kunlun);
+@@ -274,7 +277,7 @@ infiniopDestroySwiGLUDescriptor(infiniopSwiGLUDescriptor_t desc) {
+         DELETE_CUDA(INFINI_DEVICE_QY, nvidia);
+ #endif
+ #ifdef ENABLE_HYGON_API
+-        DELETE_CUDA(INFINI_DEVICE_HYGON, nvidia);
++        DELETE(INFINI_DEVICE_HYGON, ninetoothed);
+ #endif
+ #ifdef ENABLE_KUNLUN_API
+         DELETE(INFINI_DEVICE_KUNLUN, kunlun);
+diff --git a/src/infiniop/ops/topksoftmax/operator.cc b/src/infiniop/ops/topksoftmax/operator.cc
+index 56bab41..095b6fc 100644
+--- a/src/infiniop/ops/topksoftmax/operator.cc
++++ b/src/infiniop/ops/topksoftmax/operator.cc
+@@ -47,7 +47,6 @@ __INFINI_C infiniStatus_t infiniopCreateTopksoftmaxDescriptor(infiniopHandle_t h
+         CREATE(INFINI_DEVICE_ILUVATAR, nvidia);
+ #endif
+ #ifdef ENABLE_HYGON_API
+-        CREATE(INFINI_DEVICE_HYGON, nvidia);
+ #endif
+     default:
+         return INFINI_STATUS_DEVICE_TYPE_NOT_SUPPORTED;
+@@ -86,7 +85,6 @@ __INFINI_C infiniStatus_t infiniopGetTopksoftmaxWorkspaceSize(infiniopTopksoftma
+         GET(INFINI_DEVICE_ILUVATAR, nvidia);
+ #endif
+ #ifdef ENABLE_HYGON_API
+-        GET(INFINI_DEVICE_HYGON, nvidia);
+ #endif
+     default:
+         return INFINI_STATUS_DEVICE_TYPE_NOT_SUPPORTED;
+@@ -130,7 +128,6 @@ __INFINI_C infiniStatus_t infiniopTopksoftmax(infiniopTopksoftmaxDescriptor_t de
+         CALCULATE(INFINI_DEVICE_ILUVATAR, nvidia);
+ #endif
+ #ifdef ENABLE_HYGON_API
+-        CALCULATE(INFINI_DEVICE_HYGON, nvidia);
+ #endif
+     default:
+         return INFINI_STATUS_DEVICE_TYPE_NOT_SUPPORTED;
+@@ -169,7 +166,6 @@ __INFINI_C infiniStatus_t infiniopDestroyTopksoftmaxDescriptor(infiniopTopksoftm
+         DESTROY(INFINI_DEVICE_ILUVATAR, nvidia);
+ #endif
+ #ifdef ENABLE_HYGON_API
+-        DESTROY(INFINI_DEVICE_HYGON, nvidia);
+ #endif
+     default:
+         return INFINI_STATUS_DEVICE_TYPE_NOT_SUPPORTED;
+diff --git a/xmake.lua b/xmake.lua
+index 5684102..d2264fd 100644
+--- a/xmake.lua
++++ b/xmake.lua
+@@ -1,6 +1,6 @@
+ add_rules("mode.debug", "mode.release")
+-add_requires("boost", {configs = {stacktrace = true}})
+-add_requires("pybind11")
++-- add_requires("boost", {configs = {stacktrace = true}})
++-- add_requires("pybind11")
+ 
+ -- Define color codes
+ local GREEN = '\27[0;32m'
+@@ -855,7 +855,8 @@ target("infinicore_cpp_api")
+     -- pybind11/embed.h for mha_kvcache branch
+     if has_config("moore-gpu") and has_config("aten") and has_config("flash-attn") then
+         add_defines("ENABLE_MOORE_MATE_FLASH_ATTN")
+-        add_packages("pybind11")
++        add_includedirs("/work2/songshan/xmake-pkgs/pybind11/include")
++add_includedirs("/public/software/apps/anaconda3/2023.09/include/python3.11")
+     end
+ 
+     before_build(function (target)
+@@ -1086,7 +1087,8 @@ target("_infinicore")
+ 
+     set_default(false)
+     add_rules("python.library", {soabi = true})
+-    add_packages("pybind11")
++    add_includedirs("/work2/songshan/xmake-pkgs/pybind11/include")
++add_includedirs("/public/software/apps/anaconda3/2023.09/include/python3.11")
+     set_languages("cxx17")
+ 
+     add_deps("infinicore_cpp_api")
+diff --git a/xmake/hygon.lua b/xmake/hygon.lua
+index ba06ae9..710699d 100644
+--- a/xmake/hygon.lua
++++ b/xmake/hygon.lua
+@@ -120,12 +120,14 @@ target("infiniop-hygon")
+     -- 海光DCU使用DTK中的CUDA库
+     add_links("cudart", "cublas", "curand", "cublasLt", "cudnn")
+     
++add_includedirs("/work2/songshan/patch_inc")
+     add_hygon_dtk_paths()
+ 
+     set_warnings("all", "error")
+     add_cuflags("-Wno-pass-failed", {force = true})
+     add_cuflags("-Wno-error=unused-private-field", {force = true})
+-    add_cuflags("-Wno-return-type", {force = true})  -- 抑制return语句警告
++    add_cuflags("-Wno-return-type", {force = true})
++        add_cuflags("-Wno-error=deprecated-declarations", {force = true})  -- 抑制return语句警告
+     add_cuflags("-Wno-error=macro-redefined", {force = true})
+     add_cuflags("-Wno-error=ignored-attributes", {force = true})
+     add_cuflags("-Wno-error=uninitialized", {force = true})
+@@ -155,6 +157,8 @@ target("infiniop-hygon")
+     remove_files("../src/infiniop/ops/gptq_qyblas_gemm/nvidia/*.cu")
+     remove_files("../src/infiniop/ops/histc/nvidia/*.cu")
+     remove_files("../src/infiniop/ops/quant/per_tensor_quant_int8/nvidia/*.cu")
++    remove_files("../src/infiniop/ops/topksoftmax/nvidia/*.cu")
++    remove_files("../src/infiniop/ops/gaussian_nll_loss/nvidia/*.cu")
+     if has_config("ninetoothed") then
+         add_files("../build/ninetoothed/*.c", "../build/ninetoothed/*.cpp", {cxxflags = {"-Wno-return-type"}})
+     end
+@@ -169,12 +173,14 @@ target("infinirt-hygon")
+     add_rules("hygon.env")
+     set_values("cuda.rdc", false)
+ 
+-    add_links("cudart", "curand")
++    add_links("cudart", "cublas", "curand", "cublasLt", "cudnn")
+     
++add_includedirs("/work2/songshan/patch_inc")
+     add_hygon_dtk_paths()
+ 
+     set_warnings("all", "error")
+-    add_cuflags("-Wno-return-type", {force = true})  -- 抑制return语句警告
++    add_cuflags("-Wno-return-type", {force = true})
++        add_cuflags("-Wno-error=deprecated-declarations", {force = true})  -- 抑制return语句警告
+     add_cuflags("-Wno-error=macro-redefined", {force = true})
+     add_cuflags("-Wno-error=ignored-attributes", {force = true})
+     add_cuflags("-Wno-error=uninitialized", {force = true})
+@@ -202,12 +208,14 @@ target("infiniccl-hygon")
+         add_rules("hygon.env")
+         set_values("cuda.rdc", false)
+ 
+-        add_links("cudart", "curand")
++        add_links("cudart", "cublas", "curand", "cublasLt", "cudnn")
+         
++add_includedirs("/work2/songshan/patch_inc")
+         add_hygon_dtk_paths()
+ 
+         set_warnings("all", "error")
+-        add_cuflags("-Wno-return-type", {force = true})  -- 抑制return语句警告
++        add_cuflags("-Wno-return-type", {force = true})
++        add_cuflags("-Wno-error=deprecated-declarations", {force = true})  -- 抑制return语句警告
+         add_cuflags("-Wno-error=macro-redefined", {force = true})
+         add_cuflags("-Wno-error=ignored-attributes", {force = true})
+         add_cuflags("-Wno-error=uninitialized", {force = true})

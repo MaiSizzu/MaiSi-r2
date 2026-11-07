@@ -1,0 +1,17 @@
+# 编译产物
+*.o
+*.so
+*.a
+*.dylib
+__pycache__/
+*.pyc
+*.pyo
+
+# 运行时目录（run.sh 在 AFS 上生成的）
+xbin/
+.xbin/
+ic_work/
+infini/
+outputs/
+songshan_pkg/
+.cache/

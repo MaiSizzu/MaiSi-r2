@@ -1,0 +1,33 @@
+diff --git a/csrc/pybind11/engine/engine.hpp b/csrc/pybind11/engine/engine.hpp
+index 5ac341d..a526885 100644
+--- a/csrc/pybind11/engine/engine.hpp
++++ b/csrc/pybind11/engine/engine.hpp
+@@ -74,7 +74,7 @@ inline void bind_infer_engine(py::module &m) {
+                           const std::string &config_str,
+                           const distributed::DistConfig &dist,
+                           infinicore::Device::Type dev,
+-                          std::shared_ptr<const infinilm::cache::CacheConfig> cache_cfg,
++                          std::shared_ptr<infinilm::cache::CacheConfig> cache_cfg,
+                           bool enable_graph_compiling,
+                           const std::string &attention_backend,
+                           std::optional<infinicore::DataType> kv_cache_dtype,
+diff --git a/xmake.lua b/xmake.lua
+index dd04bbb..2f816ad 100644
+--- a/xmake.lua
++++ b/xmake.lua
+@@ -1,4 +1,4 @@
+-add_requires("pybind11")
++-- add_requires pybind11 offline
+ 
+ set_toolchains("gcc")
+ 
+@@ -22,7 +22,8 @@ add_includedirs("third_party/spdlog/include")
+ add_includedirs("third_party/json/single_include/")
+ 
+ target("_infinilm")
+-    add_packages("pybind11")
++    add_includedirs(os.getenv("PYBIND11_INCLUDE"), { public = false })
++add_includedirs(os.getenv("PYTHON_INCLUDE") or "/public/software/apps/anaconda3/2023.09/include/python3.11", { public = false })
+     set_default(false)
+     add_rules("python.module", {soabi = true})
+     set_languages("cxx17")

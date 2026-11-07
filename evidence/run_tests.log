@@ -1,0 +1,84 @@
+=== swiglu ===
+Testing SwiGLU on Hygon with shape:(13, 4) a_stride:None b_stride:None c_stride:None dtype:F16 inplace:Inplace.OUT_OF_PLACE
+Testing SwiGLU on Hygon with shape:(13, 4) a_stride:None b_stride:None c_stride:None dtype:BF16 inplace:Inplace.OUT_OF_PLACE
+Testing SwiGLU on Hygon with shape:(13, 4) a_stride:None b_stride:None c_stride:None dtype:F32 inplace:Inplace.OUT_OF_PLACE
+Testing SwiGLU on Hygon with shape:(13, 4) a_stride:None b_stride:None c_stride:None dtype:F16 inplace:Inplace.INPLACE_A
+Testing SwiGLU on Hygon with shape:(13, 4) a_stride:None b_stride:None c_stride:None dtype:BF16 inplace:Inplace.INPLACE_A
+Testing SwiGLU on Hygon with shape:(13, 4) a_stride:None b_stride:None c_stride:None dtype:F32 inplace:Inplace.INPLACE_A
+Testing SwiGLU on Hygon with shape:(13, 4) a_stride:None b_stride:None c_stride:None dtype:F16 inplace:Inplace.INPLACE_B
+Testing SwiGLU on Hygon with shape:(13, 4) a_stride:None b_stride:None c_stride:None dtype:BF16 inplace:Inplace.INPLACE_B
+Testing SwiGLU on Hygon with shape:(13, 4) a_stride:None b_stride:None c_stride:None dtype:F32 inplace:Inplace.INPLACE_B
+Testing SwiGLU on Hygon with shape:(13, 4) a_stride:(10, 1) b_stride:(10, 1) c_stride:(10, 1) dtype:F16 inplace:Inplace.OUT_OF_PLACE
+Testing SwiGLU on Hygon with shape:(13, 4) a_stride:(10, 1) b_stride:(10, 1) c_stride:(10, 1) dtype:BF16 inplace:Inplace.OUT_OF_PLACE
+Testing SwiGLU on Hygon with shape:(13, 4) a_stride:(10, 1) b_stride:(10, 1) c_stride:(10, 1) dtype:F32 inplace:Inplace.OUT_OF_PLACE
+Testing SwiGLU on Hygon with shape:(13, 4) a_stride:(10, 1) b_stride:(10, 1) c_stride:(10, 1) dtype:F16 inplace:Inplace.INPLACE_A
+Testing SwiGLU on Hygon with shape:(13, 4) a_stride:(10, 1) b_stride:(10, 1) c_stride:(10, 1) dtype:BF16 inplace:Inplace.INPLACE_A
+Testing SwiGLU on Hygon with shape:(13, 4) a_stride:(10, 1) b_stride:(10, 1) c_stride:(10, 1) dtype:F32 inplace:Inplace.INPLACE_A
+Testing SwiGLU on Hygon with shape:(13, 4) a_stride:(10, 1) b_stride:(10, 1) c_stride:(10, 1) dtype:F16 inplace:Inplace.INPLACE_B
+Testing SwiGLU on Hygon with shape:(13, 4) a_stride:(10, 1) b_stride:(10, 1) c_stride:(10, 1) dtype:BF16 inplace:Inplace.INPLACE_B
+Testing SwiGLU on Hygon with shape:(13, 4) a_stride:(10, 1) b_stride:(10, 1) c_stride:(10, 1) dtype:F32 inplace:Inplace.INPLACE_B
+Testing SwiGLU on Hygon with shape:(13, 4) a_stride:(0, 1) b_stride:None c_stride:None dtype:F16 inplace:Inplace.OUT_OF_PLACE
+Testing SwiGLU on Hygon with shape:(13, 4) a_stride:(0, 1) b_stride:None c_stride:None dtype:BF16 inplace:Inplace.OUT_OF_PLACE
+Testing SwiGLU on Hygon with shape:(13, 4) a_stride:(0, 1) b_stride:None c_stride:None dtype:F32 inplace:Inplace.OUT_OF_PLACE
+Testing SwiGLU on Hygon with shape:(13, 4) a_stride:(0, 1) b_stride:None c_stride:None dtype:F16 inplace:Inplace.INPLACE_B
+Testing SwiGLU on Hygon with shape:(13, 4) a_stride:(0, 1) b_stride:None c_stride:None dtype:BF16 inplace:Inplace.INPLACE_B
+Testing SwiGLU on Hygon with shape:(13, 4) a_stride:(0, 1) b_stride:None c_stride:None dtype:F32 inplace:Inplace.INPLACE_B
+Testing SwiGLU on Hygon with shape:(13, 4, 4) a_stride:None b_stride:None c_stride:None dtype:F16 inplace:Inplace.OUT_OF_PLACE
+Testing SwiGLU on Hygon with shape:(13, 4, 4) a_stride:None b_stride:None c_stride:None dtype:BF16 inplace:Inplace.OUT_OF_PLACE
+Testing SwiGLU on Hygon with shape:(13, 4, 4) a_stride:None b_stride:None c_stride:None dtype:F32 inplace:Inplace.OUT_OF_PLACE
+Testing SwiGLU on Hygon with shape:(13, 4, 4) a_stride:None b_stride:None c_stride:None dtype:F16 inplace:Inplace.INPLACE_A
+Testing SwiGLU on Hygon with shape:(13, 4, 4) a_stride:None b_stride:None c_stride:None dtype:BF16 inplace:Inplace.INPLACE_A
+Testing SwiGLU on Hygon with shape:(13, 4, 4) a_stride:None b_stride:None c_stride:None dtype:F32 inplace:Inplace.INPLACE_A
+Testing SwiGLU on Hygon with shape:(13, 4, 4) a_stride:None b_stride:None c_stride:None dtype:F16 inplace:Inplace.INPLACE_B
+Testing SwiGLU on Hygon with shape:(13, 4, 4) a_stride:None b_stride:None c_stride:None dtype:BF16 inplace:Inplace.INPLACE_B
+Testing SwiGLU on Hygon with shape:(13, 4, 4) a_stride:None b_stride:None c_stride:None dtype:F32 inplace:Inplace.INPLACE_B
+Testing SwiGLU on Hygon with shape:(13, 4, 4) a_stride:(20, 4, 1) b_stride:(20, 4, 1) c_stride:(20, 4, 1) dtype:F16 inplace:Inplace.OUT_OF_PLACE
+Testing SwiGLU on Hygon with shape:(13, 4, 4) a_stride:(20, 4, 1) b_stride:(20, 4, 1) c_stride:(20, 4, 1) dtype:BF16 inplace:Inplace.OUT_OF_PLACE
+Testing SwiGLU on Hygon with shape:(13, 4, 4) a_stride:(20, 4, 1) b_stride:(20, 4, 1) c_stride:(20, 4, 1) dtype:F32 inplace:Inplace.OUT_OF_PLACE
+Testing SwiGLU on Hygon with shape:(13, 4, 4) a_stride:(20, 4, 1) b_stride:(20, 4, 1) c_stride:(20, 4, 1) dtype:F16 inplace:Inplace.INPLACE_A
+Testing SwiGLU on Hygon with shape:(13, 4, 4) a_stride:(20, 4, 1) b_stride:(20, 4, 1) c_stride:(20, 4, 1) dtype:BF16 inplace:Inplace.INPLACE_A
+Testing SwiGLU on Hygon with shape:(13, 4, 4) a_stride:(20, 4, 1) b_stride:(20, 4, 1) c_stride:(20, 4, 1) dtype:F32 inplace:Inplace.INPLACE_A
+Testing SwiGLU on Hygon with shape:(13, 4, 4) a_stride:(20, 4, 1) b_stride:(20, 4, 1) c_stride:(20, 4, 1) dtype:F16 inplace:Inplace.INPLACE_B
+Testing SwiGLU on Hygon with shape:(13, 4, 4) a_stride:(20, 4, 1) b_stride:(20, 4, 1) c_stride:(20, 4, 1) dtype:BF16 inplace:Inplace.INPLACE_B
+Testing SwiGLU on Hygon with shape:(13, 4, 4) a_stride:(20, 4, 1) b_stride:(20, 4, 1) c_stride:(20, 4, 1) dtype:F32 inplace:Inplace.INPLACE_B
+Testing SwiGLU on Hygon with shape:(13, 4, 4) a_stride:(4, 0, 1) b_stride:(0, 4, 1) c_stride:None dtype:F16 inplace:Inplace.OUT_OF_PLACE
+Testing SwiGLU on Hygon with shape:(13, 4, 4) a_stride:(4, 0, 1) b_stride:(0, 4, 1) c_stride:None dtype:BF16 inplace:Inplace.OUT_OF_PLACE
+Testing SwiGLU on Hygon with shape:(13, 4, 4) a_stride:(4, 0, 1) b_stride:(0, 4, 1) c_stride:None dtype:F32 inplace:Inplace.OUT_OF_PLACE
+Testing SwiGLU on Hygon with shape:(16, 5632) a_stride:None b_stride:None c_stride:None dtype:F16 inplace:Inplace.OUT_OF_PLACE
+Testing SwiGLU on Hygon with shape:(16, 5632) a_stride:None b_stride:None c_stride:None dtype:BF16 inplace:Inplace.OUT_OF_PLACE
+Testing SwiGLU on Hygon with shape:(16, 5632) a_stride:None b_stride:None c_stride:None dtype:F32 inplace:Inplace.OUT_OF_PLACE
+Testing SwiGLU on Hygon with shape:(16, 5632) a_stride:None b_stride:None c_stride:None dtype:F16 inplace:Inplace.INPLACE_A
+Testing SwiGLU on Hygon with shape:(16, 5632) a_stride:None b_stride:None c_stride:None dtype:BF16 inplace:Inplace.INPLACE_A
+Testing SwiGLU on Hygon with shape:(16, 5632) a_stride:None b_stride:None c_stride:None dtype:F32 inplace:Inplace.INPLACE_A
+Testing SwiGLU on Hygon with shape:(16, 5632) a_stride:None b_stride:None c_stride:None dtype:F16 inplace:Inplace.INPLACE_B
+Testing SwiGLU on Hygon with shape:(16, 5632) a_stride:None b_stride:None c_stride:None dtype:BF16 inplace:Inplace.INPLACE_B
+Testing SwiGLU on Hygon with shape:(16, 5632) a_stride:None b_stride:None c_stride:None dtype:F32 inplace:Inplace.INPLACE_B
+Testing SwiGLU on Hygon with shape:(16, 5632) a_stride:(13312, 1) b_stride:(13312, 1) c_stride:(13312, 1) dtype:F16 inplace:Inplace.OUT_OF_PLACE
+Testing SwiGLU on Hygon with shape:(16, 5632) a_stride:(13312, 1) b_stride:(13312, 1) c_stride:(13312, 1) dtype:BF16 inplace:Inplace.OUT_OF_PLACE
+Testing SwiGLU on Hygon with shape:(16, 5632) a_stride:(13312, 1) b_stride:(13312, 1) c_stride:(13312, 1) dtype:F32 inplace:Inplace.OUT_OF_PLACE
+Testing SwiGLU on Hygon with shape:(16, 5632) a_stride:(13312, 1) b_stride:(13312, 1) c_stride:(13312, 1) dtype:F16 inplace:Inplace.INPLACE_A
+Testing SwiGLU on Hygon with shape:(16, 5632) a_stride:(13312, 1) b_stride:(13312, 1) c_stride:(13312, 1) dtype:BF16 inplace:Inplace.INPLACE_A
+Testing SwiGLU on Hygon with shape:(16, 5632) a_stride:(13312, 1) b_stride:(13312, 1) c_stride:(13312, 1) dtype:F32 inplace:Inplace.INPLACE_A
+Testing SwiGLU on Hygon with shape:(16, 5632) a_stride:(13312, 1) b_stride:(13312, 1) c_stride:(13312, 1) dtype:F16 inplace:Inplace.INPLACE_B
+Testing SwiGLU on Hygon with shape:(16, 5632) a_stride:(13312, 1) b_stride:(13312, 1) c_stride:(13312, 1) dtype:BF16 inplace:Inplace.INPLACE_B
+Testing SwiGLU on Hygon with shape:(16, 5632) a_stride:(13312, 1) b_stride:(13312, 1) c_stride:(13312, 1) dtype:F32 inplace:Inplace.INPLACE_B
+Testing SwiGLU on Hygon with shape:(4, 4, 5632) a_stride:None b_stride:None c_stride:None dtype:F16 inplace:Inplace.OUT_OF_PLACE
+Testing SwiGLU on Hygon with shape:(4, 4, 5632) a_stride:None b_stride:None c_stride:None dtype:BF16 inplace:Inplace.OUT_OF_PLACE
+Testing SwiGLU on Hygon with shape:(4, 4, 5632) a_stride:None b_stride:None c_stride:None dtype:F32 inplace:Inplace.OUT_OF_PLACE
+Testing SwiGLU on Hygon with shape:(4, 4, 5632) a_stride:None b_stride:None c_stride:None dtype:F16 inplace:Inplace.INPLACE_A
+Testing SwiGLU on Hygon with shape:(4, 4, 5632) a_stride:None b_stride:None c_stride:None dtype:BF16 inplace:Inplace.INPLACE_A
+Testing SwiGLU on Hygon with shape:(4, 4, 5632) a_stride:None b_stride:None c_stride:None dtype:F32 inplace:Inplace.INPLACE_A
+Testing SwiGLU on Hygon with shape:(4, 4, 5632) a_stride:None b_stride:None c_stride:None dtype:F16 inplace:Inplace.INPLACE_B
+Testing SwiGLU on Hygon with shape:(4, 4, 5632) a_stride:None b_stride:None c_stride:None dtype:BF16 inplace:Inplace.INPLACE_B
+Testing SwiGLU on Hygon with shape:(4, 4, 5632) a_stride:None b_stride:None c_stride:None dtype:F32 inplace:Inplace.INPLACE_B
+Testing SwiGLU on Hygon with shape:(4, 4, 5632) a_stride:(45056, 5632, 1) b_stride:(45056, 5632, 1) c_stride:(45056, 5632, 1) dtype:F16 inplace:Inplace.OUT_OF_PLACE
+Testing SwiGLU on Hygon with shape:(4, 4, 5632) a_stride:(45056, 5632, 1) b_stride:(45056, 5632, 1) c_stride:(45056, 5632, 1) dtype:BF16 inplace:Inplace.OUT_OF_PLACE
+Testing SwiGLU on Hygon with shape:(4, 4, 5632) a_stride:(45056, 5632, 1) b_stride:(45056, 5632, 1) c_stride:(45056, 5632, 1) dtype:F32 inplace:Inplace.OUT_OF_PLACE
+Testing SwiGLU on Hygon with shape:(4, 4, 5632) a_stride:(45056, 5632, 1) b_stride:(45056, 5632, 1) c_stride:(45056, 5632, 1) dtype:F16 inplace:Inplace.INPLACE_A
+Testing SwiGLU on Hygon with shape:(4, 4, 5632) a_stride:(45056, 5632, 1) b_stride:(45056, 5632, 1) c_stride:(45056, 5632, 1) dtype:BF16 inplace:Inplace.INPLACE_A
+Testing SwiGLU on Hygon with shape:(4, 4, 5632) a_stride:(45056, 5632, 1) b_stride:(45056, 5632, 1) c_stride:(45056, 5632, 1) dtype:F32 inplace:Inplace.INPLACE_A
+Testing SwiGLU on Hygon with shape:(4, 4, 5632) a_stride:(45056, 5632, 1) b_stride:(45056, 5632, 1) c_stride:(45056, 5632, 1) dtype:F16 inplace:Inplace.INPLACE_B
+Testing SwiGLU on Hygon with shape:(4, 4, 5632) a_stride:(45056, 5632, 1) b_stride:(45056, 5632, 1) c_stride:(45056, 5632, 1) dtype:BF16 inplace:Inplace.INPLACE_B
+Testing SwiGLU on Hygon with shape:(4, 4, 5632) a_stride:(45056, 5632, 1) b_stride:(45056, 5632, 1) c_stride:(45056, 5632, 1) dtype:F32 inplace:Inplace.INPLACE_B
+[92mTest passed![0m
+swiglu_exit=0

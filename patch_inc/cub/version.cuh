@@ -1,0 +1,21 @@
+#ifndef HIPCUB_VERSION_HPP_
+#define HIPCUB_VERSION_HPP_
+
+
+
+
+
+
+
+
+
+
+
+
+#define CUB_VERSION 2 * 100000 + 10 * 100 + 12
+
+#define CUB_MAJOR_VERSION 2
+#define CUB_MINOR_VERSION 10
+#define CUB_SUBMINOR_VERSION 12
+
+#endif
