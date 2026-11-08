@@ -1087,6 +1087,36 @@ ensure_nt_header() {
 #   代码里却是   from infinicore.lib import _infinicore  -> 要 python/infinicore/lib/
 # 而 $SRC_IC 是上个作业 uid 的只读树，cp 回去会静默失败（2>/dev/null 把报错吃掉）。
 # 于是把「完整包 + lib/ 下的 .so」拼到可写目录，PYTHONPATH 前置，绕开写权限。
+# 把刚编出来的 libinfinicore_cpp_api.so 刷到所有可能被加载的位置。
+# 判据是内容（cmp -s），一致就不动，免得每轮白拷一份几十 MB 的库。
+refresh_cpp_api() {
+  local newapi="" f dst n=0
+  if [ -n "$IC" ] && [ -f "$IC/build/linux/x86_64/release/libinfinicore_cpp_api.so" ]; then
+    newapi=$IC/build/linux/x86_64/release/libinfinicore_cpp_api.so
+  elif [ -n "$IC" ]; then
+    newapi=$(find "$IC/build" -maxdepth 4 -name libinfinicore_cpp_api.so 2>/dev/null | head -1)
+  fi
+  if [ -z "$newapi" ] || [ ! -f "$newapi" ]; then
+    say "  (编译树里没有 libinfinicore_cpp_api.so，跳过刷新：IC=${IC:-未定})"
+    return 0
+  fi
+  for dst in "$INFINI/lib" "$OVL/infinicore/lib" "$OVL/lib" \
+             "$SRC_IC/python/infinicore/lib" "$AFS/ic_py/infinicore/lib"; do
+    [ -d "$dst" ] || continue
+    if [ -f "$dst/libinfinicore_cpp_api.so" ] && cmp -s "$newapi" "$dst/libinfinicore_cpp_api.so"; then
+      continue
+    fi
+    if cp -f "$newapi" "$dst/libinfinicore_cpp_api.so" 2>/dev/null; then
+      n=$((n + 1))
+      say "  libinfinicore_cpp_api.so 刷新 → $dst  $(ls -lh "$newapi" 2>/dev/null | awk '{print $5}')"
+    else
+      say "  !! cpp_api 刷新失败（只读或被占）：$dst"
+    fi
+  done
+  [ "$n" = "0" ] && say "  libinfinicore_cpp_api.so 与编译树一致，不重复拷"
+  return 0
+}
+
 ensure_infinicore_overlay() {
   # 单独跑 smoke / full 时没走 pick_ic，这里补一下
   [ -n "$SRC_IC" ] || SRC_IC=$PKG/src/InfiniCore
@@ -1100,6 +1130,13 @@ ensure_infinicore_overlay() {
       IC=$SRC_IC
     fi
   fi
+  # 重编过 cpp_api 之后，$INFINI/lib 里的旧副本必须换掉。
+  # _infinilm.so 通过 RPATH 去 $INFINI/lib 找 libinfinicore_cpp_api.so，
+  # 而 ensure_infini_root 是「文件不存在才补」，永远刷不新旧文件 ——
+  # 改了 C++ 算子（ops/multi_head_attention/mha_composed_fallback.cc）却还在跑旧实现，
+  # 就会继续 rip=0。这里按内容比对，不一致就覆盖所有副本。
+  refresh_cpp_api
+
   local so
   so=$(ls "$IC"/python/infinicore/_infinicore*.so 2>/dev/null | head -1)
   if [ -z "$so" ]; then
@@ -3769,12 +3806,241 @@ PYEOF
   return 0
 }
 
+# =============================================================================
+# Hygon 上没有 flash-attn 扩展时，MultiheadAttention 在 dispatcher 里一个实现都没有：
+#   xmake.lua 只有 --flash-attn 非空才保留 ops/*/hygon/*.cc，
+#   而通用版 mha_flashattn.cc 只编 NVIDIA/METAX/QY，
+#   graph.hpp 的 INFINICORE_GRAPH_OP_DISPATCH 又不判空 -> call 0 -> SIGSEGV(rip=0)。
+# 结果：首帧图片一进视觉塔（qwen3_5_vision.cpp 的 op::mha）就整轮崩掉。
+# 下面这份 .cc 用 matmul+softmax+matmul 补一份组合实现，数学路径和 InfiniLM 的
+# static_attn 后端完全一致（那条路在文本塔上已经跑通过）。
+#
+# 为什么用 heredoc 而不是让仓库里的文件自己过去：
+#   ensure_pkg 看到 $PKG/src/InfiniLM 就「已解包，跳过」，仓库里的改动传不到平台；
+#   只有 run.sh 本身每单都是新的。所以和 h3_trace.py / cuda shim 一个套路。
+# 仓库原件：src/InfiniCore/src/infinicore/ops/multi_head_attention/mha_composed_fallback.cc
+# 两边必须逐字节一致，_fix/test_mha_fallback.sh 会比对。
+# =============================================================================
+inject_mha_fallback() {
+  if [ -z "${IC:-}" ]; then
+    say "  !! IC 还没定，注入不了 mha 兜底实现"
+    return 1
+  fi
+  local dir=$IC/src/infinicore/ops/multi_head_attention
+  local f=$dir/mha_composed_fallback.cc
+  if ! mkdir -p "$dir" 2>/dev/null; then
+    say "  !! 建不了目录 $dir（编译树是上个作业的只读树？）"
+    say "     mha 兜底注入不了 = 这一单还会 rip=0，先别跑"
+    return 1
+  fi
+  local tmp=$dir/.mha_fallback.new.cc
+  cat > "$tmp" <<'MHA_FALLBACK_CC_EOF'
+// Hygon(DCU) 上没有 flash-attn 扩展时的 MultiheadAttention 兜底实现。
+//
+// 背景：xmake.lua 只有在 --flash-attn 不为空时才保留 ops/*/hygon/*.cc，
+// 而 hygon/mha_flashattn_hygon.cc 又被 `#if defined(ENABLE_HYGON_API) &&
+// defined(ENABLE_FLASH_ATTN)` 包住；通用版 mha_flashattn.cc 只编 NVIDIA/METAX/QY。
+// 于是 README 的标准构建（--hygon-dcu=y --ninetoothed=y --ccl=y，无 --flash-attn）
+// 下 MultiheadAttention 的 dispatcher 里 **一个函数指针都没有**，
+// graph.hpp 的 INFINICORE_GRAPH_OP_DISPATCH 又不判空，直接 call 0 -> SIGSEGV(rip=0)。
+//
+// 这里用已注册的基础算子把注意力算出来（和 InfiniLM 的 static_attn 后端同一条数学路径）：
+//     q·k^T (matmul, alpha=scale) -> softmax/causal_softmax -> ·v (matmul)
+// 输入输出布局沿用调用方约定：[B, S, H, D]（vision 塔与 DiT 都是这么传的）。
+//
+// 编译条件刻意写成「Hygon 且没有 ENABLE_FLASH_ATTN」：只有这一种配置是坏的。
+// 一旦有人用 --flash-attn 编（走 hygon/mha_flashattn_hygon.cc 的真实现），
+// 本文件整体不参与编译，绝不会顶掉快路径。
+
+#if defined(ENABLE_HYGON_API) && !defined(ENABLE_FLASH_ATTN)
+
+#include "infinicore/ops/mha.hpp"
+
+#include "infinicore/ops/causal_softmax.hpp"
+#include "infinicore/ops/matmul.hpp"
+#include "infinicore/ops/softmax.hpp"
+
+#include <cstdio>
+#include <stdexcept>
+#include <string>
+
+namespace infinicore::op::mha_impl::composed {
+
+struct PlannedMeta {
+    graph::GraphTensor out, q, k, v;
+    float scale;
+    bool is_causal;
+};
+
+void *plan(Tensor out,
+           const Tensor &q,
+           const Tensor &k,
+           const Tensor &v,
+           std::optional<Tensor> alibi_slopes,
+           float scale,
+           bool is_causal) {
+    // 调用点（qwen3_5_vision / minimax_h3_transformer）都是 4D + 无 alibi；
+    // 真出现别的用法时宁可在 plan 阶段报错，也不要算出错误结果。
+    if (q->shape().size() != 4) {
+        throw std::runtime_error(
+            "MultiheadAttention(composed fallback): expect 4D [B,S,H,D] tensors, got rank "
+            + std::to_string(q->shape().size()));
+    }
+    if (alibi_slopes.has_value()) {
+        throw std::runtime_error(
+            "MultiheadAttention(composed fallback): alibi_slopes is not supported");
+    }
+
+    return new PlannedMeta{
+        graph::GraphTensor(out),
+        graph::GraphTensor(q),
+        graph::GraphTensor(k),
+        graph::GraphTensor(v),
+        scale,
+        is_causal};
+}
+
+namespace {
+
+std::string shape_str(const Tensor &t) {
+    std::string s = "[";
+    for (size_t i = 0; i < t->shape().size(); ++i) {
+        if (i) s += ",";
+        s += std::to_string(t->shape()[i]);
+    }
+    return s + "]";
+}
+
+void note_once() {
+    static bool done = false;
+    if (!done) {
+        done = true;
+        std::fprintf(stderr,
+                     "[mha] 使用 InfiniCore 组合实现（matmul+softmax+matmul），"
+                     "本平台无 flash-attn 扩展\n");
+    }
+}
+
+} // namespace
+
+void run(void *planned_meta) {
+    auto *p = reinterpret_cast<PlannedMeta *>(planned_meta);
+    Tensor out(p->out);
+    Tensor q(p->q);
+    Tensor k(p->k);
+    Tensor v(p->v);
+
+    const auto &qs = q->shape();
+    const size_t batch_size = qs[0];
+    const size_t seq_len = qs[1];
+    const size_t num_heads = qs[2];
+    const size_t head_dim = qs[3];
+
+    const size_t num_kv_heads = k->size(2);
+    const size_t value_head_dim = v->size(3);
+
+    if (num_heads % num_kv_heads != 0) {
+        throw std::runtime_error(
+            "MultiheadAttention(composed fallback): num_heads " + std::to_string(num_heads)
+            + " is not a multiple of num_kv_heads " + std::to_string(num_kv_heads)
+            + " q=" + shape_str(q) + " k=" + shape_str(k) + " v=" + shape_str(v));
+    }
+
+    note_once();
+
+    const size_t ngroup = num_heads / num_kv_heads;
+
+    // [B, S, H, D] -> [B, H, S, D] -> [B*H_kv, ngroup*S, D]
+    auto Q = q->permute({0, 2, 1, 3})
+                 ->contiguous()
+                 ->view({batch_size * num_kv_heads, ngroup * seq_len, head_dim});
+    auto K = k->permute({0, 2, 1, 3})
+                 ->contiguous()
+                 ->view({batch_size * num_kv_heads, seq_len, head_dim});
+    auto V = v->permute({0, 2, 1, 3})
+                 ->contiguous()
+                 ->view({batch_size * num_kv_heads, seq_len, value_head_dim});
+
+    auto K_transposed = K->permute({0, 2, 1}); // [B*H_kv, D, S]
+
+    // alpha 直接折进 matmul，省一次全量缩放
+    auto attn_weight = op::matmul(Q, K_transposed, p->scale); // [B*H_kv, ngroup*S, S]
+
+    auto flat = attn_weight->view({batch_size * num_heads, seq_len, seq_len});
+    // causal 用 causal_softmax_（static_attn 已验证过原地可用）；
+    // 非 causal 走独立的 softmax，避免 out/in 同一块内存时还要赌实现里的原地语义。
+    Tensor probs = flat;
+    if (p->is_causal) {
+        op::causal_softmax_(flat, flat);
+    } else {
+        probs = op::softmax(flat, -1)
+                    ->view({batch_size * num_kv_heads, ngroup * seq_len, seq_len});
+    }
+
+    auto attn_out = op::matmul(probs, V); // [B*H_kv, ngroup*S, D_v]
+
+    auto merged = attn_out->view({batch_size, num_heads, seq_len, value_head_dim})
+                      ->permute({0, 2, 1, 3})
+                      ->contiguous()
+                      ->view({batch_size, seq_len, num_heads * value_head_dim});
+
+    out->copy_from(merged);
+}
+
+void cleanup(void **planned_meta_ptr) {
+    delete *reinterpret_cast<PlannedMeta **>(planned_meta_ptr);
+    *planned_meta_ptr = nullptr;
+}
+
+namespace {
+
+static bool registered = []() {
+    // 这个编译分支下 hygon 没有任何 mha 注册，直接占位（override=true 只是为了让
+    // 静态初始化顺序无关紧要——真实现存在时整个文件都不编译）。
+    MultiheadAttention::plan_dispatcher().registerAll(&plan, true);
+    MultiheadAttention::run_dispatcher().registerAll(&run, true);
+    MultiheadAttention::cleanup_dispatcher().registerAll(&cleanup, true);
+    return true;
+}();
+
+} // namespace
+
+} // namespace infinicore::op::mha_impl::composed
+
+#endif // ENABLE_HYGON_API && !ENABLE_FLASH_ATTN
+MHA_FALLBACK_CC_EOF
+  if [ ! -s "$tmp" ]; then
+    say "  !! mha 兜底实现写出来是空的（heredoc 被截断？）"
+    rm -f "$tmp" 2>/dev/null
+    return 1
+  fi
+  if [ -f "$f" ] && cmp -s "$tmp" "$f"; then
+    rm -f "$tmp" 2>/dev/null
+    say "  mha 兜底实现已在编译树里且内容一致：$(basename "$f")"
+    return 0
+  fi
+  if mv -f "$tmp" "$f" 2>/dev/null || { cp -f "$tmp" "$f" 2>/dev/null && rm -f "$tmp" 2>/dev/null; }; then
+    say "  mha 兜底实现注入：$f"
+    say "    $(wc -c < "$f" | tr -d ' ') 字节  md5 $(md5sum "$f" 2>/dev/null | awk '{print $1}')"
+    return 0
+  fi
+  say "  !! 注入失败（写不进去）：$f"
+  return 1
+}
+
+# 这份 .cc 的 md5：smoke 每轮拿它和 $OUT/.stamp_mha_fallback 比，
+# 不一致就编一次（平台只给 smoke 入口，没法手动 build）。
+# 改了上面的 heredoc 就必须同步这一行，_fix/test_mha_fallback.sh 会核对。
+MHA_FALLBACK_CC_MD5=273202a6a67cee99517f9398e05c7b74
+
 do_build() {
   ensure_pkg
   ensure_deps
   ensure_xmake
   pick_ic
   cd "$IC" || die "进不去 $IC"
+  # 先补算子源码：xmake configure 会扫 add_files，晚于它写文件就要再 configure 一次
+  inject_mha_fallback || die "mha 兜底实现没注入成功，跑下去还是 rip=0"
 
   # 上一个作业 32 并发编 infiniop 花了 2317 秒，而节点有 128 核；这里按内存一起放宽。
   # 每个 hipcc 模板实例化峰值约 3~4 GB，按 MemTotal/4 收口，避免 OOM 直接整轮白跑。
@@ -3846,11 +4112,12 @@ do_build() {
   if [ -f "$STAMP_IOP" ] && [ -f "$INFINI/lib/libinfiniop.so" ]; then need_iop=0; fi
   # 产物判据以编译树 $IC 为准（$SRC_IC 是上个作业 uid 的只读树，别拿它当判据）
   if ls "$IC"/python/infinicore/_infinicore*.so >/dev/null 2>&1; then
-    # stamp 丢了但 .so 还在（11-07 那轮就是：编完但 stamp 没写），直接复用，别再花 280s configure
-    if [ -f "$STAMP_CORE" ]; then
+    # FORCE_BUILD 必须优先于 stamp：stamp 只表示「编过一次」，不代表「编的是当前源码」。
+    # 改了 C++ 算子后如果还按 stamp 跳过，就会一直跑旧的 libinfinicore_cpp_api.so。
+    if [ "${FORCE_BUILD:-0}" = "1" ]; then
+      say "  FORCE_BUILD=1，忽略已有 _infinicore.so 与 stamp，强制重编（增量只补改动的 .cc）"
+    elif [ -f "$STAMP_CORE" ]; then
       need_core=0
-    elif [ "${FORCE_BUILD:-0}" = "1" ]; then
-      say "  FORCE_BUILD=1，忽略已有 _infinicore.so 重新编译"
     else
       say "4/4 发现已编译好的 _infinicore.so（无 stamp），直接复用；要强制重编请 FORCE_BUILD=1"
       touch "$STAMP_CORE" 2>/dev/null
@@ -4596,7 +4863,39 @@ ensure_media_encoder() {
   local avout
   avout=$(PYTHONPATH="$PYDEPS/dyn:$PYDEPS" "$py" -c "import av; print(av.__version__)" 2>&1)
   if [ $? -eq 0 ]; then
-    say "  出片编码器 = PyAV $avout（diffusers 原生路径，不需要兜底）"
+    # av 能 import ≠ 能出片：examples/minimax_h3.py 走的是 diffusers 的 encode_video，
+    # 里面是 add_stream("libx264") + aac。缺任一编码器时启动阶段不会报错，
+    # 而是等 DiT 全部跑完、写 mp4 那一刻才抛 UnknownCodecError —— 前面几十分钟白烧。
+    # 所以在这里花 30 秒验编码器，把最后一步的翻车风险提前暴露。
+    # 注意：cv2 / imageio / imageio-ffmpeg 都不需要，encode_video 只碰 PyAV。
+    local avmiss
+    avmiss=$(PYTHONPATH="$PYDEPS/dyn:$PYDEPS" "$py" - <<'PYEOF' 2>&1
+import sys
+try:
+    import av
+except Exception as e:
+    print("import:%s" % e)
+    sys.exit(0)
+try:
+    have = set(av.codecs_available)
+except Exception:
+    try:
+        from av.codec.codec import codecs_available as _c
+        have = set(_c)
+    except Exception:
+        print("unknown")
+        sys.exit(0)
+print(",".join(c for c in ("libx264", "aac") if c not in have))
+PYEOF
+)
+    if [ -n "$avmiss" ]; then
+      say "  !! PyAV $avout 能 import，但缺编码器：$avmiss"
+      say "     encode_video 要到写 mp4 那一步才会炸（生成全跑完才失败），这会儿就得处理"
+      say "     先别跑：把这两行发我，我出个换编码器的补丁（改 patch 不改推理）"
+      H3_AV_ENCODER_MISS=$avmiss
+    else
+      say "  出片编码器 = PyAV $avout（libx264 + aac 都在，diffusers 原生路径）"
+    fi
     return 0
   fi
 
@@ -5467,7 +5766,27 @@ case "$MODE" in
   check)  do_check ;;
   setup)  do_setup ;;
   build)  do_build ;;
-  smoke)  do_setup; do_run smoke ;;
+  smoke)
+          # 平台固定只提交 smoke，而 smoke 原本不编译 —— 改了 C++ 算子就没入口生效。
+          # 所以用「算子源码 md5」做戳：戳不一致就编一次，编完落戳，之后每单秒过。
+          # 想强行重编：h3.env 里写 FORCE_BUILD=1 或 H3_BUILD=1。
+          NEED_BUILD=0
+          if [ "$(cat "$OUT/.stamp_mha_fallback" 2>/dev/null)" != "$MHA_FALLBACK_CC_MD5" ]; then
+            NEED_BUILD=1
+            say "算子源码与上次编译的不一致（戳=$(cat "$OUT/.stamp_mha_fallback" 2>/dev/null || echo 无) 现=$MHA_FALLBACK_CC_MD5），先编一次"
+          fi
+          if [ "${H3_BUILD:-0}" = "1" ] || [ "${FORCE_BUILD:-0}" = "1" ]; then
+            NEED_BUILD=1
+            say "H3_BUILD=${H3_BUILD:-0} FORCE_BUILD=${FORCE_BUILD:-0}，强制重编"
+          fi
+          if [ "$NEED_BUILD" = "1" ]; then
+            _cwd0=$(pwd)
+            do_build || die "编译失败，本轮不跑推理"
+            cd "$_cwd0" 2>/dev/null || cd "$AFS" || cd /
+            echo "$MHA_FALLBACK_CC_MD5" > "$OUT/.stamp_mha_fallback" 2>/dev/null \
+              && say "已记下算子源码戳：$MHA_FALLBACK_CC_MD5"
+          fi
+          do_setup; do_run smoke ;;
   full)   ensure_deps; do_run full ;;
   compare) do_setup; do_compare ;;
   report) do_report ;;
