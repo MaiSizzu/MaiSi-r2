@@ -112,6 +112,9 @@ PKG=$AFS/MaiSi-r2
 INFINI=$AFS/infini
 OUT=$AFS/outputs
 PYLIBS=$AFS/pylibs
+# 导入用的 pylibs 副本（/dev/shm）。留空表示还没建，建好后 setup_fast_pylibs 会填。
+# 只是个「从哪 import」的开关：.ready / .deps_ok 这些戳和打过的补丁都还在 AFS 上。
+PYLIBS_X=${PYLIBS_X:-}
 # 纯 Python 小依赖补充（janus / xxhash），见 ensure_pydeps：离线 pylibs 里没有它们
 PYDEPS=$AFS/pydeps
 # infinicore 的 Python 包目录是上个作业 uid 留下的只读树，写不进去，所以在可写盘上拼一个
@@ -294,6 +297,66 @@ ensure_pkg() {
   say "解包完成：$(find "$PKG" -type f | wc -l) 个文件"
 }
 
+# transformers / diffusers 的导入开销几乎全在「遍历包目录、对上万个 .py 逐个 stat」上，
+# 而 $PYLIBS 在 AFS 上，一次 stat 就是一次网络往返 —— 05:58 那单的心跳栈看得清清楚楚：
+#   transformers/utils/import_utils.py:3126 create_import_structure_from_path → os.path.isfile
+# 光 import 就烧掉 600 秒，加上前面 8 分钟预检，走到 [generate] 要 19 分钟，
+# 15 分钟的作业上限根本等不到崩溃现场。
+# /dev/shm 每单有 450 GB，把 32 MB 的离线包直接解到本地盘只要几秒，之后导入是本地 IO。
+# 只改「从哪 import」：.ready / .deps_ok 这些戳、以及上游补丁，仍然落在 AFS 上。
+setup_fast_pylibs() {
+  [ "${H3_FAST_PYLIBS:-1}" = "0" ] && return 0
+  [ -n "${PYLIBS_X:-}" ] && return 0
+  local stamp=""
+  stamp=$(cat "$PYLIBS/.ready" 2>/dev/null)
+  [ -n "$stamp" ] || return 0
+
+  # 目录名带 v1：以后补丁逻辑变了就把 v1 提到 v2，保证不会复用旧的本地副本
+  local shmb=${H3_SHM_DIR:-/dev/shm}
+  local dst=$shmb/h3pylibs.${stamp}.v1
+  if [ -f "$dst/.ok" ] && [ -d "$dst/transformers" ]; then
+    export PYLIBS_X=$dst
+    say "  导入路径 = $dst（本地盘副本，不碰 AFS）"
+    return 0
+  fi
+
+  local freemb=""
+  freemb=$(df -Pm "$shmb" 2>/dev/null | awk 'NR==2{print $4}')
+  if [ -z "$freemb" ] || [ "$freemb" -lt 3000 ]; then
+    say "  $shmb 余量 ${freemb:-?}MB 不够，pylibs 仍从 AFS 导入（会慢 5~10 分钟）"
+    return 0
+  fi
+
+  local zip=${PYLIBS_ZIP:-}
+  [ -n "$zip" ] || zip=$(ls -t "$AFS"/pylibs*-v3.zip "$AFS"/dl/pylibs*-v3.zip 2>/dev/null | head -1)
+  [ -n "$zip" ] || zip=$(ls -t "$AFS"/pylibs*.zip "$AFS"/dl/pylibs*.zip 2>/dev/null | head -1)
+
+  local t0=$SECONDS
+  rm -rf "$dst" 2>/dev/null
+  mkdir -p "$dst" 2>/dev/null || return 0
+  say "  建本地导入副本 $dst（解包一次，之后每单导入省 5~10 分钟）"
+  if [ -n "$zip" ] && [ -f "$zip" ]; then
+    python3 - "$zip" "$dst" >/dev/null 2>&1 <<'PY'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as z:
+    z.extractall(sys.argv[2])
+PY
+  else
+    cp -a "$PYLIBS/." "$dst/" 2>/dev/null
+  fi
+  [ -d "$dst/transformers" ] || {
+    rm -rf "$dst" 2>/dev/null
+    say "  !! 本地副本里没有 transformers，退回 AFS"
+    return 0
+  }
+  # AFS 那份已经打过 Qwen2TokenizerFast 兼容补丁，直接把同一文件覆盖过来，免得上游两边不一致
+  local enc=diffusers/modular_pipelines/minimax_h3/encoders.py
+  [ -f "$PYLIBS/$enc" ] && cp -f "$PYLIBS/$enc" "$dst/$enc" 2>/dev/null
+  touch "$dst/.ok" 2>/dev/null
+  export PYLIBS_X=$dst
+  say "  本地副本就绪（$((SECONDS - t0))s）：这两条链之后都从 /dev/shm 导入"
+}
+
 ensure_deps() {
   # all = setup + build，会连续调两次；第一次过了就直接跳过，省一分钟
   [ "${DEPS_OK:-0}" = "1" ] && { say "依赖已校验过，跳过"; return 0; }
@@ -386,7 +449,10 @@ PY
   fi
 
   say "校验依赖（diffusers 0.42 + transformers 5.x + hub 2.x 是配套的一套）"
-  PYTHONPATH="$PYLIBS:$PYTHONPATH" python3 - <<'PY'
+  # 这一步是真 import（torch + diffusers + transformers），在 AFS 上实测 6 分钟；
+  # 换成本地盘副本后就只剩几秒，指纹失效时不至于又白烧 6 分钟
+  setup_fast_pylibs
+  PYTHONPATH="${PYLIBS_X:-$PYLIBS}:$PYTHONPATH" python3 - <<'PY'
 import sys
 
 def show(tag, fn):
@@ -4250,8 +4316,11 @@ do_run() {
   fi
   local pyic="$PKG/src/InfiniCore/python"
   [ -n "${INFINICORE_OVERLAY:-}" ] && pyic="$INFINICORE_OVERLAY:$pyic"
+  # 导入路径优先本地盘：AFS 上光 transformers 建 import 结构就要好几分钟，
+  # 而这段路径 preflight 和启动器各走一遍 —— 两遍合起来就是十分钟的纯等待。
+  setup_fast_pylibs
   # overlay 放最前：既保证用的是新编的 infinicore，也让它的 sitecustomize.py 先生效
-  export PYTHONPATH="$pyic:$PYLIBS:$PYDEPS/dyn:$PYDEPS:$PKG/src/InfiniLM/python"
+  export PYTHONPATH="$pyic:${PYLIBS_X:-$PYLIBS}:$PYDEPS/dyn:$PYDEPS:$PKG/src/InfiniLM/python"
   # 启动器把 python 的 stdout 接进 `| tee`，管道 → 块缓冲（8KB），print 全憋在内存里，
   # 日志看起来"半天不动"，其实在跑。11:45 那单停在「张量并行度 = 8」就是这个原因。
   export PYTHONUNBUFFERED=1
