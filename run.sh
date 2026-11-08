@@ -2466,6 +2466,7 @@ _STATE = {
     "installed": False,
     "patched": False,
     "patched_fr": False,
+    "patched_tt": False,
     "patched_ttp": False,
     "patched_dtp": False,
     "depth": 0,
@@ -2715,13 +2716,46 @@ def _hook_pipeline():
     return True
 
 
+def _is_empty_shell(obj):
+    """这个对象是不是「空壳 Tensor」—— impl_ 为 nullptr，碰任何成员都 SIGSEGV。
+
+    只对 infinicore 的 Tensor 有意义；torch.Tensor / list / dict / None 一律 False
+    （它们由调用方自己处理）。
+
+    ⚠ 判空必须问到 `_underlying` 上，不能直接 `bool(obj)`：
+
+      infinicore.Tensor 是 python 包装类（infinicore/tensor.py:25），它只重载了
+      __getattr__ 把 shape/dtype/device 转发给 _underlying，**自己并没有 __bool__**；
+      而特殊方法是按类型槽查的，压根不走 __getattr__ 转发。于是 `bool(包装对象)`
+      落到 object 的默认实现 —— 永远 True。空壳照样往下走，下一行 `tuple(obj.shape)`
+      就去解引用 nullptr（读 0x18 偏移）直接 SIGSEGV。
+
+      11-08 12:03 那单按「先问 bool 再摸 shape」修过一次，15:08 这单又原地崩了、
+      rip 偏移一模一样（_infinicore.so+0x10ff98、fault_addr=0x18），原因就是当年
+      那一行判空其实从来没生效过。
+
+      真正的 __bool__ 只绑在 C++ 层（pybind11/tensor.hpp:53 -> bool(tensor)
+      -> impl_ != nullptr），所以先拿到 _underlying 再问它。
+    """
+    if type(obj).__name__ != "Tensor":
+        return False
+    # 包装类走 _underlying；万一是裸的 C++ Tensor（没有这个属性），就用它自己
+    target = getattr(obj, "_underlying", obj)
+    if target is None:
+        return False
+    try:
+        return not bool(target)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _fact(obj):
     """把入参印成「形状 / 精度 / 落在哪」三件事，一行看完。
 
     段错误如果是「喂错了东西」引起的，这一行就能定案；如果三样都对，
     那就是算子或 kernel 层面的问题，再往下才需要 C 层栈。
 
-    ⚠ 空 Tensor 必须先问 bool()，绝不能先摸 .shape。
+    ⚠ 空 Tensor 必须先过 _is_empty_shell()，绝不能先摸 .shape。
     _infinicore.Tensor 的 shape 是 `tensor->shape()`——operator-> 拿到的是
     内部 impl 指针，空壳时它就是 nullptr，读成员等于读 0x18，直接 SIGSEGV
     （11-08 12:03 那单：si_code=1 fault_addr=0x18，栈上是
@@ -2750,14 +2784,11 @@ def _fact(obj):
         except Exception:  # noqa: BLE001
             pass
 
-    # 只认 infinicore 的 Tensor：它绑了 __bool__（空壳 → False），是唯一能
-    # 在不解引用 impl 的前提下判断"有没有值"的办法。走到这里的一定不是
-    # torch.Tensor（上面已 return），所以按类名认就够了。
-    try:
-        if type(obj).__name__ == "Tensor" and not bool(obj):
-            return "Tensor(空：C++ 侧没填这个字段)"
-    except Exception:  # noqa: BLE001
-        pass
+    # 只认 infinicore 的 Tensor（走到这里的一定不是 torch.Tensor，上面已 return），
+    # 按类名认就够。判空交给 _is_empty_shell —— 它问到 _underlying 上，
+    # 直接 bool(obj) 是无效的（包装类没有 __bool__，永远 True，见该函数注释）。
+    if _is_empty_shell(obj):
+        return "Tensor(空：C++ 侧没填这个字段)"
     shape = getattr(obj, "shape", None)
     if shape is not None:
         return "%s%s dtype=%s dev=%s" % (
@@ -2958,6 +2989,39 @@ def _hook_forward_raw():
     return True
 
 
+def _hook_to_torch_guard():
+    """给 MiniMaxH3TransformerRunner._to_torch 套一层「空壳先拦」。
+
+    这个函数是 native infinicore.Tensor -> torch.Tensor 的唯一漏斗，第一行就是
+    `tuple(tensor.shape)`。也就是说：只要上游任何一环塞进来一个空壳，它就会
+    以 SIGSEGV（fault_addr=0x18）收场，日志里只剩一串没有名字的栈 —— 与 12:03
+    / 15:08 两单的现场完全一样，很难第一眼看出是谁给的。
+
+    包一层把它变成**可读的 Python 异常**：崩也要崩在有名字、有 message 的地方。
+    代价只有一次 isinstance 级别的判断，且异常路径本来就不会被走到。
+    """
+    mod = sys.modules.get("infinilm.multimodal.minimax_h3")
+    cls = getattr(mod, "MiniMaxH3TransformerRunner", None) if mod is not None else None
+    if cls is None:
+        return False
+    orig = getattr(cls, "_to_torch", None)
+    if orig is None or getattr(orig, "_h3_guarded", False):
+        return False
+
+    def guard(tensor, device):
+        if _is_empty_shell(tensor):
+            raise RuntimeError(
+                "native 侧给过来的是空 Tensor（impl_ 为 nullptr），转 torch 必崩；"
+                "condition_encoder_mode 下 C++ 把 hidden state 填进的是 logits 字段，"
+                "hidden_states 留空 —— 检查调用方读的是哪个字段"
+            )
+        return orig(tensor, device)
+
+    guard._h3_guarded = True
+    cls._to_torch = staticmethod(guard)
+    return True
+
+
 def _hook_tp(module_name, class_name, env_name, key, who):
     """<env_name>=N：<who>只用 N 张卡（主线照样全卡）。
 
@@ -3063,6 +3127,14 @@ def _maybe_patch():
                 _say("[trace] 已挂 InferEngine.forward_raw（会打印入参形状/精度/设备）")
         except Exception as exc:  # noqa: BLE001
             _say("[trace] 挂 forward_raw 失败：%s: %s" % (type(exc).__name__, exc))
+
+    if not _STATE["patched_tt"]:
+        try:
+            if _hook_to_torch_guard():
+                _STATE["patched_tt"] = True
+                _say("[trace] 已给 _to_torch 加空壳拦截（空 Tensor 转 torch 会抛异常而不是 SEGV）")
+        except Exception as exc:  # noqa: BLE001
+            _say("[trace] 挂 _to_torch 失败：%s: %s" % (type(exc).__name__, exc))
 
     # 两个降卡开关走同一套逻辑：没开/值错就置位（结论不会再变），命中才挂。
     # 分开置位是必要的：DiT 的类要等 minimax_h3 正文 exec 到 404 行之后才存在，
