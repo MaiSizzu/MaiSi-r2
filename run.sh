@@ -29,6 +29,16 @@
 # 整个 Qwen3VLProcessor 都构造不出来 → components.processor = None → encoders.py
 # 里 processor.image_processor(...) 直接崩。而 image processor 本身有纯 PIL 后端，
 # keyframes 完全够用。解法见 §5.5（给 video_processor 挂空壳）与 §5.5 的预检。
+#
+# 14:30 那单：processor 通了、73G 权重也加载完（文本编码器 17.6s / diffusion 13.1s），
+# 进入 [generate] 之后约十秒直接 Segmentation fault（rc=139），没有 Python traceback，
+# 也没有任何 allreduce 日志。原生崩溃不写栈，所以这一版先装「现场保护」：
+#   · faulthandler（SIGSEGV 时打印所有线程的 Python 栈）
+#   · 心跳线程（每 45s 打一次阶段 + 全线程栈，信号处理器没跑起来也有最后现场）
+#   · 块级进度 [blk] >>> / <<< 包住每个 pipeline block，最后一条就是出事那步
+# 同时给两个薄壳加故障注入日志：CUDA 那条链以前有个静默崩溃路径（cuModuleGetFunction
+# 拿到 NULL 直接被转发进 hipModuleLaunchKernel）；集合通信则在真搬运前打「进入」点，
+# 好分辨是「还没走到集合通信」还是「走进了死在搬运里」。
 # =============================================================================
 
 MODE=${1:-check}
@@ -995,7 +1005,9 @@ build_cuda_shim() {
 
   cat > "$src" <<'CEOF'
 /* h3_cuda_shim.c —— 把九齿生成算子用到的 CUDA driver API 转发到 HIP。
- * 不包含任何头文件：不依赖 cuda.h 也不依赖 hip 头，任何 cc 都能编。 */
+ * 只包含 stdio.h（打印用），不依赖 cuda.h 也不依赖 hip 头，任何 cc 都能编。 */
+#include <stdio.h>
+
 typedef int CUresult;
 typedef void *CUmodule;
 typedef void *CUfunction;
@@ -1016,14 +1028,40 @@ extern int hipFuncSetCacheConfig(void *func, int config);
 extern int hipFuncSetAttribute(void *func, int attr, int value);
 extern const char *hipGetErrorString(int err);
 
+/* 故障注入式日志：14:30 那单在 [generate] 之后十秒直接 SIGSEGV，没有 Python 栈，
+ * 也没看到任何 allreduce 日志。CUDA driver 这条链有一个典型的静默崩溃路径：
+ * cuModuleLoadData 失败（把 CUDA 的 PTX/cubin 喂给了 hipModuleLoadData）→
+ * cuModuleGetFunction 拿到 NULL → 调用方不检查就把 NULL 传给 cuLaunchKernel →
+ * hipModuleLaunchKernel 解引用空指针 → 段错误。所以这里三件事：
+ *   1. 加载/取函数失败一律打日志，并把镜像头 4 字节抠出来（能一眼认出格式）
+ *   2. cuLaunchKernel 遇到 NULL 函数句柄直接返回错误码，不往下转发
+ *   3. 前几次成功 launch 打点，确认这条路径到底有没有被走到
+ */
+static long h3c_bad = 0;
+
 CUresult cuInit(unsigned int flags) { (void)flags; return 0; }
 
 CUresult cuModuleLoadData(CUmodule *mod, const void *image) {
-  return hipModuleLoadData((void **)mod, image);
+  int rc = hipModuleLoadData((void **)mod, image);
+  if (rc != 0) {
+    unsigned int magic = image ? *(const unsigned int *)image : 0u;
+    fprintf(stderr,
+            "[h3cuda] !! cuModuleLoadData 失败 rc=%d magic=0x%08x"
+            "（0x7f454c46=ELF/HSACO 正常；0x50ed55ba=PTX 不认；0xb1c0ffee=fatbin 不认）\n",
+            rc, magic);
+    fflush(stderr);
+  }
+  return rc;
 }
 
 CUresult cuModuleGetFunction(CUfunction *fn, CUmodule mod, const char *name) {
-  return hipModuleGetFunction((void **)fn, mod, name);
+  int rc = hipModuleGetFunction((void **)fn, mod, name);
+  if (rc != 0) {
+    fprintf(stderr, "[h3cuda] !! cuModuleGetFunction 失败 rc=%d name=%s\n",
+            rc, name ? name : "(null)");
+    fflush(stderr);
+  }
+  return rc;
 }
 
 CUresult cuModuleUnload(CUmodule mod) { return hipModuleUnload(mod); }
@@ -1033,7 +1071,35 @@ CUresult cuLaunchKernel(CUfunction f,
                         unsigned int bx, unsigned int by, unsigned int bz,
                         unsigned int shared, CUstream stream,
                         void **params, void **extra) {
-  return hipModuleLaunchKernel(f, gx, gy, gz, bx, by, bz, shared, stream, params, extra);
+  if (!f) {
+    if (h3c_bad < 5) {
+      /* 走到这里说明上游没查 cuModuleGetFunction 的返回值。以前这么传下去就是
+       * hipModuleLaunchKernel 解引用空指针 —— 一崩连栈都没有。 */
+      fprintf(stderr, "[h3cuda] !! cuLaunchKernel 收到 NULL 函数句柄，已拦下"
+                      "（根因见上面的加载/取函数报错）\n");
+      fflush(stderr);
+      h3c_bad++;
+    }
+    return 1; /* CUDA_ERROR_INVALID_VALUE */
+  }
+  {
+    static long n = 0;
+    n++;
+    if (n <= 3) {
+      fprintf(stderr, "[h3cuda] launch #%ld grid=(%u,%u,%u) block=(%u,%u,%u) shared=%u\n",
+              n, gx, gy, gz, bx, by, bz, shared);
+      fflush(stderr);
+    }
+  }
+  {
+    int rc = hipModuleLaunchKernel(f, gx, gy, gz, bx, by, bz, shared, stream, params, extra);
+    if (rc != 0 && h3c_bad < 5) {
+      fprintf(stderr, "[h3cuda] !! hipModuleLaunchKernel 返回 %d（grid/block 见上一行）\n", rc);
+      fflush(stderr);
+      h3c_bad++;
+    }
+    return rc;
+  }
 }
 
 CUresult cuDeviceGetAttribute(int *pi, int attr, int dev) {
@@ -1280,6 +1346,7 @@ typedef struct {
     size_t cap;                /* stage 容量（元素数） */
     size_t esz_cap;            /* 分配时的元素字节数 */
     unsigned long long seq;
+    unsigned long long enter;  /* 进入次数（用于前几次打点） */
     unsigned long long moved;  /* 累计搬运字节（用于报进度） */
 } h3grp;
 
@@ -1449,6 +1516,19 @@ static int h3_collective(h3grp *g, int rank, size_t count, int dtype, int op,
 
     H3_MX_LOCK(&g->mu);
 
+    /* 进入点打点：11-07 14:30 那单崩在 [generate] 之后，一条 allreduce 日志都没有，
+     * 分不清是「还没走到集合通信」还是「走进了但死在搬运里」。这里在真搬运之前打，
+     * 前两次集合通信把 8 个 rank 的到达情况和 count/dtype 全列出来：
+     *   - 只出现 7 条 → 有 rank 没到，问题在计算侧或线程侧
+     *   - 8 条都出现但随后崩 → 死在 hipMemcpy/归约里
+     *   - count 各不相同 → TP 切分不对，后面的越界读也是它引起的 */
+    g->enter++;
+    if (g->enter <= 16) {
+        fprintf(stderr, "[h3ccl] >> 进入 #%llu rank=%d count=%ld dtype=%d op=%d\n",
+                g->enter, rank, (long)count, dtype, op);
+        fflush(stderr);
+    }
+
     mygen = g->gen;
     g->count[rank] = count;
     g->dtype[rank] = dtype;
@@ -1464,6 +1544,26 @@ static int h3_collective(h3grp *g, int rank, size_t count, int dtype, int op,
 
     /* 最后一个到达的当 leader：所有 rank 的数据都已登记，独占做完归约 */
     g->arrive = 0;
+
+    /* rank 间 count/dtype 不一致 = TP 切分不对。下面按 leader 的 count 搬运，
+     * 比它长的 rank 会被多读一截（越界），比它短的读到脏数据。以前完全静默。 */
+    {
+        static long h3_mism = 0;
+        int bad = 0, k;
+        for (k = 0; k < g->n; ++k) {
+            if (g->count[k] != count || g->dtype[k] != dtype) bad = 1;
+        }
+        if (bad && h3_mism < 5) {
+            fprintf(stderr, "[h3ccl] !! rank 间 count/dtype 不一致：");
+            for (k = 0; k < g->n; ++k) {
+                fprintf(stderr, " r%d=%ld/%d", k, (long)g->count[k], g->dtype[k]);
+            }
+            fprintf(stderr, "\n");
+            fflush(stderr);
+            h3_mism++;
+        }
+    }
+
     if (h3_ensure(g, chunk) != 0) {
         g->gen++;
         H3_CV_BCAST(&g->cv);
@@ -1814,7 +1914,8 @@ write_proc_fix() {
   mkdir -p "$dyn" "$AFS/ic_py" 2>/dev/null || return 1
   # 用内容比对而不是版本号：先前写死 "procfix1"，补丁内容改了但 AFS 上还是老文件，
   # 结果新 run.sh 跑起来用的还是旧补丁。改成先写临时文件再 cmp，内容一变就换。
-  local tmpd=$dyn/.h3_proc_fix.new tmpe=$AFS/ic_py/.h3_entry.new changed=0
+  local tmpd=$dyn/.h3_proc_fix.new tmpe=$AFS/ic_py/.h3_entry.new tmpt=$dyn/.h3_trace.new
+  local changed=0
 
   cat > "$tmpd" <<'PYEOF'
 """让 MiniMax-H3 的 processor 在缺少 torchvision 的容器里也能加载。
@@ -2036,16 +2137,30 @@ apply()
 PYEOF
 
   cat > "$tmpe" <<'PYEOF'
-"""examples/minimax_h3.py 的薄包装：先给 transformers 装好 processor 兜底，再原样跑入口。
+"""examples/minimax_h3.py 的薄包装。
 
-FL2VA 的入口是 `python examples/minimax_h3.py fl2va --model-path=...`，而补丁必须赶在
-AutoProcessor 加载之前生效。命令行里塞 `-c` 会打乱 argv[0] 和相对路径，所以用一个
-runpy 包装：argv 原样传给入口脚本，`__name__ == "__main__"` 也保持成立。
+做两件事，都在入口脚本之前：
+
+1. `h3_trace.install()` —— 段错误现场保护（faulthandler + 心跳 + 块级进度）。
+   必须最先装：万一崩在下面 `import h3_proc_fix` 或 transformers 导入里，也想看到栈。
+2. `import h3_proc_fix` —— 给 transformers 装 processor 兜底，必须赶在 AutoProcessor
+   加载之前。
+
+FL2VA 的入口是 `python examples/minimax_h3.py fl2va --model-path=...`。命令行里塞
+`-c` 会打乱 argv[0] 和相对路径，所以用 runpy 包装：argv 原样传给入口脚本，
+`__name__ == "__main__"` 也保持成立。
 """
 
 import os
 import runpy
 import sys
+
+try:
+    import h3_trace
+
+    h3_trace.install()
+except Exception as exc:  # noqa: BLE001 —— 现场保护装不上不能拦路
+    print(f"[h3] 段错误现场保护没装上：{type(exc).__name__}: {exc}", flush=True)
 
 try:
     import h3_proc_fix  # noqa: F401  —— import 即生效
@@ -2068,6 +2183,270 @@ sys.argv[0] = _script
 runpy.run_path(_script, run_name="__main__")
 PYEOF
 
+  # 段错误现场保护：faulthandler + 心跳 + 块级进度（h3_entry 会 import 它）
+  cat > "$tmpt" <<'PYEOF'
+"""段错误现场保护 + diffusers modular pipeline 块级进度。
+
+14:30 那单：processor 通了、73G 权重也加载完了，`[generate]` 之后约十秒直接
+Segmentation fault（rc=139）。原生崩溃不写 Python traceback，日志停在
+
+    [generate] Running MiniMax-H3 FL2VA
+      frames: 8  steps: 2
+
+就没了 —— 完全看不出死在哪一步、死的时候 8 个 RankWorker 在干什么。
+
+这里补三样东西，都不改仓库代码：
+
+1. faulthandler：SIGSEGV / SIGABRT / SIGFPE / SIGBUS 时把**所有** Python 线程的
+   栈打到 stderr。就算崩在 C 扩展里，也能看到是从哪一行 Python 调进去的。
+
+2. 心跳线程：每 N 秒打一行当前阶段，并把所有线程的栈 dump 一次。万一信号处理器
+   没跑起来（栈被踩坏、崩在非 Python 线程里），最后一份心跳就是现场快照。
+
+3. 块级进度：给 ModularPipeline 和它下面每个 block 的 `__call__` 挂日志，进入/退出
+   各一行并带耗时。段错误前最后一条 `[blk] >>> X` 就是出事那一步，前面所有
+   `[blk] <<< X  1.2s` 则证明那几步是干净的。
+
+块为什么要「延迟挂」：`minimax_h3.py` 里 `from diffusers import ModularPipeline` 在
+模块导入时就发生，而具体 block 类（MiniMaxH3ResizeStep 之类）在那之后才定义。所以
+只能先挂住 `ModularPipeline.__call__`，等第一次 `pipe(...)` 时再遍历
+`pipe._blocks.sub_blocks` 整棵树，按类挂。
+
+环境变量：
+    H3_TRACE=0     关掉全部（默认开）
+    H3_HB=45       心跳间隔秒数，0 表示只打印不 dump 栈
+"""
+
+import builtins
+import faulthandler
+import functools
+import os
+import sys
+import threading
+import time
+
+_STATE = {
+    "installed": False,
+    "patched": False,
+    "depth": 0,
+    "stage": "启动中",
+    "t0": time.perf_counter(),
+}
+_SAID = set()
+
+
+def _say(msg):
+    try:
+        sys.stderr.write(msg + "\n")
+        sys.stderr.flush()
+    except Exception:  # noqa: BLE001 —— 日志绝不能反过来把主流程搞挂
+        pass
+
+
+def _once(key, msg):
+    if key in _SAID:
+        return
+    _SAID.add(key)
+    _say(msg)
+
+
+def _now():
+    return time.perf_counter() - _STATE["t0"]
+
+
+# ---------------------------------------------------------------- faulthandler
+
+
+def _enable_faulthandler():
+    # faulthandler 要一个带真实 fd 的流；sys.stderr 被换成 StringIO 时会抛 fileno，
+    # 所以退到 sys.__stderr__（原始 fd 2）。两个都不行就放弃，不能拦路。
+    last = None
+    for stream in (sys.stderr, sys.__stderr__):
+        if stream is None:
+            continue
+        try:
+            faulthandler.enable(file=stream, all_threads=True)
+        except TypeError:  # 老解释器没有 all_threads
+            try:
+                faulthandler.enable(file=stream)
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+                continue
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            continue
+        _say("[trace] faulthandler 已开：SIGSEGV/SIGABRT/SIGFPE 会打印所有线程的 Python 栈")
+        return True
+    _say("[trace] faulthandler 打不开（无可用 fd）：%s: %s" % (type(last).__name__, last))
+    return False
+
+
+def _start_heartbeat(interval):
+    if interval <= 0:
+        return
+
+    def run():
+        last = time.perf_counter()
+        while True:
+            time.sleep(max(1.0, interval - (time.perf_counter() - last)))
+            last = time.perf_counter()
+            _say(
+                "[hb] t=+%.0fs stage=%s threads=%d"
+                % (_now(), _STATE["stage"], threading.active_count())
+            )
+            try:
+                faulthandler.dump_traceback(all_threads=True)
+            except Exception:  # noqa: BLE001
+                pass
+
+    th = threading.Thread(target=run, name="h3-heartbeat", daemon=True)
+    th.start()
+    _say("[trace] 心跳线程已起：每 %ds 打一次阶段 + 全线程栈" % int(interval))
+
+
+# ---------------------------------------------------------------- 块级进度
+
+
+def _walk(block, depth=0):
+    yield block, depth
+    subs = getattr(block, "sub_blocks", None)
+    if not subs:
+        return
+    try:
+        children = list(subs.values())
+    except Exception:  # noqa: BLE001
+        return
+    for sub in children:
+        for item in _walk(sub, depth + 1):
+            yield item
+
+
+def _trace_class(cls):
+    orig = cls.__dict__.get("__call__")
+    if orig is None:
+        # 类自己没定义 __call__，继承链上那个已经挂过了（或不需要挂）
+        return False
+    if getattr(orig, "_h3_traced", False):
+        return False
+
+    @functools.wraps(orig)
+    def wrapper(self, *args, **kwargs):
+        # 用 type(self) 而不是 patch 时那个类：很多 step 类不自己定义 __call__，
+        # 继承的是 ConditionalPipelineBlocks/SequentialPipelineBlocks 的实现，
+        # 只有按实例类型取名才看得出到底是哪一步。
+        name = type(self).__name__
+        depth = _STATE["depth"]
+        _STATE["depth"] = depth + 1
+        _STATE["stage"] = name
+        pad = "  " * depth
+        _say("[blk] %s>>> %s" % (pad, name))
+        t0 = time.perf_counter()
+        try:
+            return orig(self, *args, **kwargs)
+        finally:
+            _STATE["depth"] = depth
+            _say("[blk] %s<<< %s  %.1fs" % (pad, name, time.perf_counter() - t0))
+
+    wrapper._h3_traced = True
+    cls.__call__ = wrapper
+    return True
+
+
+def _patch_tree(pipe):
+    if _STATE.get("tree_done"):
+        return
+    _STATE["tree_done"] = True
+    blocks = getattr(pipe, "_blocks", None)
+    if blocks is None:
+        _say("[trace] pipe 上没有 _blocks，块级日志没挂上（不影响主流程）")
+        return
+    names = []
+    seen = set()
+    for block, _depth in _walk(blocks):
+        cls = type(block)
+        if cls in seen:
+            continue
+        seen.add(cls)
+        try:
+            if _trace_class(cls):
+                names.append(cls.__name__)
+        except Exception as exc:  # noqa: BLE001
+            _say("[trace] 挂 %s 失败：%s: %s" % (cls.__name__, type(exc).__name__, exc))
+    _say("[trace] 块级日志已挂 %d 个：%s" % (len(names), ", ".join(names)))
+
+
+def _hook_pipeline():
+    from diffusers.modular_pipelines.modular_pipeline import ModularPipeline
+
+    orig = ModularPipeline.__dict__.get("__call__")
+    if orig is None or getattr(orig, "_h3_traced", False):
+        return
+
+    @functools.wraps(orig)
+    def wrapper(self, *args, **kwargs):
+        _STATE["stage"] = "pipeline"
+        _say("[blk] >>> pipeline.__call__")
+        _patch_tree(self)
+        t0 = time.perf_counter()
+        try:
+            return orig(self, *args, **kwargs)
+        finally:
+            _say("[blk] <<< pipeline.__call__  %.1fs" % (time.perf_counter() - t0))
+
+    wrapper._h3_traced = True
+    ModularPipeline.__call__ = wrapper
+
+
+def _hook_import():
+    orig_import = builtins.__import__
+    if getattr(orig_import, "_h3_hooked", False):
+        return
+    target = "diffusers.modular_pipelines.modular_pipeline"
+
+    def hook(name, globals=None, locals=None, fromlist=(), level=0):
+        mod = orig_import(name, globals, locals, fromlist, level)
+        if not _STATE["patched"] and target in sys.modules:
+            # 先置位再动作：_hook_pipeline 自己也会走 __import__
+            _STATE["patched"] = True
+            try:
+                _hook_pipeline()
+                _say("[trace] 已挂 ModularPipeline.__call__（等第一次 pipe(...) 再铺开）")
+            except Exception as exc:  # noqa: BLE001
+                _say("[trace] 挂 pipeline 失败：%s: %s" % (type(exc).__name__, exc))
+        return mod
+
+    hook._h3_hooked = True
+    builtins.__import__ = hook
+
+
+# ---------------------------------------------------------------- 入口
+
+
+def install():
+    if _STATE["installed"]:
+        return True
+    _STATE["installed"] = True
+
+    if os.environ.get("H3_TRACE", "1").strip() in ("0", "false", "no"):
+        _say("[trace] H3_TRACE=0，全部关掉")
+        return False
+
+    _enable_faulthandler()
+
+    try:
+        interval = float(os.environ.get("H3_HB", "45"))
+    except ValueError:
+        interval = 45.0
+    _start_heartbeat(interval)
+
+    try:
+        _hook_import()
+    except Exception as exc:  # noqa: BLE001
+        _say("[trace] 装 import 钩子失败：%s: %s" % (type(exc).__name__, exc))
+
+    return True
+PYEOF
+
   # 内容一致就不动（省得每单都刷新 mtime）；不一致说明补丁升级了，换掉
   if cmp -s "$tmpd" "$dyn/h3_proc_fix.py" 2>/dev/null; then
     rm -f "$tmpd"
@@ -2079,17 +2458,24 @@ PYEOF
   else
     mv -f "$tmpe" "$entry" 2>/dev/null && changed=1
   fi
+  if cmp -s "$tmpt" "$dyn/h3_trace.py" 2>/dev/null; then
+    rm -f "$tmpt"
+  else
+    mv -f "$tmpt" "$dyn/h3_trace.py" 2>/dev/null && changed=1
+  fi
 
-  [ -s "$dyn/h3_proc_fix.py" ] && [ -s "$entry" ] || { say "  !! processor 兜底脚本没写出来"; return 1; }
+  [ -s "$dyn/h3_proc_fix.py" ] && [ -s "$entry" ] && [ -s "$dyn/h3_trace.py" ] \
+    || { say "  !! processor/现场保护补丁没写出来"; return 1; }
   H3_ENTRY_PY=$entry
   export H3_ENTRY_PY
   if [ $changed -eq 1 ]; then
-    say "  processor 兜底已更新：$dyn/h3_proc_fix.py + $entry"
+    say "  processor 兜底已更新：$dyn/h3_proc_fix.py + $dyn/h3_trace.py + $entry"
   else
     say "  processor 兜底已是最新（内容未变）"
   fi
   return 0
 }
+# ---- write_proc_fix 结束 ----（上面内嵌的 Python 里有独立成行的 `}`，测试脚本靠这行定界）
 
 # 子脚本里那行 `[ -f "$PRELOAD" ] && export LD_PRELOAD=$PRELOAD` 会把我们的 shim
 # 直接顶掉。包目录是上个作业 uid 的只读树（改不了），所以在可写目录生成一份打过
