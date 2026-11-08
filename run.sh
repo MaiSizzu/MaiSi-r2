@@ -812,6 +812,15 @@ do_setup() {
     say "  !! mha 兜底没装上：这单必然在视觉塔 rip=0，直接停（往上翻 [mha] 那段）"
     die "mha 兜底缺失，跑下去必崩"
   fi
+  # DiT 的 op::cast_ 在 Hygon 上只有 ATen 实现（没开 ENABLE_ATEN 就必抛）。
+  # 文本塔不经过它，所以前面几单都是一路跑到 DiT 第一步才炸，白烧 20 分钟。
+  if ensure_cast_fallback; then
+    say "  DiT op::cast_ 已有覆盖（不会再 cast_ requires ATen）"
+  else
+    say "  !! cast_ 覆盖没装上：DiT 第一步必抛 cast_ requires ATen，直接停"
+    say "     （H3_CAST=0 只用于确认诊断，不会让 DiT 跑通）"
+    die "cast_ 覆盖缺失，跑下去必在 DiT 抛"
+  fi
   say "setup 完成"
 }
 
@@ -3867,6 +3876,10 @@ ensure_cuda_compat() {
   if [ -n "${H3_MHA_PRELOAD:-}" ]; then
     H3_CUDA_PRELOAD="$H3_CUDA_PRELOAD:$H3_MHA_PRELOAD"
   fi
+  # cast_ 覆盖 .so：同名符号顶掉 cpp_api 里那份（Hygon 没开 ATen，原实现必抛）
+  if [ -n "${H3_CAST_PRELOAD:-}" ]; then
+    H3_CUDA_PRELOAD="$H3_CUDA_PRELOAD:$H3_CAST_PRELOAD"
+  fi
   export H3_CUDA_PRELOAD
 
   # 5) Python 侧兜底：万一子脚本把 LD_PRELOAD 冲掉，解释器启动时也用
@@ -4370,6 +4383,365 @@ ensure_mha_fallback() {
   fi
   H3_MHA_PRELOAD=$so
   export H3_MHA_PRELOAD
+  return 0
+}
+
+# =============================================================================
+# Hygon 上 op::cast_ 只有 ATen 实现：
+#   src/infinicore/ops/cast/cast.cc
+#     #if defined(ENABLE_ATEN)  -> to_aten_tensor(out).copy_(to_aten_tensor(in));
+#     #else                     -> throw std::runtime_error("cast_ requires ATen");
+# 本平台的构建没开 ATen，所以只要有人调它必抛。
+#
+# DiT 第一次真的命中：csrc/models/minimax_h3/minimax_h3_transformer.cpp:525
+#     video_embeds = cast_to(linear_forward(proj_in_, video_input), dtype_)
+# proj_in_ 的输入被就地升到 F32（522 行），输出于是也是 F32，这里必须转回 bf16。
+# 文本塔不经过这条路径 —— 所以 15:41 那单一路上到 DiT 的 forward_raw #2 才炸，
+# 而且 8 个 rank 报的都是同一句，上层只看到 "RankWorker stopped during run"。
+#
+# 覆盖方式还是「独立 .so + LD_PRELOAD 同名符号」（_infinilm.so 对 cast_ 的调用
+# 是跨 DSO 的 PLT 调用，预加载的先解析到）。但**不写 kernel**：
+# 真命中的只有每步 4 处中等张量（13M / 2.2M / 15.7M 元素 + 每个 block 的 temb），
+# D2H->CPU->H2D 一次几十毫秒，相对 DiT 单步可忽略；
+# 而 kernel 要 hipcc + --offload-arch=gfx936 + 设备端自检，任一环节不对就整单白跑。
+# =============================================================================
+write_cast_src() {
+  local dir=$1
+  local f=$dir/cast_hygon_shim.cc
+  local tmp=$dir/.cast_shim.new.cc
+
+  cat > "$tmp" 2>/dev/null <<'CAST_SHIM_CC_EOF'
+// Hygon(DCU) 上 infinicore::op::cast_ 的唯一实现走 ATen：
+//   src/infinicore/ops/cast/cast.cc:38-47
+//     void run_cast(...) {
+//   #if defined(ENABLE_ATEN)
+//       ... adaptor::to_aten_tensor(out).copy_(adaptor::to_aten_tensor(in));
+//   #else
+//       throw std::runtime_error("cast_ requires ATen");
+//   #endif
+//     }
+// 本平台的构建没开 ENABLE_ATEN，所以只要有人调 cast_ 就必抛。
+//
+// DiT 第一次真的用到它是在 minimax_h3_transformer.cpp:525-526：
+//   video_input = cast_to(video_hidden_states, F32)   // 入参本来就是 F32，短路
+//   video_embeds = cast_to(linear_forward(proj_in_, video_input), dtype_)
+// 入参被显式升到 F32，proj_in_ 的输出于是也是 F32，这里必须转回 bf16 —— 抛。
+// 表现就是 8 个 rank 同时打 "exception during forward: cast_ requires ATen"，
+// 上一层只看到 "RankWorker stopped during run"，一点线索都没有。
+//
+// 覆盖方式：独立 .so + LD_PRELOAD 同名符号（和 op::mha 兜底、cuda/ccl 薄壳同一条路）。
+// _infinilm.so 对 cast_ 的调用是跨 DSO 的 PLT 调用，先加载者优先，
+// 预加载的这份就顶掉了 cpp_api 里的那份。
+//
+// 为什么用 D2H -> CPU 转换 -> H2D，而不是写个 HIP kernel：
+//   · DiT 里真正命中的转换只有 4 处中等张量（每步）：
+//       proj_in 输出 2432×5376、audio_proj_in 输出 414×5376、norm_out 输出 2922×5376
+//     外加每个 block 里 temb 那点（2×hidden，可忽略）；
+//     一次 15M 元素的往返约 120MB，几十毫秒，相对 DiT 单步可忽略。
+//   · kernel 要 hipcc + --offload-arch=gfx936+ 设备端自检，任何一个不对就是整单白跑；
+//     这条路径只用到已经跑通的 infinirt memcpy（libh3cuda 薄壳早就把它接到 hip 上了）。
+//
+// 编译条件刻意只留 H3_CAST_STANDALONE：这份文件即使被 xmake 的 add_files 扫进
+// cpp_api 的编译树，也是一个空 TU，绝不会和 cast.cc 撞符号。
+#if defined(H3_CAST_STANDALONE)
+
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include "infinicore/context/context.hpp"
+#include "infinicore/dtype.hpp"
+#include "infinicore/ops/cast.hpp"
+#include "infinicore/tensor.hpp"
+
+namespace {
+
+// bf16 只是 f32 的高 16 位，转换可以纯位运算做，不依赖任何半精度头文件。
+// f32 -> bf16 用 round-to-nearest-even，和 ATen 的 BFloat16(float) 一致；
+// 不做这一步（直接截断）会让 DiT 的数值和参考实现慢慢漂开。
+inline float bf16_to_f32(uint16_t v) {
+    const uint32_t u = static_cast<uint32_t>(v) << 16;
+    float f = 0.0f;
+    std::memcpy(&f, &u, sizeof(f));
+    return f;
+}
+
+inline uint16_t f32_to_bf16(float f) {
+    uint32_t u = 0;
+    std::memcpy(&u, &f, sizeof(u));
+    const uint32_t exp = u & 0x7f800000u;
+    if (exp == 0x7f800000u) { // inf / nan
+        if ((u & 0x007fffffu) != 0) {
+            return static_cast<uint16_t>((u >> 16) | 0x0040u); // 保留为 quiet NaN
+        }
+        return static_cast<uint16_t>(u >> 16);
+    }
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return static_cast<uint16_t>(u >> 16);
+}
+
+enum Kind { K_F32, K_BF16, K_OTHER };
+
+Kind kind_of(const infinicore::DataType &d) {
+    if (d == infinicore::DataType::F32) {
+        return K_F32;
+    }
+    if (d == infinicore::DataType::BF16) {
+        return K_BF16;
+    }
+    return K_OTHER;
+}
+
+// 只实现模型真会用到的那几种；其余明确报错，不要静默算出垃圾。
+void convert_on_host(void *dst, const void *src, size_t n,
+                     const infinicore::DataType &from,
+                     const infinicore::DataType &to) {
+    const Kind ks = kind_of(from);
+    const Kind kd = kind_of(to);
+    if (ks == K_F32 && kd == K_BF16) {
+        const auto *s = static_cast<const float *>(src);
+        auto *d = static_cast<uint16_t *>(dst);
+        for (size_t i = 0; i < n; ++i) {
+            d[i] = f32_to_bf16(s[i]);
+        }
+        return;
+    }
+    if (ks == K_BF16 && kd == K_F32) {
+        const auto *s = static_cast<const uint16_t *>(src);
+        auto *d = static_cast<float *>(dst);
+        for (size_t i = 0; i < n; ++i) {
+            d[i] = bf16_to_f32(s[i]);
+        }
+        return;
+    }
+    throw std::runtime_error("cast_ shim: 未实现的转换 " + infinicore::toString(from)
+                             + " -> " + infinicore::toString(to)
+                             + "（本 shim 只做 F32<->BF16）");
+}
+
+size_t g_calls = 0;
+
+void log_call(size_t n, const infinicore::DataType &from,
+              const infinicore::DataType &to, double mbytes) {
+    const size_t k = ++g_calls;
+    // 前几次全打（能看出调用顺序），之后每 500 次一行：
+    // 日志里看到 [cast] 就证明符号确实被我们顶掉了；一条都没有 = 覆盖没生效。
+    if (k <= 8 || k % 500 == 0) {
+        std::fprintf(stderr, "[cast] #%zu %s->%s numel=%zu (%.1f MB)\n", k,
+                     infinicore::toString(from).c_str(),
+                     infinicore::toString(to).c_str(), n, mbytes);
+    }
+}
+
+} // namespace
+
+namespace infinicore::op {
+
+// 与 include/infinicore/ops/cast.hpp 的声明逐字一致，靠同名符号顶掉 cpp_api 里那份。
+void cast_(Tensor out, const Tensor &in) {
+    if (!out || !in || out->shape() != in->shape()) {
+        throw std::runtime_error("cast_ expects equal non-empty shapes");
+    }
+    if (out->device() != in->device()) {
+        throw std::runtime_error("cast_: output 与 input 必须在同一设备上。out: "
+                                 + out->info() + " in: " + in->info());
+    }
+
+    const auto &src_dtype = in->dtype();
+    const auto &dst_dtype = out->dtype();
+
+    // 转换要在调用方那个 rank 自己的设备上做（8 个 rank 是 8 个线程/进程，
+    // hip 的 current device 是线程本地状态，必须自己设）。
+    context::setDevice(out->device());
+
+    // 非连续输入先整理成连续：后面的宿主转换按线性内存走。
+    Tensor src = in;
+    if (!src->is_contiguous()) {
+        src = in->contiguous();
+    }
+
+    if (src_dtype == dst_dtype) {
+        // 同类型就是纯拷贝，交给已有实现（它会处理 out 的 strides）。
+        out->copy_from(src);
+        return;
+    }
+
+    const size_t n = src->numel();
+    if (n == 0) {
+        return;
+    }
+    if (static_cast<size_t>(out->numel()) != n) {
+        throw std::runtime_error("cast_: numel 不一致。out: " + out->info()
+                                 + " in: " + in->info());
+    }
+
+    const size_t s_size = src->element_size();
+    const size_t d_size = out->element_size();
+    log_call(n, src_dtype, dst_dtype,
+             static_cast<double>(n) * static_cast<double>(s_size + d_size) / (1024.0 * 1024.0));
+
+    std::vector<uint8_t> host_in(n * s_size);
+    std::vector<uint8_t> host_out(n * d_size);
+
+    if (out->device().getType() == Device::Type::CPU) {
+        convert_on_host(host_out.data(), src->data(), n, src_dtype, dst_dtype);
+        std::memcpy(out->data(), host_out.data(), n * d_size);
+        return;
+    }
+
+    // 关键：先把生产者的队列排空。infinirt 的 D2H 走的是 cudaMemcpy(同步)，
+    // 它和 infinirt 自己那条 stream 之间没有顺序保证，不 sync 可能读到旧值。
+    context::syncStream();
+    context::memcpyD2H(host_in.data(), src->data(), n * s_size);
+    convert_on_host(host_out.data(), host_in.data(), n, src_dtype, dst_dtype);
+
+    // H2D 用阻塞版：host_out 出了这个函数就析构，异步拷贝不安全。
+    if (out->is_contiguous()) {
+        context::memcpyH2D(out->data(), host_out.data(), n * d_size, /*async=*/false);
+    } else {
+        Tensor tmp = Tensor::empty(out->shape(), dst_dtype, out->device());
+        context::memcpyH2D(tmp->data(), host_out.data(), n * d_size, /*async=*/false);
+        out->copy_from(tmp);
+    }
+}
+
+} // namespace infinicore::op
+
+namespace {
+// 预加载自检用：构造期打一行，确认这份 .so 真的被 ld.so 挂上了。
+// （符号有没有被顶掉，要看运行时的 [cast] 行。）
+__attribute__((constructor, visibility("hidden"))) void h3_cast_shim_banner() {
+    std::fprintf(stderr,
+                 "[cast] cast_ 覆盖已就位（Hygon 无 ATen，F32<->BF16 走 D2H->CPU->H2D）\n");
+}
+} // namespace
+
+#endif // H3_CAST_STANDALONE
+CAST_SHIM_CC_EOF
+
+  if [ ! -s "$tmp" ]; then
+    rm -f "$tmp" 2>/dev/null
+    return 1
+  fi
+  if [ -s "$f" ] && cmp -s "$tmp" "$f"; then
+    rm -f "$tmp" 2>/dev/null
+    printf '%s same\n' "$f"
+    return 0
+  fi
+  if mv -f "$tmp" "$f" 2>/dev/null && [ -s "$f" ]; then
+    printf '%s new\n' "$f"
+    return 0
+  fi
+  rm -f "$tmp" 2>/dev/null
+  return 1
+}
+
+# 这份 .cc 的 md5：smoke 每轮拿它和 $OUT/.stamp_cast_shim 比。
+# 改了上面的 heredoc 就必须同步这一行，_fix/test_cast_shim.sh 会核对；
+# 仓库里的原件 src/InfiniCore/src/infinicore/ops/cast/cast_hygon_shim.cc 也要逐字节一致。
+CAST_SHIM_CC_MD5=6744fc8b3b2022912cfb3259a8c23f30
+
+ensure_cast_fallback() {
+  if [ "${H3_CAST:-1}" = 0 ]; then
+    say "  H3_CAST=0：跳过 cast_ 覆盖（DiT 会在 cast_ requires ATen 处停）"
+    return 0
+  fi
+  [ -n "${IC:-}" ] || IC=$PKG/src/InfiniCore
+  local api=$INFINI/lib/libinfinicore_cpp_api.so
+  if [ ! -f "$api" ]; then
+    local c
+    for c in "$OVL/infinicore/lib/libinfinicore_cpp_api.so" \
+             "$SRC_IC/python/infinicore/lib/libinfinicore_cpp_api.so" \
+             "$AFS/ic_py/infinicore/lib/libinfinicore_cpp_api.so"; do
+      [ -n "$c" ] && [ -f "$c" ] && { api=$c; break; }
+    done
+  fi
+  if [ ! -f "$api" ]; then
+    say "  !! 没有 libinfinicore_cpp_api.so，cast_ 覆盖挂不上"
+    return 1
+  fi
+  local apilib
+  apilib=$(dirname "$api")
+
+  # 宿主必须**导出** cast_，否则我们这份顶不掉任何东西（-fvisibility=hidden 时会这样）。
+  # 静态确认一次，省得白跑 20 分钟再看到同一句 "cast_ requires ATen"。
+  if command -v nm >/dev/null 2>&1; then
+    local nsym
+    nsym=$(nm -D --defined-only "$api" 2>/dev/null | grep -c "op5cast_")
+    if [ "${nsym:-0}" -gt 0 ]; then
+      say "  cpp_api 导出 cast_ 符号 $nsym 个（可覆盖）"
+    else
+      say "  !! cpp_api 没导出 cast_（被隐藏？）—— 覆盖不会生效"
+      return 1
+    fi
+  fi
+
+  local dir
+  dir=$(pick_mha_dir) || { say "  !! 找不到可写目录放 cast_ shim"; return 1; }
+  local so=$dir/libh3cast.so
+  local log=$dir/cast_build.log
+
+  local out changed src
+  out=$(write_cast_src "$dir") || {
+    say "  !! cast_ shim 源码写不进 $dir"
+    return 1
+  }
+  set -- $out
+  src=$1
+  changed=${2:-new}
+  say "  cast_ 源码：$src（$(wc -c < "$src" | tr -d ' ') 字节，$([ "$changed" = same ] && echo 未变 || echo 新写)）"
+
+  if [ -f "$so" ] && [ "$changed" = "same" ] && [ "$so" -nt "$src" ] && [ "$so" -nt "$api" ]; then
+    H3_CAST_PRELOAD=$so
+    export H3_CAST_PRELOAD
+    say "  cast_ shim .so 复用：$so  $(ls -lh "$so" 2>/dev/null | awk '{print $5}')"
+    return 0
+  fi
+
+  local cc=g++
+  command -v g++ >/dev/null 2>&1 || cc=clang++
+  command -v "$cc" >/dev/null 2>&1 || { say "  !! 没有 g++/clang++，编不了 cast_ shim"; return 1; }
+
+  say "  编译 cast_ shim .so（$cc -shared，只编这一个 .cc，不动 xmake）"
+  local inc="-I$INFINI/include"
+  [ -d "$IC/include" ] && inc="-I$IC/include $inc"
+  rm -f "$so.tmp" 2>/dev/null
+  if ! "$cc" -O2 -std=c++17 -fPIC -shared \
+        -DH3_CAST_STANDALONE \
+        $inc \
+        -o "$so.tmp" "$src" \
+        -L"$apilib" -linfinicore_cpp_api \
+        -Wl,-rpath,"$apilib" \
+        2>"$log"; then
+    say "  !! cast_ shim 编译失败："
+    grep -n -m8 -E "error:|fatal error:|undefined reference|cannot find" "$log" 2>/dev/null | cut -c1-200 | sed 's/^/    /'
+    tail -4 "$log" 2>/dev/null | sed 's/^/    /'
+    return 1
+  fi
+  [ -s "$so.tmp" ] || { say "  !! cast_ shim 编出来是空的"; return 1; }
+  mv -f "$so.tmp" "$so" 2>/dev/null || { cp -f "$so.tmp" "$so" 2>/dev/null; rm -f "$so.tmp" 2>/dev/null; }
+
+  # 这个 .so 会被 LD_PRELOAD 进每一个 python 进程，先单独试加载。
+  if ! LD_LIBRARY_PATH="$apilib:$INFINI/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+       LD_PRELOAD="$so" /bin/true 2>"$dir/cast_preload.log"; then
+    say "  !! cast_ shim 预加载失败："
+    tail -6 "$dir/cast_preload.log" 2>/dev/null | sed 's/^/    /'
+    say "     不挂它——挂了会连 python 都起不来"
+    return 1
+  fi
+  if grep -q "cast_ 覆盖已就位" "$dir/cast_preload.log" 2>/dev/null; then
+    say "  cast_ shim 就位：$so  $(ls -lh "$so" 2>/dev/null | awk '{print $5}')（构造期自检通过）"
+  else
+    say "  !! cast_ shim 能加载但构造期没打标语，符号多半没编进去："
+    tail -4 "$dir/cast_preload.log" 2>/dev/null | sed 's/^/    /'
+    return 1
+  fi
+  H3_CAST_PRELOAD=$so
+  export H3_CAST_PRELOAD
   return 0
 }
 
@@ -5767,7 +6139,7 @@ do_run() {
     probe_dcu preload || pp=$?
     if [ $pp -eq 2 ] && [ $pc -eq 0 ]; then
       say "  !! plain 有卡但 preload 没卡 → 弃用 DTK libcuda，只留薄壳，重新打补丁"
-      H3_CUDA_PRELOAD="$H3_CUDA_SHIM${H3_CCL_SHIM:+:$H3_CCL_SHIM}"
+      H3_CUDA_PRELOAD="$H3_CUDA_SHIM${H3_CCL_SHIM:+:$H3_CCL_SHIM}${H3_MHA_PRELOAD:+:$H3_MHA_PRELOAD}${H3_CAST_PRELOAD:+:$H3_CAST_PRELOAD}"
       H3_DROP_LIBCUDA=1
       export H3_CUDA_PRELOAD H3_DROP_LIBCUDA
       patch_fl2va_launcher >/dev/null 2>&1 || true
