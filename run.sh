@@ -71,6 +71,11 @@
 #     微算子（matmul），B 同一台 engine 的纯文本 forward（4 token、无 pixel_values）。
 #     A 挂 = 算子/设备层坏；A 过 B 挂 = 注意力/KV 主路坏；A、B 都过 = 视觉塔坏。
 #     关掉：H3_FRPROBE=0（B 会往 KV cache 写 4 个槽，只是 smoke 期诊断用）
+#   · H3_TEXT_TP=1：文本编码器只占 1 张卡，diffusion 主线照样 8 卡。它的活只是
+#     76 个 token 的 prefill，TP=8 对它零收益，但要多走一条 allreduce 和分片
+#     边界——而段错误恰好就在这个 forward 里。降卡等于整段绕开，不碰算子，
+#     是「先出一帧视频」的保底手段。不设 = 保持现在的 8 卡（默认不动，免得
+#     给定位引入新变量）
 #
 # compare 模式的取舍（官方脚本一次跑四件事：PyTorch fl2va / InfiniLM fl2va / 两边 ref2va，
 # 每件 124 帧 50 步，一件都不便宜）：
@@ -2357,6 +2362,7 @@ _STATE = {
     "installed": False,
     "patched": False,
     "patched_fr": False,
+    "patched_ttp": False,
     "depth": 0,
     "stage": "启动中",
     "t0": time.perf_counter(),
@@ -2794,6 +2800,70 @@ def _hook_forward_raw():
     return True
 
 
+def _hook_text_tp():
+    """H3_TEXT_TP=N：文本编码器只用 N 张卡（diffusion 主线照样全卡）。
+
+    为什么要这个开关：text encoder 干的事只是把 76 个 token 的 prompt 编成
+    embedding，一遍 prefill，TP=8 对它一分钱收益都没有；但 TP=8 要多走一条
+    allreduce 和分片边界，而 11-08 那两单的 SIGSEGV 恰好就在这个 forward 里
+    ——崩的位置离 TP 的分片逻辑太近了。降到单卡等于把整段路径绕开，是
+    「先出一帧视频」的保底手段，不用碰任何算子。
+
+    副作用只有一个：权重从 8 份变成 1 份全量，卡 0 显存占用上升。真 OOM
+    会报 allocation 失败，不是段错误，看日志就能分清。
+
+    默认不开（不设 = 现在的 8 卡行为），免得给定位引入新变量。
+    """
+    want = os.environ.get("H3_TEXT_TP", "").strip()
+    if want in ("", "0"):
+        return False
+    try:
+        n = int(want)
+    except ValueError:
+        _once("ttp_bad", "[trace] H3_TEXT_TP=%r 不是整数，按不降处理" % want)
+        return False
+    if n <= 0:
+        return False
+
+    # 和 forward_raw 一样：只认「对象上真的有这个类」，不认 sys.modules 里的名字。
+    # 模块正文可能还在 exec，此时类还没定义，返回 False 等下一次。
+    mod = sys.modules.get("infinilm.multimodal.minimax_h3")
+    cls = getattr(mod, "MiniMaxH3ConditionEncoder", None) if mod is not None else None
+    if cls is None:
+        return False
+
+    orig = getattr(cls, "__init__", None)
+    if orig is None or getattr(orig, "_h3_ttp", False):
+        return False
+
+    def wrapper(self, *args, **kwargs):
+        ids = kwargs.get("tp_device_ids")
+        if ids is None:
+            # 位置参数形态：tp_device_ids 是第 5 个（path, *, ... 全 keyword-only），
+            # 实际调用方不会这么传，真出现了就原样放过去并留一句话。
+            _once("ttp_noids",
+                  "[trace] 文本编码器没拿到 tp_device_ids，H3_TEXT_TP 这次没生效")
+            return orig(self, *args, **kwargs)
+        ids = [int(x) for x in ids]
+        keep = min(n, len(ids))
+        if keep >= len(ids):
+            _once("ttp_noop", "[trace] 文本编码器已是 %d 卡，H3_TEXT_TP=%d 不用降"
+                  % (len(ids), n))
+            return orig(self, *args, **kwargs)
+        kwargs["tp_device_ids"] = ids[:keep]
+        # tp_size 入口没显式传（默认 1），但万一哪天传了 8，这里必须一起改，
+        # 否则构造函数里 tp_size 与 len(tp_device_ids) 对不上会直接 raise。
+        if kwargs.get("tp_size") not in (None, 1):
+            kwargs["tp_size"] = keep
+        _say("[trace] 文本编码器降 TP：%d 卡 → %d 卡（%s）—— 只为绕开 TP 分片路径"
+             % (len(ids), keep, ",".join(str(x) for x in kwargs["tp_device_ids"])))
+        return orig(self, *args, **kwargs)
+
+    wrapper._h3_ttp = True
+    cls.__init__ = wrapper
+    return True
+
+
 def _maybe_patch():
     """目标模块一旦就绪就立刻挂上（幂等，可反复调用）。
 
@@ -2819,6 +2889,23 @@ def _maybe_patch():
                 _say("[trace] 已挂 InferEngine.forward_raw（会打印入参形状/精度/设备）")
         except Exception as exc:  # noqa: BLE001
             _say("[trace] 挂 forward_raw 失败：%s: %s" % (type(exc).__name__, exc))
+
+    # 没开这个开关就当它已经处理完，省得每次 import 都白看一遍
+    if not _STATE["patched_ttp"]:
+        _want = os.environ.get("H3_TEXT_TP", "").strip()
+        if _want in ("", "0"):
+            _STATE["patched_ttp"] = True
+        elif not _want.isdigit():
+            # 值给错了就等于不降，而且这个结论不会再变——置位，别每次 import 重解析
+            _once("ttp_bad", "[trace] H3_TEXT_TP=%r 不是正整数，按不降处理" % _want)
+            _STATE["patched_ttp"] = True
+        else:
+            try:
+                if _hook_text_tp():
+                    _STATE["patched_ttp"] = True
+                    _say("[trace] 已挂 MiniMaxH3ConditionEncoder.__init__（H3_TEXT_TP 生效）")
+            except Exception as exc:  # noqa: BLE001
+                _say("[trace] 挂 text encoder 降 TP 失败：%s: %s" % (type(exc).__name__, exc))
 
 
 def _hook_import():
@@ -4753,6 +4840,14 @@ do_run() {
   if [ -n "${H3_LAUNCHER:-}" ] && [ -f "$H3_LAUNCHER" ]; then launcher=$H3_LAUNCHER; patched=1; fi
   say "启动 $tag：GPUS=$GPUS  MODEL_ROOT=$MODEL_ROOT"
   say "  启动器 = $launcher"
+  # 降 TP 是保底手段，不是默认行为，所以每次都要在日志里留一行：跑完回头看
+  # 才知道这一单到底是 8 卡文本编码器还是 1 卡。不设时必须说「不降」，否则
+  # 空着的那行会让人以为是忘了传。
+  if [ -n "${H3_TEXT_TP:-}" ] && [ "${H3_TEXT_TP}" != "0" ]; then
+    say "  文本编码器降 TP = $H3_TEXT_TP 卡（diffusion 仍 $GPUS）—— 绕开 TP 分片路径"
+  else
+    say "  文本编码器 TP = 与主线一致（未降；要降设 H3_TEXT_TP=1）"
+  fi
   if [ $patched -eq 1 ]; then
     # 补丁版自己会 export LD_PRELOAD（shim 最前），父进程不必再设，
     # 免得 launcher 里每条 ls/sed 都去加载一遍 HIP 运行时
