@@ -85,12 +85,18 @@
 # 的整数除法，不能整除时静默取整，随后 view({bs,seq,heads,head_dim}) 的元素数
 # 就和 q 对不上 → 越界 → SIGSEGV，且崩在 qkv_proj 之后、o_proj 的 allreduce
 # 之前（这正好解释了「一条 [h3ccl] >> 进入 都没有」）。所以启动时会打一行
-# heads / kv_heads / hidden，并检查能不能被卡数整除，不能就提示 retry4/retry2。
-#   · H3_TEXT_TP=1：文本编码器只占 1 张卡，diffusion 主线照样 8 卡。它的活只是
-#     76 个 token 的 prefill，TP=8 对它零收益，但要多走一条 allreduce 和分片
-#     边界——而段错误恰好就在这个 forward 里。降卡等于整段绕开，不碰算子，
-#     是「先出一帧视频」的保底手段。不设 = 保持现在的 8 卡（默认不动，免得
-#     给定位引入新变量）
+# heads / kv_heads / hidden，并检查能不能被卡数整除。
+#   · H3_TEXT_TP / H3_DIT_TP：只把「文本编码器」/「DiT」单独降成 N 卡，主线
+#     照样全卡。文本塔的活只是 76 个 token 的 prefill，TP=8 对它零收益，却要
+#     多走一条 allreduce 和分片边界——而段错误恰好就落在这个 forward 里。降卡
+#     等于整段绕开，不碰算子，是「先出一帧视频」的保底手段。
+#     ★ 平台只能选 8 卡时，这是唯一能改分片数的杠杆（retry4/retry2 用不了）。
+#     不设 = 保持现在的全卡行为（默认不动，免得给定位引入新变量）
+#
+# 注意组件 config 的实际位置：examples/minimax_h3.py 的 resolve_model_paths 里，
+# fl2va 的 partition_dir 就是 diffusers/ 本身，所以 text_encoder 在
+# <MODEL_ROOT>/diffusers/text_encoder；而 MODEL_ROOT 通常是 .../MiniMax-H3/FL2VA。
+# 直接拼 $MODEL_ROOT/text_encoder 找不到 —— 11-08 那单就是这么丢掉 heads 那行的。
 #
 # 开关怎么传：平台提交只给位置参数（mode / gpu），环境变量带不进来。所以
 # 在 AFS 根下建 h3.env（和 run.sh 同级那个 $AFS），每行一条 H3_XXX=值，
@@ -2410,6 +2416,7 @@ _STATE = {
     "patched": False,
     "patched_fr": False,
     "patched_ttp": False,
+    "patched_dtp": False,
     "depth": 0,
     "stage": "启动中",
     "t0": time.perf_counter(),
@@ -2847,40 +2854,44 @@ def _hook_forward_raw():
     return True
 
 
-def _hook_text_tp():
-    """H3_TEXT_TP=N：文本编码器只用 N 张卡（diffusion 主线照样全卡）。
+def _hook_tp(module_name, class_name, env_name, key, who):
+    """<env_name>=N：<who>只用 N 张卡（主线照样全卡）。
 
-    为什么要这个开关：text encoder 干的事只是把 76 个 token 的 prompt 编成
-    embedding，一遍 prefill，TP=8 对它一分钱收益都没有；但 TP=8 要多走一条
-    allreduce 和分片边界，而 11-08 那两单的 SIGSEGV 恰好就在这个 forward 里
-    ——崩的位置离 TP 的分片逻辑太近了。降到单卡等于把整段路径绕开，是
-    「先出一帧视频」的保底手段，不用碰任何算子。
+    为什么要这个开关：文本塔的活只是把 76 个 token 的 prompt 编成 embedding，
+    一遍 prefill，TP=8 对它一分钱收益都没有；但 TP=8 要多走一条 allreduce 和
+    分片边界，而 11-08 那两单的 SIGSEGV 恰好就在这个 forward 里 —— 崩的位置
+    离 TP 的分片逻辑太近了。降卡等于把整段路径绕开，是「先出一帧视频」的保底
+    手段，不用碰任何算子。DiT 那边同理：平台只给 8 卡时，这是唯一还能改分片数
+    的杠杆（retry4 / retry2 那条路走不通）。
 
-    副作用只有一个：权重从 8 份变成 1 份全量，卡 0 显存占用上升。真 OOM
-    会报 allocation 失败，不是段错误，看日志就能分清。
+    副作用只有一个：权重从 N 份变成 1 份全量，首卡显存占用上升。真 OOM 会报
+    allocation 失败，不是段错误，看日志就能分清。
 
-    默认不开（不设 = 现在的 8 卡行为），免得给定位引入新变量。
+    默认不开（不设 = 现在的全卡行为），免得给定位引入新变量。
     """
-    want = os.environ.get("H3_TEXT_TP", "").strip()
+    want = os.environ.get(env_name, "").strip()
     if want in ("", "0"):
         return False
     try:
         n = int(want)
     except ValueError:
-        _once("ttp_bad", "[trace] H3_TEXT_TP=%r 不是整数，按不降处理" % want)
+        # key 加 patched_ 前缀，和 _maybe_patch 里用同一个去重键：两处都判定
+        # 「不是正整数」时只留一句，免得日志里同一件事说两遍
+        _once("patched_" + key + "_bad",
+              "[trace] %s=%r 不是整数，按不降处理" % (env_name, want))
         return False
     if n <= 0:
         return False
 
     # 和 forward_raw 一样：只认「对象上真的有这个类」，不认 sys.modules 里的名字。
     # 模块正文可能还在 exec，此时类还没定义，返回 False 等下一次。
-    mod = sys.modules.get("infinilm.multimodal.minimax_h3")
-    cls = getattr(mod, "MiniMaxH3ConditionEncoder", None) if mod is not None else None
+    mod = sys.modules.get(module_name)
+    cls = getattr(mod, class_name, None) if mod is not None else None
     if cls is None:
         return False
 
     orig = getattr(cls, "__init__", None)
-    if orig is None or getattr(orig, "_h3_ttp", False):
+    if orig is None or getattr(orig, "_h3_tp", False):
         return False
 
     def wrapper(self, *args, **kwargs):
@@ -2888,27 +2899,39 @@ def _hook_text_tp():
         if ids is None:
             # 位置参数形态：tp_device_ids 是第 5 个（path, *, ... 全 keyword-only），
             # 实际调用方不会这么传，真出现了就原样放过去并留一句话。
-            _once("ttp_noids",
-                  "[trace] 文本编码器没拿到 tp_device_ids，H3_TEXT_TP 这次没生效")
+            _once(key + "_noids",
+                  "[trace] %s没拿到 tp_device_ids，%s 这次没生效" % (who, env_name))
             return orig(self, *args, **kwargs)
         ids = [int(x) for x in ids]
         keep = min(n, len(ids))
         if keep >= len(ids):
-            _once("ttp_noop", "[trace] 文本编码器已是 %d 卡，H3_TEXT_TP=%d 不用降"
-                  % (len(ids), n))
+            _once(key + "_noop", "[trace] %s已是 %d 卡，%s=%d 不用降"
+                  % (who, len(ids), env_name, n))
             return orig(self, *args, **kwargs)
         kwargs["tp_device_ids"] = ids[:keep]
         # tp_size 入口没显式传（默认 1），但万一哪天传了 8，这里必须一起改，
         # 否则构造函数里 tp_size 与 len(tp_device_ids) 对不上会直接 raise。
         if kwargs.get("tp_size") not in (None, 1):
             kwargs["tp_size"] = keep
-        _say("[trace] 文本编码器降 TP：%d 卡 → %d 卡（%s）—— 只为绕开 TP 分片路径"
-             % (len(ids), keep, ",".join(str(x) for x in kwargs["tp_device_ids"])))
+        _say("[trace] %s降 TP：%d 卡 → %d 卡（%s）—— 只为绕开 TP 分片路径"
+             % (who, len(ids), keep, ",".join(str(x) for x in kwargs["tp_device_ids"])))
         return orig(self, *args, **kwargs)
 
-    wrapper._h3_ttp = True
+    wrapper._h3_tp = True
     cls.__init__ = wrapper
     return True
+
+
+def _hook_text_tp():
+    return _hook_tp("infinilm.multimodal.minimax_h3", "MiniMaxH3ConditionEncoder",
+                    "H3_TEXT_TP", "ttp", "文本编码器")
+
+
+def _hook_dit_tp():
+    # DiT 也走 InferEngine + 同一份 attention.cpp，所以 heads 不整除时一样会崩。
+    # 但它比文本塔大得多，降卡只到「不 OOM」为止，别一上来就填 1。
+    return _hook_tp("infinilm.multimodal.minimax_h3", "MiniMaxH3TransformerRunner",
+                    "H3_DIT_TP", "dtp", "DiT 侧")
 
 
 def _maybe_patch():
@@ -2937,22 +2960,30 @@ def _maybe_patch():
         except Exception as exc:  # noqa: BLE001
             _say("[trace] 挂 forward_raw 失败：%s: %s" % (type(exc).__name__, exc))
 
-    # 没开这个开关就当它已经处理完，省得每次 import 都白看一遍
-    if not _STATE["patched_ttp"]:
-        _want = os.environ.get("H3_TEXT_TP", "").strip()
+    # 两个降卡开关走同一套逻辑：没开/值错就置位（结论不会再变），命中才挂。
+    # 分开置位是必要的：DiT 的类要等 minimax_h3 正文 exec 到 404 行之后才存在，
+    # 不能因为文本塔挂上了就把 DiT 也当成处理完。
+    for _env, _key, _hook, _label in (
+        ("H3_TEXT_TP", "patched_ttp", _hook_text_tp, "MiniMaxH3ConditionEncoder"),
+        ("H3_DIT_TP", "patched_dtp", _hook_dit_tp, "MiniMaxH3TransformerRunner"),
+    ):
+        if _STATE[_key]:
+            continue
+        _want = os.environ.get(_env, "").strip()
         if _want in ("", "0"):
-            _STATE["patched_ttp"] = True
-        elif not _want.isdigit():
+            _STATE[_key] = True
+            continue
+        if not _want.isdigit():
             # 值给错了就等于不降，而且这个结论不会再变——置位，别每次 import 重解析
-            _once("ttp_bad", "[trace] H3_TEXT_TP=%r 不是正整数，按不降处理" % _want)
-            _STATE["patched_ttp"] = True
-        else:
-            try:
-                if _hook_text_tp():
-                    _STATE["patched_ttp"] = True
-                    _say("[trace] 已挂 MiniMaxH3ConditionEncoder.__init__（H3_TEXT_TP 生效）")
-            except Exception as exc:  # noqa: BLE001
-                _say("[trace] 挂 text encoder 降 TP 失败：%s: %s" % (type(exc).__name__, exc))
+            _once(_key + "_bad", "[trace] %s=%r 不是正整数，按不降处理" % (_env, _want))
+            _STATE[_key] = True
+            continue
+        try:
+            if _hook():
+                _STATE[_key] = True
+                _say("[trace] 已挂 %s.__init__（%s 生效）" % (_label, _env))
+        except Exception as exc:  # noqa: BLE001
+            _say("[trace] 挂 %s 降 TP 失败：%s: %s" % (_label, type(exc).__name__, exc))
 
 
 def _hook_import():
@@ -4910,43 +4941,82 @@ skel_fp() {
 # forward 就崩，而且 [h3ccl] 一条 ">> 进入" 都没有 —— 因为 qkv_proj 是列并行，
 # 它后面才轮到 o_proj 的 allreduce，崩在 view 就永远走不到集合通信。
 # 所以先把这几个数字打到日志里，一单就能定案。
+# 组件 config 到底在哪，不能靠拼：examples/minimax_h3.py 的 resolve_model_paths
+# 里 fl2va 的 partition_dir 就是 diffusers/ 本身，所以 text_encoder 在
+# <MODEL_ROOT>/diffusers/text_encoder，而 MODEL_ROOT 常是 .../MiniMax-H3/FL2VA。
+# 直接拼 "$MODEL_ROOT/text_encoder/config.json" 会找不到 —— 11-08 那单就因此
+# 白丢了一次 heads 诊断。这里按 resolve_model_paths 的分支顺序逐一探。
+find_component_cfg() {
+  local root=$1 comp=$2 par c
+  par=$(dirname "$root")
+  for c in "$root/$comp/config.json" \
+           "$root/$comp/$comp/config.json" \
+           "$root/diffusers/$comp/config.json" \
+           "$root/diffusers/$comp/$comp/config.json" \
+           "$par/diffusers/$comp/config.json" \
+           "$par/diffusers/$comp/$comp/config.json" \
+           "$par/$comp/config.json"; do
+    [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+
+# 为什么单看这几个数就能定案：attention.cpp:26 是
+#   num_attention_heads_ = total_num_heads / tp_size
+# C++ 的整数除法。不能整除时它不报错，直接向下取整，接着
+#   view({batch, seq, num_attention_heads_, head_dim_})
+# 的元素数就和 q 的实际元素数对不上 —— 越界，SIGSEGV。
+#
+# 这个错法跟这一单的现场完全对得上：A 自检（裸 infinicore 算子）全过，一进
+# forward 就崩，而且 [h3ccl] 一条 ">> 进入" 都没有 —— 因为 qkv_proj 是列并行，
+# 它后面才轮到 o_proj 的 allreduce，崩在 view 就永远走不到集合通信。
+#
+# 平台只给 8 卡时，最后那两行给的 H3_TEXT_TP / H3_DIT_TP 是唯一出路：只降这
+# 一个组件的分片数，主线不动。
 report_heads() {
-  local cfg=$1 gpus=$2
+  local cfg=$1 gpus=$2 label=${3:-text encoder} knob=${4:-H3_TEXT_TP} afs=${5:-}
   if [ ! -f "$cfg" ]; then
-    say "  heads 检查：config 不在（$cfg），跳过"
+    say "  $label：config 不在（$cfg），跳过"
     return 0
   fi
-  python3 - "$cfg" "$gpus" <<'PYHEADS'
+  python3 - "$cfg" "$gpus" "$label" "$knob" "$afs" <<'PYHEADS'
 import json
 import sys
 
-cfg, gpus = sys.argv[1], sys.argv[2]
+cfg, gpus, label, knob, afs = sys.argv[1:6]
 n = len([g for g in gpus.split(",") if g.strip()])
 try:
     d = json.load(open(cfg))
 except Exception as exc:  # noqa: BLE001
-    print("  heads 检查：config 读不了（%s），跳过" % exc)
+    print("  %s：config 读不了（%s），跳过" % (label, exc))
     sys.exit(0)
 tc = d.get("text_config", d) or {}
 h = tc.get("num_attention_heads")
 kv = tc.get("num_key_value_heads")
 hs = tc.get("hidden_size")
 hd = tc.get("head_dim")
-print("  text encoder: hidden=%s heads=%s kv_heads=%s head_dim=%s 卡数=%d"
-      % (hs, h, kv, hd, n))
+print("  %s: hidden=%s heads=%s kv_heads=%s head_dim=%s 卡数=%d"
+      % (label, hs, h, kv, hd, n))
 if not isinstance(h, int):
     print("  （config 里没有 num_attention_heads，整除性判断跳过）")
     sys.exit(0)
 if h % n == 0:
     print("  heads %d / %d 卡 = %d，能整除" % (h, n, h // n))
     sys.exit(0)
-print("  !! heads %d 不能被 %d 卡整除，会被整数除法截成 %d" % (h, n, h // n))
+print("  !! %s 的 heads %d 不能被 %d 卡整除，会被整数除法截成 %d" % (label, h, n, h // n))
 print("     后果：q 的元素数 ≠ view({bs,seq,heads,head_dim}) 要的元素数")
 print("           → 越界 → SIGSEGV，而且一条 allreduce 都走不到")
 ok = [k for k in (1, 2, 3, 4, 6, 8) if k <= n and h % k == 0]
 if ok:
+    best = max(ok)
     print("     能整除的卡数：%s" % "、".join("%d 卡" % k for k in ok))
-    print("     最省事：重跑时选 retry4（4 卡）或 retry2（2 卡）")
+    env = (afs + "/h3.env") if afs else "$AFS/h3.env"
+    print("     平台只给 %d 卡、换不了卡数时 —— 别减卡，把它单独降 TP：" % n)
+    print("       在 %s 里加一行   %s=%d" % (env, knob, best))
+    print("       （这组件的 attention 就用 %d 卡分片，%d/%d=%d 正好整除；主线仍 %d 卡）"
+          % (best, h, best, h // best, n))
+    if best != n:
+        print("     平台允许换卡数时也可以整条链路减卡：retry4 / retry2")
 PYHEADS
 }
 
@@ -5072,14 +5142,31 @@ do_run() {
   if [ -n "${H3_LAUNCHER:-}" ] && [ -f "$H3_LAUNCHER" ]; then launcher=$H3_LAUNCHER; patched=1; fi
   say "启动 $tag：GPUS=$GPUS  MODEL_ROOT=$MODEL_ROOT"
   say "  启动器 = $launcher"
-  report_heads "$MODEL_ROOT/text_encoder/config.json" "$GPUS"
+  # config 的位置按 resolve_model_paths 探，不硬拼（见 find_component_cfg 注释）。
+  # 两个组件都可能不整除，所以各打一行——DiT 那边崩起来一样是 SIGSEGV。
+  local tcfg dcfg
+  if tcfg=$(find_component_cfg "$MODEL_ROOT" text_encoder); then
+    report_heads "$tcfg" "$GPUS" "text encoder" H3_TEXT_TP "$AFS"
+  else
+    say "  text encoder：config 没找到（$MODEL_ROOT 和 diffusers/ 下都探过）"
+  fi
+  if dcfg=$(find_component_cfg "$MODEL_ROOT" transformer); then
+    report_heads "$dcfg" "$GPUS" "DiT" H3_DIT_TP "$AFS"
+  else
+    say "  DiT：config 没找到（$MODEL_ROOT 和 diffusers/ 下都探过）"
+  fi
   # 降 TP 是保底手段，不是默认行为，所以每次都要在日志里留一行：跑完回头看
-  # 才知道这一单到底是 8 卡文本编码器还是 1 卡。不设时必须说「不降」，否则
+  # 才知道这一单到底是全卡还是降过。不设时必须说「不降」，否则
   # 空着的那行会让人以为是忘了传。
   if [ -n "${H3_TEXT_TP:-}" ] && [ "${H3_TEXT_TP}" != "0" ]; then
-    say "  文本编码器降 TP = $H3_TEXT_TP 卡（diffusion 仍 $GPUS）—— 绕开 TP 分片路径"
+    say "  文本编码器降 TP = $H3_TEXT_TP 卡（DiT 不受影响）—— 绕开 TP 分片路径"
   else
-    say "  文本编码器 TP = 与主线一致（未降；要降设 H3_TEXT_TP=1）"
+    say "  文本编码器 TP = 与主线一致（未降；要降就往 $AFS/h3.env 写 H3_TEXT_TP=1）"
+  fi
+  if [ -n "${H3_DIT_TP:-}" ] && [ "${H3_DIT_TP}" != "0" ]; then
+    say "  DiT 降 TP = $H3_DIT_TP 卡（文本塔不受影响）—— 绕开 TP 分片路径"
+  else
+    say "  DiT TP = 与主线一致（未降；要降就往 $AFS/h3.env 写 H3_DIT_TP=4）"
   fi
   if [ $patched -eq 1 ]; then
     # 补丁版自己会 export LD_PRELOAD（shim 最前），父进程不必再设，
@@ -5120,12 +5207,13 @@ do_run() {
         if [ -n "$lastlog" ] && grep -q "Error Code 5" "$lastlog" 2>/dev/null; then
           echo "  集合通信没接管（Error Code 5）：往上找「集合通信薄壳」那行，看是不是没编出来/没预加载"
         elif [ -n "$lastlog" ] && grep -qi "out of memory\|OUT_OF_RESOURCES\|memory access fault" "$lastlog" 2>/dev/null; then
-          echo "  显存/访存出错 → 降 num_frames，或换 retry2"
+          echo "  显存/访存出错 → 先降 num_frames；还不行就降 H3_DIT_TP / H3_TEXT_TP"
         elif [ -n "$lastlog" ] && grep -q "InfiniCore C API Error" "$lastlog" 2>/dev/null; then
           echo "  InfiniCore 内部报错 → 往上翻 20 行看 C++ 侧打印的文件:行号"
         fi
         echo "  常见原因与对策："
-        echo "   · heads 不能被卡数整除 → 减少卡数：retry2"
+        echo "   · heads 不能被卡数整除：平台只给 8 卡、减不了卡 —— 往 $AFS/h3.env 里加一行"
+        echo "     H3_TEXT_TP=<能整除的卡数>（DiT 不整除就改用 H3_DIT_TP），具体填几看上面 heads 那行"
         echo "   · 显存不足 → 降 num_frames"
         ;;
     esac
