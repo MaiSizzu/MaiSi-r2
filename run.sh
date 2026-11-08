@@ -1793,6 +1793,10 @@ static int h3_collective(h3grp *g, int rank, size_t count, int dtype, int op,
         *p++ = '\n';
         *p = 0;
         h3_log(buf);
+        /* 只打前 3 次是为了不把平台日志冲爆，但 11-08 12:03 那单因此被误读成
+           「只跑了 3 层、forward 没走完」。第 3 次之后必须留一句说明。 */
+        if (g->seq == 3)
+            h3_log("[h3ccl] （前 3 次已报；之后每 500 次再报一行，静默不代表没走）\n");
     }
 
     g->gen++;
@@ -2669,16 +2673,42 @@ def _fact(obj):
 
     段错误如果是「喂错了东西」引起的，这一行就能定案；如果三样都对，
     那就是算子或 kernel 层面的问题，再往下才需要 C 层栈。
-    """
-    try:
-        import torch
 
-        if isinstance(obj, torch.Tensor):
-            return "torch.Tensor%s dtype=%s dev=%s" % (
-                tuple(obj.shape),
-                str(obj.dtype).replace("torch.", ""),
-                obj.device,
-            )
+    ⚠ 空 Tensor 必须先问 bool()，绝不能先摸 .shape。
+    _infinicore.Tensor 的 shape 是 `tensor->shape()`——operator-> 拿到的是
+    内部 impl 指针，空壳时它就是 nullptr，读成员等于读 0x18，直接 SIGSEGV
+    （11-08 12:03 那单：si_code=1 fault_addr=0x18，栈上是
+    _PyObject_GenericGetAttrWithDict → _infinicore.so）。而 SIGSEGV 不是
+    Python 异常，外面套 try 完全拦不住——这里是唯一的关口。
+    """
+    # torch 先单独试，拿到就用；拿不到不能让后面的判断跟着 NameError
+    # （踩过：`isinstance(obj, torch.Tensor)` 在 import 失败后引用未定义名，
+    #  异常又被自己的 try 吞掉，于是空壳判断整段被跳过，照样摸到了 shape）
+    torch = None
+    try:
+        import torch as _torch
+
+        torch = _torch
+    except Exception:  # noqa: BLE001
+        pass
+
+    if torch is not None:
+        try:
+            if isinstance(obj, torch.Tensor):
+                return "torch.Tensor%s dtype=%s dev=%s" % (
+                    tuple(obj.shape),
+                    str(obj.dtype).replace("torch.", ""),
+                    obj.device,
+                )
+        except Exception:  # noqa: BLE001
+            pass
+
+    # 只认 infinicore 的 Tensor：它绑了 __bool__（空壳 → False），是唯一能
+    # 在不解引用 impl 的前提下判断"有没有值"的办法。走到这里的一定不是
+    # torch.Tensor（上面已 return），所以按类名认就够了。
+    try:
+        if type(obj).__name__ == "Tensor" and not bool(obj):
+            return "Tensor(空：C++ 侧没填这个字段)"
     except Exception:  # noqa: BLE001
         pass
     shape = getattr(obj, "shape", None)
@@ -2701,6 +2731,22 @@ def _fact(obj):
     if obj is None:
         return "None"
     return "%s(%r)" % (type(obj).__name__, obj if isinstance(obj, (int, float, str, bool)) else "…")
+
+
+def _brief_out(out):
+    """一行说清 forward_raw 返回了什么（哪些字段有值、哪些是空壳）。
+
+    这一行是 11-08 12:03 那单的结论来源：condition_encoder_mode 下 C++ 只填了
+    logits（内容其实是第 50 层 hidden state，encode() 正是靠它），hidden_states
+    是空 Tensor —— 谁去摸它的 .shape 谁就 SIGSEGV。所以打印必须过 _fact，
+    不能直接 tuple(t.shape)。
+    """
+    try:
+        if isinstance(out, dict):
+            return " ".join("%s=%s" % (k, _fact(v)) for k, v in sorted(out.items()))
+    except Exception:  # noqa: BLE001
+        pass
+    return _fact(out)
 
 
 def _probe_guard(fn, tag):
@@ -2767,8 +2813,12 @@ def _probe_ops():
 def _probe_text_only(orig, engine):
     """B：同一台 engine 的纯文本 forward（4 个 token、不带 pixel_values）。
 
-    过了 → 注意力 / KV cache 这条主路是好的，崩在视觉塔；
-    挂了 → 主路就有问题，跟 keyframe 视觉输入无关。
+    11-08 12:03 这单把它跑通了：50 层全跑完（allreduce 日志只打前 3 次，后面
+    静默 —— 别被「只有 #1/#2/#3」骗成「只跑了 3 层」），返回
+    {logits=有效, hidden_states=空, output_ids={0}}。当时崩在**打印返回值**：
+    摸空 hidden_states 的 .shape → nullptr+0x18。所以现在这个自检的结论是
+    「主路没问题」，它只剩回归验证的价值，默认不再跑（H3_FRPROBE=1 可开）。
+
     代价：往 KV cache 写了 4 个槽；之后真调用从 0 开始覆盖，smoke 可以接受。
     """
     import torch
@@ -2837,8 +2887,10 @@ def _hook_forward_raw():
             _say("[fr] >>> forward_raw #%d" % n)
         if n == 1:
             # 真调用之前把「崩在哪儿」劈成两半，顺手确认 C 栈兜底没被 HIP 顶掉。
-            # 关掉：H3_FRPROBE=0
-            if os.environ.get("H3_FRPROBE", "1").strip().lower() not in ("0", "false", "no"):
+            # 11-08 12:03 那单已经用它出结论了（A 算子全过、B 跑到 forward 结束），
+            # 所以默认关 —— probe 会往 KV cache 里写 4 个槽，也会多花一两分钟，
+            # 而它想证明的两件事现在都成立了。要复跑：H3_FRPROBE=1
+            if os.environ.get("H3_FRPROBE", "0").strip().lower() not in ("0", "false", "no"):
                 _probe_guard(_probe_ops, "A 微算子")
                 _probe_guard(lambda: _probe_text_only(orig, self), "B 纯文本 forward")
                 _STATE["stage"] = "text encoder forward"
@@ -2846,7 +2898,12 @@ def _hook_forward_raw():
             _say("[fr] --- 自检结束，开始真调用（下面这行之后就是 C++）---")
         t0 = time.perf_counter()
         out = orig(self, input_ids, **kwargs)
-        _say("[fr] <<< forward_raw #%d  %.1fs" % (n, time.perf_counter() - t0))
+        # 返回值摘要：11-08 12:03 那单就是死在「打印返回值」这一步 —— C++ 在
+        # condition_encoder_mode 下只填了 {logits}（内容其实是第 50 层 hidden
+        # state），hidden_states 留空；谁去摸空壳的 .shape 谁就 SIGSEGV。
+        # 现在一律走 _fact（空壳先问 bool），哪几个字段有值一眼可见。
+        _say("[fr] <<< forward_raw #%d  %.1fs  ← %s"
+             % (n, time.perf_counter() - t0, _brief_out(out)))
         return out
 
     wrapper._h3_traced = True
@@ -4949,12 +5006,16 @@ skel_fp() {
 find_component_cfg() {
   local root=$1 comp=$2 par c
   par=$(dirname "$root")
-  for c in "$root/$comp/config.json" \
-           "$root/$comp/$comp/config.json" \
+  # diffusers 排前面：fl2va 的 partition_dir 就是 modular_dir（= .../MiniMax-H3/
+  # diffusers），那才是真正被 load 的那份。FL2VA/ 下也有一份同名目录，但只是
+  # 分区的另一份拷贝；11-08 12:03 打出来的 heads=64 来自 FL2VA 那份，代码实际
+  # 加载的却是 diffusers 那份，两者一致只是运气。
+  for c in "$par/diffusers/$comp/config.json" \
+           "$par/diffusers/$comp/$comp/config.json" \
            "$root/diffusers/$comp/config.json" \
            "$root/diffusers/$comp/$comp/config.json" \
-           "$par/diffusers/$comp/config.json" \
-           "$par/diffusers/$comp/$comp/config.json" \
+           "$root/$comp/config.json" \
+           "$root/$comp/$comp/config.json" \
            "$par/$comp/config.json"; do
     [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
   done
@@ -4997,6 +5058,7 @@ hs = tc.get("hidden_size")
 hd = tc.get("head_dim")
 print("  %s: hidden=%s heads=%s kv_heads=%s head_dim=%s 卡数=%d"
       % (label, hs, h, kv, hd, n))
+print("     config: %s" % cfg)
 if not isinstance(h, int):
     print("  （config 里没有 num_attention_heads，整除性判断跳过）")
     sys.exit(0)
