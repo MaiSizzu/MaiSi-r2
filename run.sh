@@ -45,6 +45,8 @@
 # 同时给两个薄壳加故障注入日志：CUDA 那条链以前有个静默崩溃路径（cuModuleGetFunction
 # 拿到 NULL 直接被转发进 hipModuleLaunchKernel）；集合通信则在真搬运前打「进入」点，
 # 好分辨是「还没走到集合通信」还是「走进了死在搬运里」。
+# 万一 trace 只能定位到 block 而定位不到单次 kernel：H3_SERIAL=1 打开同步 launch
+# （=2 连 HIP 运行时 memcpy 一起序列化），崩点会精确到那一条 dispatch，代价是变慢。
 #
 # compare 模式的取舍（官方脚本一次跑四件事：PyTorch fl2va / InfiniLM fl2va / 两边 ref2va，
 # 每件 124 帧 50 步，一件都不便宜）：
@@ -3984,6 +3986,19 @@ do_run() {
     return 0
   fi
 
+  # 段错误定位加速器（默认关，只在 trace 还不够用时开）：
+  # 异步 launch 崩了以后，Python 栈只能指出「在哪个 block」，指不出「哪一次 launch」。
+  # 打开串行化，崩点就精确到那一条 dispatch，代价是明显变慢（smoke 也够用）。
+  #   H3_SERIAL=1  torch 侧每次 launch 后同步（CUDA/HIP 两个变量名都设，ROCm 构建读哪个都认）
+  #   H3_SERIAL=2  再把 HIP 运行时本身也序列化（kernel 和 memcpy 全同步）
+  if [ -n "${H3_SERIAL:-}" ] && [ "${H3_SERIAL}" != "0" ]; then
+    export CUDA_LAUNCH_BLOCKING=1 HIP_LAUNCH_BLOCKING=1
+    if [ "${H3_SERIAL}" -ge 2 ] 2>/dev/null; then
+      export AMD_SERIALIZE_KERNEL=3 AMD_SERIALIZE_COPY=3
+    fi
+    say "  串行化调试已开（H3_SERIAL=$H3_SERIAL）：崩点可精确到单次 launch，会明显变慢"
+  fi
+
   local launcher=$PKG/scripts/run_fl2va_direct.sh
   local patched=0
   if [ -n "${H3_LAUNCHER:-}" ] && [ -f "$H3_LAUNCHER" ]; then launcher=$H3_LAUNCHER; patched=1; fi
@@ -4253,7 +4268,8 @@ case "$MODE" in
           echo "  compare 跑官方 minimax_h3_compare.py：默认只跑 fl2va，PyTorch 基准跑一次就复用"
           echo "    H3_TASKS=fl2va,ref2va  两个任务都跑    H3_REUSE_OURS=1  复用已有的本方片子"
           echo "    H3_FORCE_REF=1  强制重跑基准          LEGACY_GPUS=0,1,2,3  基准用的卡"
-          echo "  report  只算 SSIM / 尺寸 / 帧数，不生成、不占卡（两条片子都得先在 compare 目录里）" ;;
+          echo "  report  只算 SSIM / 尺寸 / 帧数，不生成、不占卡（两条片子都得先在 compare 目录里）"
+          echo "  段错误还在就开 H3_SERIAL=1（同步 launch，崩点精确到单次 dispatch；=2 更彻底但更慢）" ;;
 esac
 
 RC=$?
