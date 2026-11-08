@@ -794,6 +794,13 @@ do_setup() {
   ensure_pkg
   ensure_deps
   ensure_first_frame
+  # 视觉塔和 DiT 都走 op::mha，而 Hygon 上它零注册。这一步只编一个 .cc（几秒），
+  # 不碰 xmake；编不出来就明确告诉这一单会白跑，而不是等到 rip=0 才发现。
+  if ensure_mha_fallback; then
+    say "  视觉塔 op::mha 已有兜底实现（不会再 call 0）"
+  else
+    say "  !! mha 兜底没装上：这单跑到视觉塔仍是 rip=0（往上翻 [mha] 那段）"
+  fi
   say "setup 完成"
 }
 
@@ -3763,6 +3770,10 @@ ensure_cuda_compat() {
   else
     H3_CUDA_PRELOAD="$H3_CUDA_SHIM"
   fi
+  # mha 兜底 .so：构造期把组合实现注册进 libinfinicore_cpp_api.so 的 dispatcher
+  if [ -n "${H3_MHA_PRELOAD:-}" ]; then
+    H3_CUDA_PRELOAD="$H3_CUDA_PRELOAD:$H3_MHA_PRELOAD"
+  fi
   export H3_CUDA_PRELOAD
 
   # 5) Python 侧兜底：万一子脚本把 LD_PRELOAD 冲掉，解释器启动时也用
@@ -3852,7 +3863,14 @@ inject_mha_fallback() {
 // 一旦有人用 --flash-attn 编（走 hygon/mha_flashattn_hygon.cc 的真实现），
 // 本文件整体不参与编译，绝不会顶掉快路径。
 
-#if defined(ENABLE_HYGON_API) && !defined(ENABLE_FLASH_ATTN)
+// 两种编译形态，代码完全相同：
+//   · 编进 libinfinicore_cpp_api.so（宏 ENABLE_HYGON_API）—— 需要重编该库时才走这条；
+//   · 独立编成 libh3mha.so，用 LD_PRELOAD 挂（宏 H3_MHA_STANDALONE）—— 只编一个 .cc，
+//     靠构造期把实现注册进 cpp_api 里的 dispatcher。后者是当前实际使用的路径：
+//     重编 cpp_api 会连带触发 infiniop 全量重编（约 38 分钟），单作业 50 分钟装不下。
+#if (defined(ENABLE_HYGON_API) || defined(H3_MHA_STANDALONE)) && !defined(ENABLE_FLASH_ATTN)
+
+#include <cstdio>
 
 #include "infinicore/ops/mha.hpp"
 
@@ -3994,20 +4012,39 @@ void cleanup(void **planned_meta_ptr) {
 
 namespace {
 
-static bool registered = []() {
-    // 这个编译分支下 hygon 没有任何 mha 注册，直接占位（override=true 只是为了让
-    // 静态初始化顺序无关紧要——真实现存在时整个文件都不编译）。
-    MultiheadAttention::plan_dispatcher().registerAll(&plan, true);
-    MultiheadAttention::run_dispatcher().registerAll(&run, true);
-    MultiheadAttention::cleanup_dispatcher().registerAll(&cleanup, true);
-    return true;
-}();
+void register_all() {
+    // override=false：只填没人注册的槽位。Hygon 上这个表本来就是全 nullptr，
+    // 所以一定会填上；将来若真编了 --flash-attn 的真实现，也不会被我们顶掉。
+    MultiheadAttention::plan_dispatcher().registerAll(&plan, false);
+    MultiheadAttention::run_dispatcher().registerAll(&run, false);
+    MultiheadAttention::cleanup_dispatcher().registerAll(&cleanup, false);
+    // 这行是判断「兜底到底有没有装上」的唯一凭据，日志里搜 [mha] 即可。
+    std::fprintf(stderr, "[mha] 使用 InfiniCore 组合实现（matmul+softmax+matmul）\n");
+}
 
 } // namespace
 
+#if defined(H3_MHA_STANDALONE)
+// 独立 .so 走 LD_PRELOAD：构造期注册到 libinfinicore_cpp_api.so 里的 dispatcher。
+// 链接依赖保证 cpp_api 先加载，所以此处调用 plan_dispatcher() 是安全的。
+// try/catch 兜住一切异常：这个构造函数跑在所有 python 进程里（包括预检），
+// 绝不能因为注册失败把进程带崩。
+extern "C" __attribute__((constructor)) static void h3_mha_fallback_ctor() {
+    try {
+        register_all();
+    } catch (...) {
+        std::fprintf(stderr, "[mha] 注册失败（异常），保持不注册状态\n");
+    }
+}
+#else
+namespace {
+const bool registered = (register_all(), true);
+} // namespace
+#endif
+
 } // namespace infinicore::op::mha_impl::composed
 
-#endif // ENABLE_HYGON_API && !ENABLE_FLASH_ATTN
+#endif // (ENABLE_HYGON_API || H3_MHA_STANDALONE) && !ENABLE_FLASH_ATTN
 MHA_FALLBACK_CC_EOF
   if [ ! -s "$tmp" ]; then
     say "  !! mha 兜底实现写出来是空的（heredoc 被截断？）"
@@ -4031,7 +4068,80 @@ MHA_FALLBACK_CC_EOF
 # 这份 .cc 的 md5：smoke 每轮拿它和 $OUT/.stamp_mha_fallback 比，
 # 不一致就编一次（平台只给 smoke 入口，没法手动 build）。
 # 改了上面的 heredoc 就必须同步这一行，_fix/test_mha_fallback.sh 会核对。
-MHA_FALLBACK_CC_MD5=273202a6a67cee99517f9398e05c7b74
+MHA_FALLBACK_CC_MD5=e75c7cbbac8d77e0051da0690bc676a9
+
+# =============================================================================
+# Hygon 上 MultiheadAttention 在 dispatcher 里是零注册，op::mha 的 lookup 返回
+# nullptr，graph.hpp 的 INFINICORE_GRAPH_OP_DISPATCH 又不判空 -> call 0 (rip=0)。
+# 视觉塔第一步就是 op::mha，所以 13:28 那单注入成功、却还是在同一处崩。
+#
+# 为什么不重编 libinfinicore_cpp_api.so：
+#   xmake 里 _infinicore 依赖 infiniop，触发构建就是全量（infiniop 约 38 分钟），
+#   单作业 3000 秒装不下；而且这棵树的 build/ 里连 cpp_api 的产物都没有。
+# 所以：把兜底实现单独编成一个 .so，LD_PRELOAD 挂上去，靠构造期把它注册进
+#   cpp_api 里的 dispatcher —— 和已经跑通的 libh3cuda.so / libh3ccl.so 同一条路。
+# 代价只有一个 .cc（几秒），完全不碰 xmake 目标。
+# =============================================================================
+ensure_mha_fallback() {
+  [ -n "${IC:-}" ] || IC=$PKG/src/InfiniCore
+  local api=$INFINI/lib/libinfinicore_cpp_api.so
+  local dir=$AFS/cudashim
+  local so=$dir/libh3mha.so
+  local log=$dir/mha_build.log
+
+  if [ ! -f "$api" ]; then
+    say "  !! 没有 $api（dispatcher 的宿主），兜底挂不上"
+    return 1
+  fi
+
+  inject_mha_fallback || { say "  !! 兜底源码没注入成功"; return 1; }
+  local src=$IC/src/infinicore/ops/multi_head_attention/mha_composed_fallback.cc
+
+  # 源码与宿主库都没动就复用（.cc 由 inject 按内容覆盖，内容不变就不改 mtime）
+  if [ -f "$so" ] && [ "$so" -nt "$src" ] && [ "$so" -nt "$api" ]; then
+    H3_MHA_PRELOAD=$so
+    export H3_MHA_PRELOAD
+    say "  mha 兜底 .so 复用：$so  $(ls -lh "$so" 2>/dev/null | awk '{print $5}')"
+    return 0
+  fi
+
+  local cc=g++
+  command -v g++ >/dev/null 2>&1 || cc=clang++
+  command -v "$cc" >/dev/null 2>&1 || { say "  !! 没有 g++/clang++，编不了兜底 .so"; return 1; }
+
+  say "  编译 mha 兜底 .so（$cc -shared，只编这一个 .cc，不动 xmake）"
+  mkdir -p "$dir" 2>/dev/null
+  rm -f "$so.tmp" 2>/dev/null
+  if ! "$cc" -O2 -std=c++17 -fPIC -shared \
+        -DH3_MHA_STANDALONE -DENABLE_HYGON_API \
+        -I"$IC/include" -I"$INFINI/include" \
+        -o "$so.tmp" "$src" \
+        -L"$INFINI/lib" -linfinicore_cpp_api \
+        -Wl,-rpath,"$INFINI/lib" \
+        2>"$log"; then
+    say "  !! 兜底 .so 编译失败（这单还会 rip=0，先别跑）："
+    grep -n -m8 -E "error:|fatal error:|undefined reference|cannot find" "$log" 2>/dev/null | cut -c1-200 | sed 's/^/    /'
+    tail -4 "$log" 2>/dev/null | sed 's/^/    /'
+    return 1
+  fi
+  [ -s "$so.tmp" ] || { say "  !! 兜底 .so 编出来是空的"; return 1; }
+  mv -f "$so.tmp" "$so" 2>/dev/null || { cp -f "$so.tmp" "$so" 2>/dev/null; rm -f "$so.tmp" 2>/dev/null; }
+
+  # 必须在独立进程里试加载：这个 .so 会被 LD_PRELOAD 进每一个 python 进程。
+  # 万一 cpp_api 没导出 plan_dispatcher（被 -fvisibility=hidden 藏了），ld.so 会
+  # 直接拒绝加载，那就不只是 mha 的问题了，整个 smoke 都起不来。宁可这里失败。
+  if ! LD_LIBRARY_PATH="$INFINI/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+       LD_PRELOAD="$so" /bin/true 2>"$dir/mha_preload.log"; then
+    say "  !! 兜底 .so 预加载失败（cpp_api 可能没导出符号）："
+    tail -6 "$dir/mha_preload.log" 2>/dev/null | sed 's/^/    /'
+    say "     不挂它——挂了会连 python 都起不来"
+    return 1
+  fi
+  say "  mha 兜底 .so 就位：$so  $(ls -lh "$so" 2>/dev/null | awk '{print $5}')（预加载自检通过）"
+  H3_MHA_PRELOAD=$so
+  export H3_MHA_PRELOAD
+  return 0
+}
 
 do_build() {
   ensure_pkg
@@ -5767,14 +5877,10 @@ case "$MODE" in
   setup)  do_setup ;;
   build)  do_build ;;
   smoke)
-          # 平台固定只提交 smoke，而 smoke 原本不编译 —— 改了 C++ 算子就没入口生效。
-          # 所以用「算子源码 md5」做戳：戳不一致就编一次，编完落戳，之后每单秒过。
-          # 想强行重编：h3.env 里写 FORCE_BUILD=1 或 H3_BUILD=1。
+          # 平台固定只提交 smoke，而 smoke 原本不编译。算子兜底现已改成
+          # 「独立 .so + LD_PRELOAD」（见 ensure_mha_fallback，setup 阶段就编好），
+          # 所以这里只在显式要求时才走 xmake —— 光 configure 一次就要 100 秒。
           NEED_BUILD=0
-          if [ "$(cat "$OUT/.stamp_mha_fallback" 2>/dev/null)" != "$MHA_FALLBACK_CC_MD5" ]; then
-            NEED_BUILD=1
-            say "算子源码与上次编译的不一致（戳=$(cat "$OUT/.stamp_mha_fallback" 2>/dev/null || echo 无) 现=$MHA_FALLBACK_CC_MD5），先编一次"
-          fi
           if [ "${H3_BUILD:-0}" = "1" ] || [ "${FORCE_BUILD:-0}" = "1" ]; then
             NEED_BUILD=1
             say "H3_BUILD=${H3_BUILD:-0} FORCE_BUILD=${FORCE_BUILD:-0}，强制重编"

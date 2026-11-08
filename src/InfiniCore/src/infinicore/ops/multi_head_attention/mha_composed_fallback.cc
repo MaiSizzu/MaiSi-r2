@@ -15,7 +15,14 @@
 // 一旦有人用 --flash-attn 编（走 hygon/mha_flashattn_hygon.cc 的真实现），
 // 本文件整体不参与编译，绝不会顶掉快路径。
 
-#if defined(ENABLE_HYGON_API) && !defined(ENABLE_FLASH_ATTN)
+// 两种编译形态，代码完全相同：
+//   · 编进 libinfinicore_cpp_api.so（宏 ENABLE_HYGON_API）—— 需要重编该库时才走这条；
+//   · 独立编成 libh3mha.so，用 LD_PRELOAD 挂（宏 H3_MHA_STANDALONE）—— 只编一个 .cc，
+//     靠构造期把实现注册进 cpp_api 里的 dispatcher。后者是当前实际使用的路径：
+//     重编 cpp_api 会连带触发 infiniop 全量重编（约 38 分钟），单作业 50 分钟装不下。
+#if (defined(ENABLE_HYGON_API) || defined(H3_MHA_STANDALONE)) && !defined(ENABLE_FLASH_ATTN)
+
+#include <cstdio>
 
 #include "infinicore/ops/mha.hpp"
 
@@ -157,17 +164,36 @@ void cleanup(void **planned_meta_ptr) {
 
 namespace {
 
-static bool registered = []() {
-    // 这个编译分支下 hygon 没有任何 mha 注册，直接占位（override=true 只是为了让
-    // 静态初始化顺序无关紧要——真实现存在时整个文件都不编译）。
-    MultiheadAttention::plan_dispatcher().registerAll(&plan, true);
-    MultiheadAttention::run_dispatcher().registerAll(&run, true);
-    MultiheadAttention::cleanup_dispatcher().registerAll(&cleanup, true);
-    return true;
-}();
+void register_all() {
+    // override=false：只填没人注册的槽位。Hygon 上这个表本来就是全 nullptr，
+    // 所以一定会填上；将来若真编了 --flash-attn 的真实现，也不会被我们顶掉。
+    MultiheadAttention::plan_dispatcher().registerAll(&plan, false);
+    MultiheadAttention::run_dispatcher().registerAll(&run, false);
+    MultiheadAttention::cleanup_dispatcher().registerAll(&cleanup, false);
+    // 这行是判断「兜底到底有没有装上」的唯一凭据，日志里搜 [mha] 即可。
+    std::fprintf(stderr, "[mha] 使用 InfiniCore 组合实现（matmul+softmax+matmul）\n");
+}
 
 } // namespace
 
+#if defined(H3_MHA_STANDALONE)
+// 独立 .so 走 LD_PRELOAD：构造期注册到 libinfinicore_cpp_api.so 里的 dispatcher。
+// 链接依赖保证 cpp_api 先加载，所以此处调用 plan_dispatcher() 是安全的。
+// try/catch 兜住一切异常：这个构造函数跑在所有 python 进程里（包括预检），
+// 绝不能因为注册失败把进程带崩。
+extern "C" __attribute__((constructor)) static void h3_mha_fallback_ctor() {
+    try {
+        register_all();
+    } catch (...) {
+        std::fprintf(stderr, "[mha] 注册失败（异常），保持不注册状态\n");
+    }
+}
+#else
+namespace {
+const bool registered = (register_all(), true);
+} // namespace
+#endif
+
 } // namespace infinicore::op::mha_impl::composed
 
-#endif // ENABLE_HYGON_API && !ENABLE_FLASH_ATTN
+#endif // (ENABLE_HYGON_API || H3_MHA_STANDALONE) && !ENABLE_FLASH_ATTN
