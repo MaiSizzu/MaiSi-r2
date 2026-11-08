@@ -12,6 +12,12 @@
 #   localall  同 all，但不复用 AFS 上的编译树（AFS 编译太慢时用这个）
 #             （编译日志实时打到控制台，被 50 分钟上限杀也能看到死在哪一步）
 #   retry4    smoke 失败时改用 2 卡重试
+#   compare   官方 minimax_h3_compare.py 的 PyTorch↔InfiniLM 对比
+#             （默认只跑 fl2va；PyTorch 基准片生成一次就存在 outputs/compare/，
+#               之后靠 --reference-fl2va-video 复用，不会每次重跑）
+#             H3_TASKS=fl2va,ref2va 两个任务都跑；H3_REUSE_OURS=1 本方片子也复用
+#             H3_FORCE_REF=1 强制重跑基准（旧片留 .bak）
+#   report    只算 SSIM/尺寸/帧数，不生成、不占卡（两条片子都在 compare 目录里时用）
 #
 # 编译树怎么来（都为了绕开 AFS 上 8668 个小文件的慢速遍历，cp -a 一次要 31 分钟）：
 #   · $AFS/ic_work 已存在 → 直接复用，能接着编上次没编完的目标
@@ -39,6 +45,14 @@
 # 同时给两个薄壳加故障注入日志：CUDA 那条链以前有个静默崩溃路径（cuModuleGetFunction
 # 拿到 NULL 直接被转发进 hipModuleLaunchKernel）；集合通信则在真搬运前打「进入」点，
 # 好分辨是「还没走到集合通信」还是「走进了死在搬运里」。
+#
+# compare 模式的取舍（官方脚本一次跑四件事：PyTorch fl2va / InfiniLM fl2va / 两边 ref2va，
+# 每件 124 帧 50 步，一件都不便宜）：
+#   · 只跑 fl2va，ref2va 要额外输入视频且时间翻倍，默认不跑
+#   · PyTorch 基准片落在 outputs/compare/reference_fl2va.mp4，之后一律 provided，
+#     官方脚本连子进程都不起（日志里是 using existing result），省掉最贵的那一趟
+#   · 开工前先确认 skimage 在不在 —— 官方脚本是在解码对比那一刻才 import 它的，
+#     不先查就会跑完几小时才在最后一步崩在 No module named 'skimage'
 # =============================================================================
 
 MODE=${1:-check}
@@ -2634,8 +2648,26 @@ for _p in os.environ.get("H3_CUDA_PRELOAD", "").split(":"):
             ctypes.CDLL(_p, mode=ctypes.RTLD_GLOBAL)
         except OSError:
             pass
+
+# 只在显式要求时补 processor 兜底 + 现场保护。
+# 为什么需要这一手：minimax_h3_compare.py 是用 sys.executable 直接起
+# minimax_h3.py 子进程的，不走我们的 h3_entry.py，补丁装不上就会在
+# Qwen3VLVideoProcessor 那里再炸一次（缺 torchvision）。而 run_fl2va 那条路
+# 已经由 h3_entry 装了，重复装也是幂等的。
+# 默认不开：每次探测用的小 python 都去 import transformers 要多花 3~5 秒。
+if os.environ.get("H3_SITE_PATCH") == "1":
+    try:
+        import h3_trace
+
+        h3_trace.install()
+    except Exception:
+        pass
+    try:
+        import h3_proc_fix
+    except Exception:
+        pass
 PYEOF
-    say "  Python 兜底：$ovl/sitecustomize.py"
+    say "  Python 兜底：$ovl/sitecustomize.py（H3_SITE_PATCH=1 时连带装 processor 补丁）"
   fi
 
   # 6) 打补丁启动器，保证 LD_PRELOAD 里薄壳始终在最前
@@ -3533,6 +3565,9 @@ NEED = [
     ("出片", "cv2", False, "opencv-python-headless"),
     ("出片", "imageio_ffmpeg", False, "imageio-ffmpeg"),
     ("工具", "imageio", False, "imageio"),
+    # 官方对比脚本算 SSIM 要用 skimage（离线包里没有，compare 前会现场补）
+    ("对比", "skimage", False, "scikit-image"),
+    ("对比", "scipy", False, "scipy"),
 ]
 
 missing = []
@@ -3944,6 +3979,11 @@ do_run() {
     return 3
   }
 
+  if [ "${H3_ENV_ONLY:-0}" = "1" ]; then
+    say "  环境已就绪（H3_ENV_ONLY=1：只准备环境，不启动推理）"
+    return 0
+  fi
+
   local launcher=$PKG/scripts/run_fl2va_direct.sh
   local patched=0
   if [ -n "${H3_LAUNCHER:-}" ] && [ -f "$H3_LAUNCHER" ]; then launcher=$H3_LAUNCHER; patched=1; fi
@@ -4001,6 +4041,185 @@ do_run() {
   return $rc
 }
 
+# ---------- 官方对比（minimax_h3_compare.py）----------
+# 官方脚本一次跑四件事：PyTorch 基准 fl2va、InfiniLM fl2va、两边 ref2va。
+# 每件都是 124 帧 / 50 步，一件都不便宜，所以这里按「任务能单独跑」来编排：
+#   · 默认 --tasks=fl2va             —— ref2va 要额外的参考视频，时间翻倍，不默认跑
+#   · PyTorch 基准跑一次就落在 $OUT/compare/reference_fl2va.mp4，
+#     之后一律用 --reference-fl2va-video 指过去，官方脚本直接标 provided，
+#     不会重新生成（H3_FORCE_REF=1 才强制重跑）
+#   · 只想看我们自己的片子：H3_REUSE_OURS=1，连 InfiniLM 那侧也走 provided
+# 每条片子的来路都会打一行，日志里能分清哪个是刚生成的、哪个是复用的。
+CMP_DIR=$OUT/compare
+CMP_PY=$PKG/src/InfiniLM/examples/minimax_h3_compare.py
+
+# 官方脚本用 skimage 算 SSIM，离线 pylibs 里没有这个包。
+# 它是在**解码对比**那一刻才 import 的，也就是说：不先查，就会跑完 124 帧 × 50 步
+# （每侧几十分钟）才在最后一步崩在 No module named 'skimage' 上。
+# 所以这里在开工前就探一次，缺了就现场补 wheel（不依赖 pip，走清华镜像）。
+ensure_compare_deps() {
+  local py=python3
+  command -v python3 >/dev/null 2>&1 || py=python
+  local probe='from skimage.metrics import structural_similarity as f; print("skimage OK", f.__module__)'
+  local out
+  out=$(PYTHONPATH="$PYDEPS/dyn:$PYDEPS${PYTHONPATH:+:$PYTHONPATH}" "$py" -c "$probe" 2>&1)
+  if [ $? -eq 0 ]; then
+    say "  对比依赖就位：$out"
+    return 0
+  fi
+  say "  对比要 skimage（SSIM），离线包里没有 → 现场补"
+  printf '%s\n' "$out" | tail -3 | sed 's/^/    /'
+  # scikit-image 的硬依赖：scipy / networkx / lazy_loader / imageio / tifffile
+  # （pyfetch_install 只解压指定包，不会替我们解析依赖，得自己列全）
+  pip_heal scikit-image scipy networkx lazy-loader imageio tifffile
+  out=$(PYTHONPATH="$PYDEPS/dyn:$PYDEPS${PYTHONPATH:+:$PYTHONPATH}" "$py" -c "$probe" 2>&1)
+  if [ $? -eq 0 ]; then
+    say "  对比依赖补齐：$out"
+    return 0
+  fi
+  printf '%s\n' "$out" | tail -8 | sed 's/^/    /'
+  return 3
+}
+
+# 按目录里已有的片源组装参数（结果放 CMP_ARGS 全局数组）
+cmp_build_args() {
+  CMP_ARGS=(
+    --model-path="$MODEL_ROOT"
+    --output-dir="$CMP_DIR"
+    --tasks="${H3_TASKS:-fl2va}"
+  )
+  [ -f "$FIRST_FRAME" ] && CMP_ARGS+=(--first-frame="$FIRST_FRAME")
+
+  local ref=$CMP_DIR/reference_fl2va.mp4 ours=$CMP_DIR/infinilm_fl2va.mp4
+  if [ "${H3_FORCE_REF:-0}" = "1" ]; then
+    say "  PyTorch 基准：H3_FORCE_REF=1，强制重新生成（旧片会被覆盖）"
+    [ -f "$ref" ] && mv -f "$ref" "$ref.bak" && say "    旧片已留作 reference_fl2va.mp4.bak"
+  elif [ -s "$ref" ]; then
+    CMP_ARGS+=(--reference-fl2va-video="$ref")
+    say "  PyTorch 基准：复用 $ref（$(stat -c '%s' "$ref" 2>/dev/null) 字节，不重新生成）"
+  else
+    say "  PyTorch 基准：目录里没有现成的，这一单生成一次，之后就一直复用"
+  fi
+
+  if [ "${H3_REUSE_OURS:-0}" = "1" ]; then
+    local fullout=$OUT/fl2va_124f_50s.mp4
+    if [ -s "$ours" ]; then
+      CMP_ARGS+=(--infinilm-fl2va-video="$ours")
+      say "  InfiniLM 结果：H3_REUSE_OURS=1，复用 $ours（不重新生成）"
+    elif [ -s "$fullout" ]; then
+      # full 那条路的参数和官方对比完全对齐：prompt「A dog falls asleep」、
+      # 124 帧、50 步、seed 42（minimax_h3.py 的默认值），所以这份片子就是
+      # 官方脚本要生成的同一份，直接拿来比，省掉一整趟 124 帧生成。
+      CMP_ARGS+=(--infinilm-fl2va-video="$fullout")
+      say "  InfiniLM 结果：H3_REUSE_OURS=1，复用 full 的产出 $fullout"
+      say "    （前提：prompt/帧数/步数/seed 都没改过；改过就别用这个开关）"
+    else
+      say "  InfiniLM 结果：H3_REUSE_OURS=1 但两条候选都没有，照常生成"
+    fi
+  fi
+
+  # ref2va 两条片子也支持复用，避免重复跑
+  local t
+  for t in reference infinilm; do
+    local f=$CMP_DIR/${t}_ref2va.mp4
+    if [ -s "$f" ] && [ "${H3_FORCE_REF2VA:-0}" != "1" ]; then
+      CMP_ARGS+=(--${t}-ref2va-video="$f")
+      say "  ${t} ref2va：复用 $f"
+    fi
+  done
+}
+
+# 预加载链要和启动器完全一致：我们的薄壳在最前，DTK 的 libcuda 跟在后面。
+# 少这一段，compare 的子进程会自己 import infinicore，符号解析就跟 smoke 走的路不一样了。
+h3_preload_chain() {
+  local pre="${H3_CUDA_PRELOAD:-}" f
+  if [ "${H3_DROP_LIBCUDA:-0}" != "1" ]; then
+    for f in "$DTK_ROOT"/cuda/*/targets/x86_64-linux/lib/libcuda.so.1 \
+             "$DTK_ROOT"/cuda/*/lib64/libcuda.so.1; do
+      [ -f "$f" ] && pre="${pre:+$pre:}$f" && break
+    done
+  fi
+  printf '%s' "$pre"
+}
+
+do_compare() {
+  [ -f "$CMP_PY" ] || die "缺官方对比脚本：$CMP_PY（代码包没解全？）"
+  mkdir -p "$CMP_DIR" 2>/dev/null || die "建不了 $CMP_DIR"
+
+  # 卡、CUDA→HIP 薄壳、集合通信、PYTHONPATH、三道预检，全走 smoke 那套；
+  # H3_ENV_ONLY=1 让它准备完就停，不启动 run_fl2va_direct。
+  H3_ENV_ONLY=1 do_run compare
+  local rc=$?
+  [ $rc -eq 0 ] || return $rc
+
+  # compare 的子进程是 sys.executable 直接起的，不经过 h3_entry，靠 sitecustomize
+  # 这道闸门把 processor 兜底 + 现场保护带进去。
+  export H3_SITE_PATCH=1
+  export H3_TRACE="${H3_TRACE:-1}"
+  export H3_HB="${H3_HB:-300}"   # 124 帧跑很久，心跳 5 分钟一次，别把日志刷爆
+
+  local py=python3
+  command -v python3 >/dev/null 2>&1 || py=python
+
+  # 先确认 SSIM 依赖在，缺了现在补；这东西不在的话，几小时生成完才崩在最后一步
+  ensure_compare_deps || return $?
+
+  local -a args
+  cmp_build_args
+  args=("${CMP_ARGS[@]}")
+  args+=(--infinilm-gpus="$GPUS"
+         --legacy-gpus="${LEGACY_GPUS:-0,1,2,3}"
+         --legacy-memory-fraction="${LEGACY_MEM_FRAC:-0.4}")
+
+  say "官方对比（每侧 124 帧 / 50 步）"
+  say "  脚本 = $CMP_PY"
+  say "  参数 = ${args[*]}"
+  local clog=$OUT/compare_${TS}.log clrc=0
+  local pre
+  pre=$(h3_preload_chain)
+  say "  预加载链 = ${pre:-<空>}"
+  LD_PRELOAD="$pre${LD_PRELOAD:+:$LD_PRELOAD}" \
+    "$py" "$CMP_PY" "${args[@]}" 2>&1 | tee "$clog"
+  clrc=${PIPESTATUS[0]}
+
+  echo
+  say "对比结束 rc=$clrc  日志 $clog"
+  local f
+  for f in reference_fl2va infinilm_fl2va reference_ref2va infinilm_ref2va; do
+    [ -s "$CMP_DIR/$f.mp4" ] && say "  $f.mp4  $(stat -c '%s' "$CMP_DIR/$f.mp4" 2>/dev/null) 字节  $(stat -c '%y' "$CMP_DIR/$f.mp4" 2>/dev/null | cut -d. -f1)"
+  done
+  say "  SSIM/尺寸/帧数见上面 [result] 段；报告填这一段就行"
+  # 只跑出基准、我们这侧挂了也不算白跑：基准已落盘，下一单直接复用
+  return $clrc
+}
+
+# 纯出报告：两条片子都现成，只算 SSIM / 时长，不碰卡
+do_report() {
+  [ -f "$CMP_PY" ] || die "缺官方对比脚本：$CMP_PY"
+  local ref=$CMP_DIR/reference_fl2va.mp4 ours=$CMP_DIR/infinilm_fl2va.mp4
+  [ -s "$ref" ] || die "缺基准片 $ref（先跑 compare，或把官方给的参考片放这里）"
+  [ -s "$ours" ] || die "缺我们的片 $ours（先跑 full，或 H3_REUSE_OURS 指过去）"
+  [ -n "$MODEL_ROOT" ] && [ -f "$MODEL_ROOT/model_index.json" ] \
+    || die "找不到权重目录（--model-path 是必填参数，虽然 report 不会真去加载）"
+
+  local py=python3
+  command -v python3 >/dev/null 2>&1 || py=python
+  ensure_compare_deps || return $?
+  say "只出报告（不生成、不占卡）"
+  say "  基准 = $ref  $(stat -c '%s' "$ref") 字节"
+  say "  本方 = $ours  $(stat -c '%s' "$ours") 字节"
+  PYTHONPATH="$PYLIBS:$PYDEPS/dyn:$PYDEPS${PYTHONPATH:+:$PYTHONPATH}" \
+    "$py" "$CMP_PY" \
+      --model-path="$MODEL_ROOT" \
+      --output-dir="$CMP_DIR" \
+      --tasks="${H3_TASKS:-fl2va}" \
+      --reference-fl2va-video="$ref" \
+      --infinilm-fl2va-video="$ours" 2>&1 | tee "$OUT/report_${TS}.log"
+  local rc=${PIPESTATUS[0]}
+  say "报告结束 rc=$rc  日志 $OUT/report_${TS}.log"
+  return $rc
+}
+
 # ---------- 分发 ----------
 case "$MODE" in
   check)  do_check ;;
@@ -4008,6 +4227,8 @@ case "$MODE" in
   build)  do_build ;;
   smoke)  do_setup; do_run smoke ;;
   full)   ensure_deps; do_run full ;;
+  compare) do_setup; do_compare ;;
+  report) do_report ;;
   retry2|retry4)
           ensure_deps
           WANT_GPU=2
@@ -4028,7 +4249,11 @@ case "$MODE" in
             fi
           fi
           ;;
-  *)      echo "用法: run.sh {check|setup|build|smoke|full|all|localall|retry2} [卡数]" ;;
+  *)      echo "用法: run.sh {check|setup|build|smoke|full|compare|report|all|localall|retry2} [卡数]"
+          echo "  compare 跑官方 minimax_h3_compare.py：默认只跑 fl2va，PyTorch 基准跑一次就复用"
+          echo "    H3_TASKS=fl2va,ref2va  两个任务都跑    H3_REUSE_OURS=1  复用已有的本方片子"
+          echo "    H3_FORCE_REF=1  强制重跑基准          LEGACY_GPUS=0,1,2,3  基准用的卡"
+          echo "  report  只算 SSIM / 尺寸 / 帧数，不生成、不占卡（两条片子都得先在 compare 目录里）" ;;
 esac
 
 RC=$?
