@@ -139,7 +139,10 @@ void run(void *planned_meta) {
     auto flat = attn_weight->view({batch_size * num_heads, seq_len, seq_len});
     // causal 用 causal_softmax_（static_attn 已验证过原地可用）；
     // 非 causal 走独立的 softmax，避免 out/in 同一块内存时还要赌实现里的原地语义。
-    Tensor probs = flat;
+    //
+    // 之后必须 view 回 GQA 展开的形状再乘 V：probs 的 batch 维得是 B*H_kv，
+    // 留成 [B*H_q, S, S] 去乘 [B*H_kv, S, D_v]，ngroup>1 时 batch 维直接对不上。
+    Tensor probs = flat->view({batch_size * num_kv_heads, ngroup * seq_len, seq_len});
     if (p->is_causal) {
         op::causal_softmax_(flat, flat);
     } else {
@@ -151,9 +154,10 @@ void run(void *planned_meta) {
 
     auto merged = attn_out->view({batch_size, num_heads, seq_len, value_head_dim})
                       ->permute({0, 2, 1, 3})
-                      ->contiguous()
-                      ->view({batch_size, seq_len, num_heads * value_head_dim});
+                      ->contiguous(); // [B, S, H, D_v]：必须和 out 同形
 
+    // copy_from 的实现是 `if (src->shape() != this->shape()) throw`（copy.cc:21），
+    // 所以这里千万不要 view 成 [B,S,H*D] —— 元素数一样也不行，形状必须逐维相同。
     out->copy_from(merged);
 }
 
@@ -181,7 +185,10 @@ void register_all() {
 // 链接依赖保证 cpp_api 先加载，所以此处调用 plan_dispatcher() 是安全的。
 // try/catch 兜住一切异常：这个构造函数跑在所有 python 进程里（包括预检），
 // 绝不能因为注册失败把进程带崩。
-extern "C" __attribute__((constructor)) static void h3_mha_fallback_ctor() {
+// 注意：这里**不能**写 static —— C++ 标准禁止在 extern "C" 的链接规范里带存储类，
+// gcc 报 `invalid use of 'static' in linkage specification`（14:49 那单就死在这一个词）。
+// 用 visibility("hidden") 把它藏起来，效果和 static 一样，但不违反链接规范。
+extern "C" __attribute__((constructor, visibility("hidden"))) void h3_mha_fallback_ctor() {
     try {
         register_all();
         // 注册完立刻回查：静态 dispatcher 是函数内 static，正常只会有一份；
