@@ -3795,9 +3795,14 @@ preflight_processor() {
   export PYTHONPATH="$PYDEPS/dyn:$PYDEPS${PYTHONPATH:+:$PYTHONPATH}"
 
   say "  预检 3/3：processor 加载（torchvision 缺失时 image_processor 应走 PIL 后端）"
+  # 这一步正常只花几十秒。14:30 那单若在这里无声挂着，后面 40 分钟的权重加载和
+  # 一小时的生成全是白烧，所以套个超时：卡住就直接判死，把卡时留给重提一单。
+  local tmo=""
+  command -v timeout >/dev/null 2>&1 && tmo="timeout -k 5 ${H3_PTMO:-900}"
+  [ -n "$tmo" ] && say "    上限 ${H3_PTMO:-900}s 强制结束（正常几十秒；卡住就是真卡住）"
   local gout grc
   gout=$(MODEL_ROOT="$MODEL_ROOT" LD_PRELOAD="${H3_CUDA_PRELOAD:-}${LD_PRELOAD:+:$LD_PRELOAD}" \
-    "$py" - 2>&1 <<'PYEOF'
+    $tmo "$py" - 2>&1 <<'PYEOF'
 import glob
 import os
 import sys
@@ -3862,6 +3867,13 @@ PYEOF
   if [ $grc -eq 0 ]; then
     printf '%s\n' "$gout" | sed 's/^/    /'
     return 0
+  fi
+  if [ $grc -eq 124 ] || [ $grc -eq 137 ]; then
+    say "  !! processor 自检超过 ${H3_PTMO:-900}s 仍没结束 → 判定卡死（不是慢）"
+    printf '%s\n' "$gout" | tail -20 | sed 's/^/    /'
+    say "     停在 from_pretrained 或某个 import 等锁上。这一单重提一次通常就过；"
+    say "     连续两单都卡在同一处，把上面那几行贴我"
+    return 5
   fi
   say "  !! processor 自检失败（这次只花几十秒，不是 40 分钟），根因在下面："
   printf '%s\n' "$gout" | tail -20 | sed 's/^/    /'
