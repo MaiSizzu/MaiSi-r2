@@ -49,7 +49,10 @@ fi
 
 # ---- 参数 ----
 if [ "${SMOKE:-0}" = "1" ]; then
-  FRAMES=8; STEPS=2; HW_ARGS="--height 256 --width 256"; TAG=smoke
+  # 视频 VAE 只能编码 17n+5 帧，before_denoise.py 会先向上取到最近的 17n+5，
+  # 再校验必须落在 [120,360]。所以 8 帧这种小样永远不可能合法（8→22，直接拒），
+  # 最小合法值就是 124（17*7+5）。smoke 用最小合法档，别再改回 8。
+  FRAMES=${H3_SMOKE_FRAMES:-124}; STEPS=${H3_SMOKE_STEPS:-2}; HW_ARGS="--height 256 --width 256"; TAG=smoke
 else
   FRAMES=${NUM_FRAMES:-124}; STEPS=${STEPS:-50}; HW_ARGS=""; TAG="${FRAMES}f_${STEPS}s"
 fi

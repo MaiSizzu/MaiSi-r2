@@ -110,6 +110,14 @@
 #     官方脚本连子进程都不起（日志里是 using existing result），省掉最贵的那一趟
 #   · 开工前先确认 skimage 在不在 —— 官方脚本是在解码对比那一刻才 import 它的，
 #     不先查就会跑完几小时才在最后一步崩在 No module named 'skimage'
+#
+# smoke 的帧数不是 8（11-08 15:41 那单的结论）：
+# 视频 VAE 只能编码 17n+5 帧，before_denoise.py:406 先把 num_frames 向上取到最近的
+# 17n+5，再要求落在 [120,360]。8 帧取上去是 22，直接 ValueError —— 也就是说 8 这种
+# 「小样」在这个模型里永远不可能合法，最小合法档就是 124（17*7+5）。
+# 启动器里那行写死的是 FRAMES=8，包目录是别的 uid 的只读树改不了，所以
+# patch_fl2va_launcher 生成补丁副本时会就地换成 ${H3_SMOKE_FRAMES:-124}。
+# 想换档位：往 h3.env 写 H3_SMOKE_FRAMES=<17n+5 且 ≥120>，124 已经是最小合法值。
 # =============================================================================
 
 MODE=${1:-check}
@@ -3287,6 +3295,15 @@ patch_fl2va_launcher() {
         out+='export PYTHONPATH="$PYTHONPATH:$SS/InfiniCore/python:$SS/InfiniLM/python"'$'\n'
         n=$((n+1))
         ;;
+      *'FRAMES=8; STEPS=2;'*)
+        # 15:41 那单的结论：smoke 的 frames=8 根本不被接受。
+        # before_denoise.py:406 会先把它「向上取到最近的 17n+5」= 22，再校验必须落在
+        # [120,360] —— 22 直接 ValueError。视频 VAE 只能编码 17n+5 帧，所以 8 帧这种
+        # 小样永远不可能合法，最小合法值就是 124（17*7+5）。
+        # 这里就地改掉，不依赖重打 tarball：包目录是别的 uid 的只读树，改了也不生效。
+        out+='  FRAMES=${H3_SMOKE_FRAMES:-124}; STEPS=${H3_SMOKE_STEPS:-2}; HW_ARGS="--height 256 --width 256"; TAG=smoke'$'\n'
+        n=$((n+1))
+        ;;
       '"$PY" examples/minimax_h3.py fl2va \')
         # 换成 h3_entry.py 中转，好在 AutoProcessor 加载之前装上 processor 兜底
         out+='H3_ENTRY_SCRIPT="$PWD/examples/minimax_h3.py" "$PY" '"${H3_ENTRY_PY:-$AFS/ic_py/h3_entry.py}"$' fl2va \\'$'\n'
@@ -3315,6 +3332,7 @@ patch_fl2va_launcher() {
   fi
   H3_LAUNCHER=$dst
   say "  启动器已打补丁：$dst（shim 前置 / PYTHONPATH 追加）"
+  say "  smoke 帧数 = ${H3_SMOKE_FRAMES:-124}（17n+5 且 ≥120；8 帧会被 before_denoise.py 直接拒）"
   return 0
 }
 
