@@ -71,6 +71,21 @@
 #     微算子（matmul），B 同一台 engine 的纯文本 forward（4 token、无 pixel_values）。
 #     A 挂 = 算子/设备层坏；A 过 B 挂 = 注意力/KV 主路坏；A、B 都过 = 视觉塔坏。
 #     关掉：H3_FRPROBE=0（B 会往 KV cache 写 4 个槽，只是 smoke 期诊断用）
+#
+# 11-08 11:48 那单把上面这套跑出了结果：A[0]~A[7] 全部 OK（matmul 读数
+# 32768.0 一位不差），B0 一开就崩 —— 算子层排除，视觉塔也排除，问题在
+# 纯文本 forward 的公共路径上。但 v2 的 h3bt 把 /proc/self/maps 全量倒进了
+# 日志（3000 多行），平台缓冲被冲爆，sig/RIP/出错模块和 C 栈全被挤掉 ——
+# 用最没用的信息换掉了最有用的。所以 h3bt 升到 v3：
+#   · 顺序按信息密度重排：常量串 → siginfo/RIP → dladdr(RIP) → unwind（每帧都
+#     过 dladdr，格式统一是「模块 + 偏移」）→ 最后才是 maps
+#   · maps 只挑 RIP/RSP/RBP 各自命中的那一行（三行），全量要 H3_BT_MAPS=1
+#
+# 同一单还派生出第三条线索：attention.cpp:26 是 num_attention_heads / tp_size
+# 的整数除法，不能整除时静默取整，随后 view({bs,seq,heads,head_dim}) 的元素数
+# 就和 q 对不上 → 越界 → SIGSEGV，且崩在 qkv_proj 之后、o_proj 的 allreduce
+# 之前（这正好解释了「一条 [h3ccl] >> 进入 都没有」）。所以启动时会打一行
+# heads / kv_heads / hidden，并检查能不能被卡数整除，不能就提示 retry4/retry2。
 #   · H3_TEXT_TP=1：文本编码器只占 1 张卡，diffusion 主线照样 8 卡。它的活只是
 #     76 个 token 的 prefill，TP=8 对它零收益，但要多走一条 allreduce 和分片
 #     边界——而段错误恰好就在这个 forward 里。降卡等于整段绕开，不碰算子，
@@ -3112,19 +3127,22 @@ build_bt_shim() {
   # 后面「so 比 src 新就复用」永远不成立，每单都白编一次。
   cat > "$tmps" <<'H3BTEOF'
 /* ====================================================================
- * h3_bt.c —— 原生（C/C++）栈兜底  v2
+ * h3_bt.c —— 原生（C/C++）栈兜底  v3
  *
- * v1 在 11-08 09:55 那单彻底哑了：日志里一个 [h3bt] 字都没有，跟没装一样。
- * 原因很可能是它把 backtrace() 放在了最前面——而段错误现场恰恰是栈可能已经
- * 被踩坏的时候，unwind 自己一崩，前面什么都没来得及写。
+ * v1 全哑：把 backtrace() 放最前，栈一坏它自己先崩，一个字都写不出来。
+ * v2 能进了 —— 11-08 11:48 那单日志里确实出现了 maps 转储。但顺序还是错：
+ * 它在 unwind 之前把 /proc/self/maps 全量倒出来（3000 多行），平台日志缓冲
+ * 被冲爆，sig/RIP/出错模块 和 后面的 C 栈一起被挤掉 —— 等于用最没用的信息
+ * 换掉了最有用的那几行。
  *
- * v2 改成「从最不可能失败的地方开始」：
- *   ① 一条常量串            —— 只要它出现，就证明处理器真的被调到了
- *   ② siginfo + RIP/RSP/RBP —— 纯内存读，不可能失败
- *   ③ dladdr(RIP)           —— 出错指令在哪个 .so 的哪个偏移
- *   ④ /proc/self/maps 全量   —— 纯 open/read/write，事后能靠 rip 反查
- *   ⑤ 最后才 backtrace()     —— 它挂了也不要紧，①~④ 已经落地
- *   ⑥ 把信号交回被顶掉的处理器（Python 的 faulthandler），Python 栈照常打
+ * v3 按「信息密度」重排，越靠前越不可能失败也越关键：
+ *   ① 一条常量串                —— 它出现就证明处理器真被调到了
+ *   ② siginfo + RIP/RSP/RBP     —— 纯内存读
+ *   ③ dladdr(RIP)               —— 出错指令在哪个 .so 的哪个偏移
+ *   ④ unwind，每帧都过 dladdr    —— C 栈，格式统一是「模块 + 偏移」
+ *   ⑤ maps 里只挑命中的那几行    —— RIP/RSP/RBP 各一行，不再全量
+ *   ⑥ 把信号交回被顶掉的处理器（Python 的 faulthandler）
+ * 完整 maps 只在 H3_BT_MAPS=1 时要，日常绝不开。
  *
  * 另外三个入口：
  *   h3bt_selftest()  fork 一个子进程故意 SIGSEGV，验证整条链是活的
@@ -3138,6 +3156,7 @@ build_bt_shim() {
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -3152,6 +3171,8 @@ static struct sigaction h3_prev[H3BT_NSIG];
 static volatile sig_atomic_t h3_busy = 0;
 static volatile sig_atomic_t h3_selftest = 0;
 static char h3_altbuf[H3BT_ALTBUF];
+/* install 时读一次：信号处理器里不碰 getenv */
+static int h3_want_maps = 0;
 
 static void h3w(const char *s) {
     ssize_t r = write(2, s, strlen(s));
@@ -3195,7 +3216,105 @@ static void h3dec(long v) {
     h3w(&b[i + 1]);
 }
 
-static void h3maps(void) {
+/* maps 行开头的十六进制数。手写而不用 strtoul：后者不在 async-signal-safe 名单里 */
+static unsigned long h3hexval(const char **pp, int *ok) {
+    const char *p = *pp;
+    unsigned long v = 0UL;
+    int n = 0;
+    *ok = 0;
+    while (n < 16) {
+        char c = *p;
+        int d;
+        if (c >= '0' && c <= '9') {
+            d = c - '0';
+        } else if (c >= 'a' && c <= 'f') {
+            d = c - 'a' + 10;
+        } else if (c >= 'A' && c <= 'F') {
+            d = c - 'A' + 10;
+        } else {
+            break;
+        }
+        v = (v << 4) | (unsigned long)d;
+        p++;
+        n++;
+    }
+    if (n > 0) {
+        *ok = 1;
+        *pp = p;
+    }
+    return v;
+}
+
+static int h3_in(unsigned long a, unsigned long s, unsigned long e) {
+    return (a != 0UL) && (s <= a) && (a < e);
+}
+
+/* 只打 RIP / RSP / RBP 各自所在的那一行。
+   v2 在这里倒全量，把日志冲爆，反而丢了 sig/RIP —— 这次的教训。 */
+static void h3maps_keys(unsigned long a1, unsigned long a2, unsigned long a3) {
+    int fd;
+    static char lbuf[1024];
+    int llen = 0;
+    int hit1 = 0, hit2 = 0, hit3 = 0;
+    char buf[4096];
+    ssize_t k;
+
+    fd = open("/proc/self/maps", O_RDONLY);
+    if (fd < 0) {
+        h3w("[h3bt] （/proc/self/maps 打不开）\n");
+        return;
+    }
+    h3w("[h3bt] --- maps 命中段（只列 RIP/RSP/RBP 所在的，不打全量）---\n");
+    while ((k = read(fd, buf, sizeof buf)) > 0) {
+        ssize_t i;
+        for (i = 0; i < k; i++) {
+            char c = buf[i];
+            int eol = (c == '\n') || (llen >= (int)sizeof lbuf - 1);
+            if (!eol) {
+                lbuf[llen++] = c;
+                continue;
+            }
+            lbuf[llen] = '\0';
+            if (llen > 0) {
+                const char *p = lbuf;
+                int ok1 = 0, ok2 = 0;
+                unsigned long s = h3hexval(&p, &ok1);
+                if (ok1 && *p == '-') {
+                    unsigned long e;
+                    p++;
+                    e = h3hexval(&p, &ok2);
+                    if (ok2) {
+                        const char *tag = NULL;
+                        if (!hit1 && h3_in(a1, s, e)) {
+                            tag = "        <<< RIP（出错指令）";
+                            hit1 = 1;
+                        } else if (!hit2 && h3_in(a2, s, e)) {
+                            tag = "        <<< RSP（出事时的栈顶）";
+                            hit2 = 1;
+                        } else if (!hit3 && h3_in(a3, s, e)) {
+                            tag = "        <<< RBP（栈帧基址）";
+                            hit3 = 1;
+                        }
+                        if (tag != NULL) {
+                            h3w("[h3bt] ");
+                            h3w(lbuf);
+                            h3w(tag);
+                            h3w("\n");
+                        }
+                    }
+                }
+            }
+            llen = 0;
+        }
+    }
+    close(fd);
+    if (!hit1) {
+        h3w("[h3bt] （RIP 没落在任何已映射段里 —— 说明是跳飞了，不是踩数据）\n");
+    }
+}
+
+/* 全量 maps：只在 H3_BT_MAPS=1 时调用。留给「事后要自己反查段」的场合。 */
+static void h3maps_all(void) {
     int fd = open("/proc/self/maps", O_RDONLY);
     char buf[4096];
     ssize_t k;
@@ -3203,7 +3322,7 @@ static void h3maps(void) {
         h3w("[h3bt] （/proc/self/maps 打不开）\n");
         return;
     }
-    h3w("[h3bt] --- /proc/self/maps ---\n");
+    h3w("[h3bt] --- /proc/self/maps 全量（H3_BT_MAPS=1）---\n");
     while ((k = read(fd, buf, sizeof buf)) > 0) {
         ssize_t off = 0;
         while (off < k) {
@@ -3218,9 +3337,40 @@ static void h3maps(void) {
     h3w("[h3bt] --- maps end ---\n");
 }
 
+static void h3_frame(void *pc, int i) {
+    const char *mod = "?";
+    unsigned long off = 0UL;
+    Dl_info info;
+    memset(&info, 0, sizeof info);
+    if (dladdr(pc, &info) != 0 && info.dli_fname != NULL) {
+        mod = info.dli_fname;
+        if (info.dli_fbase != NULL) {
+            off = (unsigned long)((char *)pc - (char *)info.dli_fbase);
+        }
+    }
+    h3w("[h3bt] #");
+    if (i < 10) {
+        h3w(" ");
+    }
+    h3dec((long)i);
+    h3w(" ");
+    h3w(mod);
+    h3w(" + ");
+    h3hex(off);
+    /* 有符号名就顺手带上，省一次手工 addr2line */
+    if (info.dli_sname != NULL && info.dli_saddr != NULL) {
+        h3w("   ");
+        h3w(info.dli_sname);
+        h3w(" + ");
+        h3hex((unsigned long)((char *)pc - (char *)info.dli_saddr));
+    }
+    h3w("\n");
+}
+
 static void h3_handler(int sig, siginfo_t *si, void *uc_) {
     ucontext_t *uc = (ucontext_t *)uc_;
     void *frames[H3BT_MAX];
+    unsigned long rip = 0UL, rsp = 0UL, rbp = 0UL;
     int n, i;
 
     if (h3_busy) {
@@ -3255,12 +3405,15 @@ static void h3_handler(int sig, siginfo_t *si, void *uc_) {
 
 #ifdef __x86_64__
     if (uc != NULL) {
+        rip = (unsigned long)(uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+        rsp = (unsigned long)(uintptr_t)uc->uc_mcontext.gregs[REG_RSP];
+        rbp = (unsigned long)(uintptr_t)uc->uc_mcontext.gregs[REG_RBP];
         h3w("[h3bt] rip=");
-        h3hex((unsigned long)(uintptr_t)uc->uc_mcontext.gregs[REG_RIP]);
+        h3hex(rip);
         h3w(" rsp=");
-        h3hex((unsigned long)(uintptr_t)uc->uc_mcontext.gregs[REG_RSP]);
+        h3hex(rsp);
         h3w(" rbp=");
-        h3hex((unsigned long)(uintptr_t)uc->uc_mcontext.gregs[REG_RBP]);
+        h3hex(rbp);
         h3w("\n");
     }
 #else
@@ -3275,9 +3428,8 @@ static void h3_handler(int sig, siginfo_t *si, void *uc_) {
 
     /* ③ 出错指令落在哪个模块的哪个偏移 */
 #ifdef __x86_64__
-    if (uc != NULL) {
+    if (uc != NULL && rip != 0UL) {
         Dl_info info;
-        unsigned long rip = (unsigned long)(uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
         memset(&info, 0, sizeof info);
         if (dladdr((void *)(uintptr_t)rip, &info) != 0 && info.dli_fname != NULL) {
             h3w("[h3bt] 出错指令在 ");
@@ -3291,38 +3443,30 @@ static void h3_handler(int sig, siginfo_t *si, void *uc_) {
                 h3hex(rip - (unsigned long)(uintptr_t)info.dli_saddr);
             }
             h3w("\n");
+        } else {
+            h3w("[h3bt] 出错指令不在任何已加载模块里（dladdr 没查到）\n");
         }
     }
 #endif
 
-    /* ④ maps 全量：即使下面 unwind 挂了，也能靠 rip 事后反查 */
-    h3maps();
-
-    /* ⑤ 现在才尝试 unwind */
+    /* ④ 现在才 unwind：每帧都过 dladdr，输出统一是「模块 + 偏移」 */
     n = backtrace(frames, H3BT_MAX);
     h3w("[h3bt] --- C 栈（每帧 = 模块 + 偏移）---\n");
     for (i = 0; i < n; i++) {
-        const char *mod = "?";
-        unsigned long off = 0UL;
-        Dl_info info;
-        memset(&info, 0, sizeof info);
-        if (dladdr(frames[i], &info) != 0 && info.dli_fname != NULL) {
-            mod = info.dli_fname;
-            if (info.dli_fbase != NULL) {
-                off = (unsigned long)((char *)frames[i] - (char *)info.dli_fbase);
-            }
-        }
-        h3w("[h3bt] #");
-        h3dec((long)i);
-        h3w(" ");
-        h3w(mod);
-        h3w(" + ");
-        h3hex(off);
-        h3w("\n");
+        h3_frame(frames[i], i);
     }
-    /* 再来一份带符号名的（少一层手工换算） */
-    backtrace_symbols_fd(frames, n, 2);
+    if (n >= H3BT_MAX) {
+        h3w("[h3bt] （栈更深，只留了前 ");
+        h3dec((long)H3BT_MAX);
+        h3w(" 层）\n");
+    }
     h3w("===== [h3bt] END BACKTRACE =====\n");
+
+    /* ⑤ maps 只挑命中行。全量要显式开 —— v2 就是在这把日志冲爆的 */
+    h3maps_keys(rip, rsp, rbp);
+    if (h3_want_maps) {
+        h3maps_all();
+    }
 
     /* ⑥ 交回原处理器：faulthandler 接着打 Python 栈，然后照常死掉 */
     for (i = 0; i < H3BT_NSIG; i++) {
@@ -3339,8 +3483,13 @@ int h3bt_install(void) {
     struct sigaction sa;
     struct sigaction cur;
     stack_t ss;
+    const char *env;
     int i;
     int rc = 0;
+
+    /* install 不是信号处理器，可以安心读环境变量；handler 里只认这个静态位 */
+    env = getenv("H3_BT_MAPS");
+    h3_want_maps = (env != NULL && env[0] == '1') ? 1 : 0;
 
     /* 主线程开一块备用栈：万一是栈溢出引起的 SIGSEGV，
      * 没有 SA_ONSTACK 的话处理器根本跑不起来（直接二次失败）。 */
@@ -3404,7 +3553,7 @@ int h3bt_selftest(void) {
     return -3;
 }
 
-const char *h3bt_version(void) { return "h3bt/2"; }
+const char *h3bt_version(void) { return "h3bt/3"; }
 H3BTEOF
 
   # 内容没变就直接复用编好的 .so（每单都重编没必要，也省 gcc 存在与否的抖动）
@@ -4750,6 +4899,57 @@ skel_fp() {
   printf '%s' "$s" | md5sum | cut -c1-16
 }
 
+# 文本编码器的 heads 能不能被卡数整除 —— 11-08 11:48 那单把范围逼到了这里。
+#
+# csrc/layers/attention/attention.cpp:26 是 `num_attention_heads_ = total / tp_size`，
+# C++ 的整数除法。不能整除时它不报错，直接向下取整，接着
+#   view({batch, seq, num_attention_heads_, head_dim_})
+# 的元素数就和 q 的实际元素数对不上 —— 越界，SIGSEGV。
+#
+# 这个错法跟这一单的现场完全对得上：A 自检（裸 infinicore 算子）全过，一进
+# forward 就崩，而且 [h3ccl] 一条 ">> 进入" 都没有 —— 因为 qkv_proj 是列并行，
+# 它后面才轮到 o_proj 的 allreduce，崩在 view 就永远走不到集合通信。
+# 所以先把这几个数字打到日志里，一单就能定案。
+report_heads() {
+  local cfg=$1 gpus=$2
+  if [ ! -f "$cfg" ]; then
+    say "  heads 检查：config 不在（$cfg），跳过"
+    return 0
+  fi
+  python3 - "$cfg" "$gpus" <<'PYHEADS'
+import json
+import sys
+
+cfg, gpus = sys.argv[1], sys.argv[2]
+n = len([g for g in gpus.split(",") if g.strip()])
+try:
+    d = json.load(open(cfg))
+except Exception as exc:  # noqa: BLE001
+    print("  heads 检查：config 读不了（%s），跳过" % exc)
+    sys.exit(0)
+tc = d.get("text_config", d) or {}
+h = tc.get("num_attention_heads")
+kv = tc.get("num_key_value_heads")
+hs = tc.get("hidden_size")
+hd = tc.get("head_dim")
+print("  text encoder: hidden=%s heads=%s kv_heads=%s head_dim=%s 卡数=%d"
+      % (hs, h, kv, hd, n))
+if not isinstance(h, int):
+    print("  （config 里没有 num_attention_heads，整除性判断跳过）")
+    sys.exit(0)
+if h % n == 0:
+    print("  heads %d / %d 卡 = %d，能整除" % (h, n, h // n))
+    sys.exit(0)
+print("  !! heads %d 不能被 %d 卡整除，会被整数除法截成 %d" % (h, n, h // n))
+print("     后果：q 的元素数 ≠ view({bs,seq,heads,head_dim}) 要的元素数")
+print("           → 越界 → SIGSEGV，而且一条 allreduce 都走不到")
+ok = [k for k in (1, 2, 3, 4, 6, 8) if k <= n and h % k == 0]
+if ok:
+    print("     能整除的卡数：%s" % "、".join("%d 卡" % k for k in ok))
+    print("     最省事：重跑时选 retry4（4 卡）或 retry2（2 卡）")
+PYHEADS
+}
+
 do_run() {
   local tag=$1
   [ -f "$PKG/scripts/run_fl2va_direct.sh" ] || die "缺 run_fl2va_direct.sh"
@@ -4872,6 +5072,7 @@ do_run() {
   if [ -n "${H3_LAUNCHER:-}" ] && [ -f "$H3_LAUNCHER" ]; then launcher=$H3_LAUNCHER; patched=1; fi
   say "启动 $tag：GPUS=$GPUS  MODEL_ROOT=$MODEL_ROOT"
   say "  启动器 = $launcher"
+  report_heads "$MODEL_ROOT/text_encoder/config.json" "$GPUS"
   # 降 TP 是保底手段，不是默认行为，所以每次都要在日志里留一行：跑完回头看
   # 才知道这一单到底是 8 卡文本编码器还是 1 卡。不设时必须说「不降」，否则
   # 空着的那行会让人以为是忘了传。
