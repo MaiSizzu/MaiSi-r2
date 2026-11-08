@@ -2290,6 +2290,10 @@ def _start_heartbeat(interval):
         while True:
             time.sleep(max(1.0, interval - (time.perf_counter() - last)))
             last = time.perf_counter()
+            try:
+                _maybe_patch()  # 万一两条 import 路径都漏了，心跳兜一次
+            except Exception:  # noqa: BLE001
+                pass
             _say(
                 "[hb] t=+%.0fs stage=%s threads=%d"
                 % (_now(), _STATE["stage"], threading.active_count())
@@ -2397,26 +2401,53 @@ def _hook_pipeline():
     ModularPipeline.__call__ = wrapper
 
 
-def _hook_import():
-    orig_import = builtins.__import__
-    if getattr(orig_import, "_h3_hooked", False):
+def _maybe_patch():
+    """目标模块一旦出现在 sys.modules 里就立刻挂上（幂等，可反复调用）。"""
+    if _STATE["patched"]:
         return
-    target = "diffusers.modular_pipelines.modular_pipeline"
+    if "diffusers.modular_pipelines.modular_pipeline" not in sys.modules:
+        return
+    # 先置位再动作：_hook_pipeline 自己也会走 import
+    _STATE["patched"] = True
+    try:
+        _hook_pipeline()
+        _say("[trace] 已挂 ModularPipeline.__call__（等第一次 pipe(...) 再铺开）")
+    except Exception as exc:  # noqa: BLE001
+        _say("[trace] 挂 pipeline 失败：%s: %s" % (type(exc).__name__, exc))
 
-    def hook(name, globals=None, locals=None, fromlist=(), level=0):
-        mod = orig_import(name, globals, locals, fromlist, level)
-        if not _STATE["patched"] and target in sys.modules:
-            # 先置位再动作：_hook_pipeline 自己也会走 __import__
-            _STATE["patched"] = True
-            try:
-                _hook_pipeline()
-                _say("[trace] 已挂 ModularPipeline.__call__（等第一次 pipe(...) 再铺开）")
-            except Exception as exc:  # noqa: BLE001
-                _say("[trace] 挂 pipeline 失败：%s: %s" % (type(exc).__name__, exc))
-        return mod
 
-    hook._h3_hooked = True
-    builtins.__import__ = hook
+def _hook_import():
+    """两条路径都要覆盖：
+
+    - `import x` / `from x import y` 走 builtins.__import__
+    - diffusers 顶层是 _LazyModule，`from diffusers import ModularPipeline` 只是
+      __getattr__ 触发 importlib.import_module，不经过 __import__
+
+    所以两个都包一层。反正 _maybe_patch 幂等，多调几次没成本。
+    """
+    orig_import = builtins.__import__
+    if not getattr(orig_import, "_h3_hooked", False):
+
+        def hook(name, globals=None, locals=None, fromlist=(), level=0):
+            mod = orig_import(name, globals, locals, fromlist, level)
+            _maybe_patch()
+            return mod
+
+        hook._h3_hooked = True
+        builtins.__import__ = hook
+
+    import importlib
+
+    orig_im = importlib.import_module
+    if not getattr(orig_im, "_h3_hooked", False):
+
+        def im_hook(name, package=None):
+            mod = orig_im(name, package)
+            _maybe_patch()
+            return mod
+
+        im_hook._h3_hooked = True
+        importlib.import_module = im_hook
 
 
 # ---------------------------------------------------------------- 入口
