@@ -59,6 +59,19 @@
 #   · forward_raw 入参打点：进去那一刻手里拿的张量、形状、精度、在哪张卡。
 #     三行看完就能分清是「喂错了东西」（好改）还是「算子/kernel 自己炸」（难改）
 #
+# 11-08 09:55 那单把上面两条都验了：入参全对（input_ids 1×76 int64 cuda:0、
+# position_ids 3×76、四个 list(len=1)），三处钩子也确实挂上了，可还是 rc=139，
+# 而且 [h3bt] 一行都没有、faulthandler 也没打 Python 栈 —— 两套都哑了，
+# 说明它们装好之后被谁顶掉了，或者 v1 的处理器自己先崩了（它把 backtrace()
+# 放在最前面，栈一坏就一个字都写不出来）。于是这一版：
+#   · h3bt v2：先写常量串 → siginfo/RIP → dladdr → /proc/self/maps，最后才 unwind；
+#     另给 h3bt_selftest()（fork 子进程故意崩一次，证明链是活的）和
+#     h3bt_status()（真调用前比对处理器地址，被 HIP 顶掉就重装）
+#   · [fr] 第一次真调用之前先跑两个便宜的自检：A 八张卡各跑一次 infinicore
+#     微算子（matmul），B 同一台 engine 的纯文本 forward（4 token、无 pixel_values）。
+#     A 挂 = 算子/设备层坏；A 过 B 挂 = 注意力/KV 主路坏；A、B 都过 = 视觉塔坏。
+#     关掉：H3_FRPROBE=0（B 会往 KV cache 写 4 个槽，只是 smoke 期诊断用）
+#
 # compare 模式的取舍（官方脚本一次跑四件事：PyTorch fl2va / InfiniLM fl2va / 两边 ref2va，
 # 每件 124 帧 50 步，一件都不便宜）：
 #   · 只跑 fl2va，ref2va 要额外输入视频且时间翻倍，默认不跑
@@ -305,17 +318,38 @@ ensure_pkg() {
 # /dev/shm 每单有 450 GB，把 32 MB 的离线包直接解到本地盘只要几秒，之后导入是本地 IO。
 # 只改「从哪 import」：.ready / .deps_ok 这些戳、以及上游补丁，仍然落在 AFS 上。
 setup_fast_pylibs() {
-  [ "${H3_FAST_PYLIBS:-1}" = "0" ] && return 0
-  [ -n "${PYLIBS_X:-}" ] && return 0
+  # 每个提前返回都留一句人话：09:55 那单这里一声不响就退出了，
+  # 结果 preflight 和启动器全在 AFS 上导包（心跳栈里全是 AFS 的 transformers），
+  # 白等 10 分钟还查不出为什么。
+  if [ "${H3_FAST_PYLIBS:-1}" = "0" ]; then
+    say "  本地导入副本：H3_FAST_PYLIBS=0，按开关关闭"
+    return 0
+  fi
+  if [ -n "${PYLIBS_X:-}" ]; then
+    # 已经设过就不要再往 PYTHONPATH 前面拼一遍（这函数会被调好几次）
+    case ":${PYTHONPATH:-}:" in
+      *":$PYLIBS_X:"*) : ;;
+      *) export PYTHONPATH="$PYLIBS_X${PYTHONPATH:+:$PYTHONPATH}" ;;
+    esac
+    return 0
+  fi
+  if [ -z "${PYLIBS:-}" ]; then
+    say "  !! 本地导入副本：PYLIBS 还是空的（调用点太早），这一单仍从 AFS 导入"
+    return 0
+  fi
   local stamp=""
   stamp=$(cat "$PYLIBS/.ready" 2>/dev/null)
-  [ -n "$stamp" ] || return 0
+  if [ -z "$stamp" ]; then
+    say "  !! 本地导入副本：$PYLIBS/.ready 读不到（空），这一单仍从 AFS 导入"
+    return 0
+  fi
 
   # 目录名带 v1：以后补丁逻辑变了就把 v1 提到 v2，保证不会复用旧的本地副本
   local shmb=${H3_SHM_DIR:-/dev/shm}
   local dst=$shmb/h3pylibs.${stamp}.v1
   if [ -f "$dst/.ok" ] && [ -d "$dst/transformers" ]; then
     export PYLIBS_X=$dst
+    export PYTHONPATH="$dst${PYTHONPATH:+:$PYTHONPATH}"
     say "  导入路径 = $dst（本地盘副本，不碰 AFS）"
     return 0
   fi
@@ -354,6 +388,7 @@ PY
   [ -f "$PYLIBS/$enc" ] && cp -f "$PYLIBS/$enc" "$dst/$enc" 2>/dev/null
   touch "$dst/.ok" 2>/dev/null
   export PYLIBS_X=$dst
+  export PYTHONPATH="$dst${PYTHONPATH:+:$PYTHONPATH}"
   say "  本地副本就绪（$((SECONDS - t0))s）：这两条链之后都从 /dev/shm 导入"
 }
 
@@ -2381,6 +2416,10 @@ def _install_native_bt():
     顺序有讲究：本函数必须在 faulthandler.enable() 之后调用。它是以「链」的方式
     工作的——自己上位，崩时先打 C 栈，再把信号交回被它顶掉的那个处理器，也就是
     faulthandler。装早了就被 faulthandler 顶掉，装晚了才轮到它打头阵。
+
+    两个自检（09:55 那单的教训：处理器"装了"却一个字都没打出来，等于没装）：
+      · h3bt_selftest()：fork 子进程故意崩一次，证明整条链是活的
+      · h3bt_status()  ：和 h3bt_self() 比，证明现在挂的还是我（没被 HIP 顶掉）
     """
     lib = os.environ.get("H3_BT_LIB", "")
     if not lib or not os.path.isfile(lib):
@@ -2392,15 +2431,53 @@ def _install_native_bt():
 
         so = ctypes.CDLL(lib, use_errno=False)
         so.h3bt_install.restype = ctypes.c_int
+        so.h3bt_status.restype = ctypes.c_ulong
+        so.h3bt_self.restype = ctypes.c_ulong
+        so.h3bt_selftest.restype = ctypes.c_int
         rc = so.h3bt_install()
         if rc != 0:
             _say("[trace] 原生栈兜底装不上：h3bt_install() 返回 %d" % rc)
             return False
-        _say("[trace] 原生栈兜底已装：%s（崩时先打 C 栈，再交回 faulthandler）" % lib)
+        _STATE["bt_so"] = so
+        mine = int(so.h3bt_self())
+        _STATE["bt_self"] = mine
+        _say("[trace] 原生栈兜底已装：%s（处理器 @0x%x，崩时先打 C 栈再交回 faulthandler）"
+             % (lib, mine))
+        if os.environ.get("H3_BT_SELFTEST", "1").strip().lower() not in ("0", "false", "no"):
+            st = int(so.h3bt_selftest())
+            if st in (11, 139):
+                _say("[trace]   自检通过：子进程确实被 SIGSEGV 干掉（%d），处理器链是活的" % st)
+            else:
+                _say("[trace]   !! 自检异常：子进程 rc=%d（期望 139）"
+                     "—— 这一单的 C 栈很可能还是打不出来" % st)
         return True
     except Exception as exc:  # noqa: BLE001
         _say("[trace] 原生栈兜底加载失败：%s: %s" % (type(exc).__name__, exc))
         return False
+
+
+def _bt_check(tag):
+    """崩之前确认 C 栈兜底还在位。
+
+    HIP / DTK 初始化时会自己装 SIGSEGV 处理器；它装在我们后面就把我们顶掉了。
+    09:55 那单 C 栈和 Python 栈一个都没打出来，最像这种接管。
+    这里比对地址，发现不对就立刻重装（h3bt_install 里有"已经是我就不装"的判断）。
+    """
+    so = _STATE.get("bt_so")
+    if so is None:
+        return
+    try:
+        mine = int(_STATE.get("bt_self") or 0)
+        cur = int(so.h3bt_status())
+        if cur == mine:
+            _say("[trace] %s：C 栈兜底仍在位（0x%x）" % (tag, cur))
+            return
+        _say("[trace] !! %s：SIGSEGV 处理器被换掉了（现在 0x%x，我 0x%x）→ 重装" % (tag, cur, mine))
+        so.h3bt_install()
+        cur = int(so.h3bt_status())
+        _say("[trace]    重装后 0x%x（%s）" % (cur, "成功" if cur == mine else "还是被占着"))
+    except Exception as exc:  # noqa: BLE001
+        _say("[trace] 检查 C 栈兜底失败：%s: %s" % (type(exc).__name__, exc))
 
 
 def _start_heartbeat(interval):
@@ -2553,10 +2630,109 @@ def _fact(obj):
             getattr(obj, "device", "?"),
         )
     if isinstance(obj, (list, tuple)):
-        return "%s(len=%d)" % (type(obj).__name__, len(obj))
+        # 列表里装的东西才是关键：pixel_values / image_grid_thw / image_bound 全是
+        # list(len=1)，光看个数等于没看。前 3 个元素各给一份形状/精度/设备。
+        try:
+            items = ["[%d] %s" % (i, _fact(v)) for i, v in enumerate(obj[:3])]
+            more = "" if len(obj) <= 3 else " …(+%d)" % (len(obj) - 3)
+            return "%s(len=%d) {%s%s}" % (type(obj).__name__, len(obj), ", ".join(items), more)
+        except Exception:  # noqa: BLE001
+            return "%s(len=%d)" % (type(obj).__name__, len(obj))
     if obj is None:
         return "None"
     return "%s(%r)" % (type(obj).__name__, obj if isinstance(obj, (int, float, str, bool)) else "…")
+
+
+def _probe_guard(fn, tag):
+    """跑一个自检；它自己报错就记一行，绝不能把主流程带崩。"""
+    try:
+        return fn()
+    except BaseException as exc:  # noqa: BLE001
+        msg = (str(exc) or "").splitlines()
+        _say("[probe] !! %s 自己报错（不是段错误）：%s: %s"
+             % (tag, type(exc).__name__, (msg[0][:200] if msg else "")))
+        return None
+
+
+def _probe_ops():
+    """A：infinicore 微算子，8 张卡逐个走一遍。
+
+    挂了 = 算子分发层本身是坏的，跟 H3 的模型代码无关。
+    为什么要逐卡：TP=8 是「一个进程里 8 张卡」，只要有一张卡的 device
+    没被 infinicore 真正认下来（ctx / stream 没建），第一个 forward 就会
+    在某一路 rank 上崩，而日志上看起来只是"进了 C++ 就没了"。
+    """
+    import torch
+
+    import infinicore
+
+    try:
+        ndev = int(torch.cuda.device_count())
+    except Exception:  # noqa: BLE001
+        ndev = 1
+    _say("[probe] A0 torch 看到 %d 张卡" % ndev)
+    ndev = max(1, min(ndev, 8))
+    has_mm = hasattr(infinicore, "matmul")
+    exp = (32.0 * 32.0 * 32.0) if has_mm else (32.0 * 32.0 * 2.0)
+    bad = []
+    for d in range(ndev):
+        dev = "cuda:%d" % d
+        try:
+            at = torch.ones((32, 32), dtype=torch.float32, device=dev)
+            bt = torch.ones((32, 32), dtype=torch.float32, device=dev)
+            _say("[probe] A[%d] from_torch" % d)
+            a = infinicore.from_torch(at)
+            b = infinicore.from_torch(bt)
+            c = infinicore.matmul(a, b) if has_mm else infinicore.add(a, b)
+            if hasattr(infinicore, "sync_device"):
+                infinicore.sync_device()
+            out = torch.empty((32, 32), dtype=torch.float32, device=dev)
+            infinicore.from_torch(out).copy_(c)
+            if hasattr(infinicore, "sync_device"):
+                infinicore.sync_device()
+            s = float(out.sum().item())
+            ok = abs(s - exp) < 0.5
+            _say("[probe] A[%d] sum=%.1f 期望=%.1f → %s"
+                 % (d, s, exp, "OK" if ok else "数值不对"))
+            if not ok:
+                bad.append(d)
+        except BaseException as exc:  # noqa: BLE001
+            msg = (str(exc) or "").splitlines()
+            _say("[probe] !! A[%d] 报错：%s: %s"
+                 % (d, type(exc).__name__, (msg[0][:160] if msg else "")))
+            bad.append(d)
+    return "全过" if not bad else ("坏的卡 %s" % bad)
+
+
+def _probe_text_only(orig, engine):
+    """B：同一台 engine 的纯文本 forward（4 个 token、不带 pixel_values）。
+
+    过了 → 注意力 / KV cache 这条主路是好的，崩在视觉塔；
+    挂了 → 主路就有问题，跟 keyframe 视觉输入无关。
+    代价：往 KV cache 写了 4 个槽；之后真调用从 0 开始覆盖，smoke 可以接受。
+    """
+    import torch
+
+    import infinicore
+
+    n = 4
+    dev = "cuda:0"
+    ids = torch.tensor([[11, 22, 33, 44]], dtype=torch.int64, device=dev)
+    pos = torch.arange(n, dtype=torch.int64, device=dev).unsqueeze(0).repeat(3, 1).contiguous()
+    kw = {
+        "position_ids": infinicore.from_torch(pos),
+        "past_kv_lengths": infinicore.from_torch(torch.zeros(1, dtype=torch.int32, device=dev)),
+        "total_kv_lengths": infinicore.from_torch(torch.tensor([n], dtype=torch.int32, device=dev)),
+        "input_offsets": infinicore.from_torch(torch.tensor([0, n], dtype=torch.int32, device=dev)),
+    }
+    _say("[probe] B0 纯文本 forward 开始（%d token、无 pixel_values）" % n)
+    out = orig(engine, infinicore.from_torch(ids), **kw)
+    if isinstance(out, dict):
+        _say("[probe] B1 返回：%s"
+             % ", ".join("%s=%s" % (k, _fact(v)) for k, v in sorted(out.items())))
+    else:
+        _say("[probe] B1 返回：%s" % _fact(out))
+    return True
 
 
 def _hook_forward_raw():
@@ -2599,6 +2775,15 @@ def _hook_forward_raw():
                 pass
         else:
             _say("[fr] >>> forward_raw #%d" % n)
+        if n == 1:
+            # 真调用之前把「崩在哪儿」劈成两半，顺手确认 C 栈兜底没被 HIP 顶掉。
+            # 关掉：H3_FRPROBE=0
+            if os.environ.get("H3_FRPROBE", "1").strip().lower() not in ("0", "false", "no"):
+                _probe_guard(_probe_ops, "A 微算子")
+                _probe_guard(lambda: _probe_text_only(orig, self), "B 纯文本 forward")
+                _STATE["stage"] = "text encoder forward"
+            _bt_check("[fr] 真调用前")
+            _say("[fr] --- 自检结束，开始真调用（下面这行之后就是 C++）---")
         t0 = time.perf_counter()
         out = orig(self, input_ids, **kwargs)
         _say("[fr] <<< forward_raw #%d  %.1fs" % (n, time.perf_counter() - t0))
@@ -2808,76 +2993,219 @@ build_bt_shim() {
   # 后面「so 比 src 新就复用」永远不成立，每单都白编一次。
   cat > "$tmps" <<'H3BTEOF'
 /* ====================================================================
- * h3_bt.c —— 原生（C/C++）栈兜底
+ * h3_bt.c —— 原生（C/C++）栈兜底  v2
  *
- * 为什么需要：段错误发生在 C++ 里时，Python 栈顶只显示「正在调用
- * super().forward(...)」这一行，再往下全是 C，faulthandler 看不见。
- * 有了这个处理器，崩的那一刻会先打 C 层栈（每帧给出「哪个 .so + 偏移」），
- * 打完再把信号交回原来装的那个处理器（Python 的 faulthandler），
- * 于是 C 栈和 Python 栈都会出现在日志里。
+ * v1 在 11-08 09:55 那单彻底哑了：日志里一个 [h3bt] 字都没有，跟没装一样。
+ * 原因很可能是它把 backtrace() 放在了最前面——而段错误现场恰恰是栈可能已经
+ * 被踩坏的时候，unwind 自己一崩，前面什么都没来得及写。
  *
- * 只用 async-signal-safe 的东西：write / backtrace / snprintf / dladdr。
- * 重入保护：正在打栈时再崩（栈被踩坏时会发生）就直接 _exit，不再递归。
+ * v2 改成「从最不可能失败的地方开始」：
+ *   ① 一条常量串            —— 只要它出现，就证明处理器真的被调到了
+ *   ② siginfo + RIP/RSP/RBP —— 纯内存读，不可能失败
+ *   ③ dladdr(RIP)           —— 出错指令在哪个 .so 的哪个偏移
+ *   ④ /proc/self/maps 全量   —— 纯 open/read/write，事后能靠 rip 反查
+ *   ⑤ 最后才 backtrace()     —— 它挂了也不要紧，①~④ 已经落地
+ *   ⑥ 把信号交回被顶掉的处理器（Python 的 faulthandler），Python 栈照常打
+ *
+ * 另外三个入口：
+ *   h3bt_selftest()  fork 一个子进程故意 SIGSEGV，验证整条链是活的
+ *   h3bt_status()    现在 SIGSEGV 上挂的是谁的地址
+ *   h3bt_self()      我自己的地址（跟 status 比就知道有没有被顶掉）
  * ==================================================================== */
 #define _GNU_SOURCE
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <fcntl.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
-#include <execinfo.h>
-#include <dlfcn.h>
+#include <ucontext.h>
 
 #define H3BT_MAX 64
 #define H3BT_NSIG 4
+#define H3BT_ALTBUF (64 * 1024)
 
 static const int h3_sigs[H3BT_NSIG] = {SIGSEGV, SIGABRT, SIGBUS, SIGILL};
 static struct sigaction h3_prev[H3BT_NSIG];
-static volatile int h3_busy = 0;
+static volatile sig_atomic_t h3_busy = 0;
+static volatile sig_atomic_t h3_selftest = 0;
+static char h3_altbuf[H3BT_ALTBUF];
 
-static void h3_wr(const char *s) {
+static void h3w(const char *s) {
     ssize_t r = write(2, s, strlen(s));
     (void)r;
 }
 
-static void h3_handler(int sig, siginfo_t *si, void *uc) {
+/* 固定宽度十六进制：不用 snprintf，信号处理器里少一个不确定因素 */
+static void h3hex(unsigned long v) {
+    char b[19];
+    int i;
+    b[0] = '0';
+    b[1] = 'x';
+    for (i = 0; i < 16; i++) {
+        unsigned int d = (unsigned int)((v >> (60 - 4 * i)) & 0xfUL);
+        b[2 + i] = (char)(d < 10 ? ('0' + d) : ('a' + (d - 10)));
+    }
+    b[18] = '\0';
+    h3w(b);
+}
+
+static void h3dec(long v) {
+    char b[24];
+    int i = 23;
+    unsigned long u;
+    b[i] = '\0';
+    i--;
+    u = (v < 0) ? (unsigned long)(-(v + 1)) + 1UL : (unsigned long)v;
+    if (u == 0UL) {
+        b[i] = '0';
+        i--;
+    }
+    while (u != 0UL && i >= 0) {
+        b[i] = (char)('0' + (int)(u % 10UL));
+        u /= 10UL;
+        i--;
+    }
+    if (v < 0 && i >= 0) {
+        b[i] = '-';
+        i--;
+    }
+    h3w(&b[i + 1]);
+}
+
+static void h3maps(void) {
+    int fd = open("/proc/self/maps", O_RDONLY);
+    char buf[4096];
+    ssize_t k;
+    if (fd < 0) {
+        h3w("[h3bt] （/proc/self/maps 打不开）\n");
+        return;
+    }
+    h3w("[h3bt] --- /proc/self/maps ---\n");
+    while ((k = read(fd, buf, sizeof buf)) > 0) {
+        ssize_t off = 0;
+        while (off < k) {
+            ssize_t r = write(2, buf + off, (size_t)(k - off));
+            if (r <= 0) {
+                break;
+            }
+            off += r;
+        }
+    }
+    close(fd);
+    h3w("[h3bt] --- maps end ---\n");
+}
+
+static void h3_handler(int sig, siginfo_t *si, void *uc_) {
+    ucontext_t *uc = (ucontext_t *)uc_;
     void *frames[H3BT_MAX];
     int n, i;
-    char line[512];
-    Dl_info info;
 
-    (void)uc;
     if (h3_busy) {
-        _exit(139);
+        h3w("\n[h3bt] !! 重入：上一轮正在打栈时又崩了，直接退出\n");
+        _exit(128 + sig);
     }
     h3_busy = 1;
 
+    /* ① 先落地一条常量串 */
+    h3w("\n[h3bt] >>> CAUGHT sig=");
+    h3dec((long)sig);
+    h3w(" (");
+    if (sig == SIGSEGV) {
+        h3w("SIGSEGV");
+    } else if (sig == SIGABRT) {
+        h3w("SIGABRT");
+    } else if (sig == SIGBUS) {
+        h3w("SIGBUS");
+    } else if (sig == SIGILL) {
+        h3w("SIGILL");
+    } else {
+        h3w("?");
+    }
+    h3w(")\n");
+
+    /* ② siginfo + 出事那条指令的地址 */
+    h3w("[h3bt] si_code=");
+    h3dec(si ? (long)si->si_code : 0L);
+    h3w("  fault_addr=");
+    h3hex(si ? (unsigned long)(uintptr_t)si->si_addr : 0UL);
+    h3w("\n");
+
+#ifdef __x86_64__
+    if (uc != NULL) {
+        h3w("[h3bt] rip=");
+        h3hex((unsigned long)(uintptr_t)uc->uc_mcontext.gregs[REG_RIP]);
+        h3w(" rsp=");
+        h3hex((unsigned long)(uintptr_t)uc->uc_mcontext.gregs[REG_RSP]);
+        h3w(" rbp=");
+        h3hex((unsigned long)(uintptr_t)uc->uc_mcontext.gregs[REG_RBP]);
+        h3w("\n");
+    }
+#else
+    (void)uc;
+#endif
+
+    if (h3_selftest) {
+        /* 自检子进程：走到这里已经证明「处理器能进、能写」 */
+        h3w("[h3bt] selftest：整条链是活的（子进程到此为止）\n");
+        _exit(128 + sig);
+    }
+
+    /* ③ 出错指令落在哪个模块的哪个偏移 */
+#ifdef __x86_64__
+    if (uc != NULL) {
+        Dl_info info;
+        unsigned long rip = (unsigned long)(uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+        memset(&info, 0, sizeof info);
+        if (dladdr((void *)(uintptr_t)rip, &info) != 0 && info.dli_fname != NULL) {
+            h3w("[h3bt] 出错指令在 ");
+            h3w(info.dli_fname);
+            h3w(" + ");
+            h3hex(info.dli_fbase ? (rip - (unsigned long)(uintptr_t)info.dli_fbase) : 0UL);
+            if (info.dli_sname != NULL) {
+                h3w("   最近符号 ");
+                h3w(info.dli_sname);
+                h3w(" + ");
+                h3hex(rip - (unsigned long)(uintptr_t)info.dli_saddr);
+            }
+            h3w("\n");
+        }
+    }
+#endif
+
+    /* ④ maps 全量：即使下面 unwind 挂了，也能靠 rip 事后反查 */
+    h3maps();
+
+    /* ⑤ 现在才尝试 unwind */
     n = backtrace(frames, H3BT_MAX);
-
-    h3_wr("\n===== [h3bt] NATIVE BACKTRACE =====\n");
-    snprintf(line, sizeof line,
-             "[h3bt] signal=%d fault_addr=%p depth=%d\n",
-             sig, si ? si->si_addr : (void *)0, n);
-    h3_wr(line);
-
+    h3w("[h3bt] --- C 栈（每帧 = 模块 + 偏移）---\n");
     for (i = 0; i < n; i++) {
         const char *mod = "?";
-        unsigned long off = 0;
+        unsigned long off = 0UL;
+        Dl_info info;
         memset(&info, 0, sizeof info);
-        if (dladdr(frames[i], &info) != 0 && info.dli_fname) {
+        if (dladdr(frames[i], &info) != 0 && info.dli_fname != NULL) {
             mod = info.dli_fname;
-            if (info.dli_fbase) {
+            if (info.dli_fbase != NULL) {
                 off = (unsigned long)((char *)frames[i] - (char *)info.dli_fbase);
             }
         }
-        snprintf(line, sizeof line, "[h3bt] #%-2d %s+0x%lx\n", i, mod, off);
-        h3_wr(line);
+        h3w("[h3bt] #");
+        h3dec((long)i);
+        h3w(" ");
+        h3w(mod);
+        h3w(" + ");
+        h3hex(off);
+        h3w("\n");
     }
-
-    /* 再来一份带符号名的（少一层手工换算，能直接看函数名） */
+    /* 再来一份带符号名的（少一层手工换算） */
     backtrace_symbols_fd(frames, n, 2);
-    h3_wr("===== [h3bt] END BACKTRACE =====\n");
+    h3w("===== [h3bt] END BACKTRACE =====\n");
 
-    /* 把信号交回原处理器：faulthandler 会接着打 Python 栈，然后照常死掉 */
+    /* ⑥ 交回原处理器：faulthandler 接着打 Python 栈，然后照常死掉 */
     for (i = 0; i < H3BT_NSIG; i++) {
         if (h3_sigs[i] == sig) {
             sigaction(sig, &h3_prev[i], NULL);
@@ -2885,25 +3213,79 @@ static void h3_handler(int sig, siginfo_t *si, void *uc) {
         }
     }
     raise(sig);
-    _exit(139);
+    _exit(128 + sig);
 }
 
 int h3bt_install(void) {
     struct sigaction sa;
+    struct sigaction cur;
+    stack_t ss;
     int i;
+    int rc = 0;
+
+    /* 主线程开一块备用栈：万一是栈溢出引起的 SIGSEGV，
+     * 没有 SA_ONSTACK 的话处理器根本跑不起来（直接二次失败）。 */
+    ss.ss_sp = h3_altbuf;
+    ss.ss_size = sizeof h3_altbuf;
+    ss.ss_flags = 0;
+    (void)sigaltstack(&ss, NULL);
+
     for (i = 0; i < H3BT_NSIG; i++) {
+        /* 已经是我了就别再装：重复装会把 h3_prev 覆盖成自己，
+         * 崩的时候"交回原处理器"变成无限递归。 */
+        if (sigaction(h3_sigs[i], NULL, &cur) == 0 && cur.sa_sigaction == h3_handler) {
+            continue;
+        }
         memset(&sa, 0, sizeof sa);
         sa.sa_sigaction = h3_handler;
         sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
         sigemptyset(&sa.sa_mask);
         if (sigaction(h3_sigs[i], &sa, &h3_prev[i]) != 0) {
-            return -1;
+            rc = -1;
         }
     }
-    return 0;
+    return rc;
 }
 
-const char *h3bt_version(void) { return "h3bt/1"; }
+/* 现在 SIGSEGV 上挂的是谁的地址 */
+unsigned long h3bt_status(void) {
+    struct sigaction cur;
+    if (sigaction(SIGSEGV, NULL, &cur) != 0) {
+        return 0UL;
+    }
+    return (unsigned long)(uintptr_t)cur.sa_sigaction;
+}
+
+unsigned long h3bt_self(void) { return (unsigned long)(uintptr_t)h3_handler; }
+
+/* 在一个子进程里故意崩一次：不改主进程状态，又能证明整条链是活的。
+ * 返回 139 表示"子进程确实被 SIGSEGV 干掉了"，也就是处理器链正常。 */
+int h3bt_selftest(void) {
+    pid_t pid;
+    int st = 0;
+    pid = fork();
+    if (pid < 0) {
+        return -1;
+    }
+    if (pid == 0) {
+        h3_selftest = 1;
+        h3_busy = 0;
+        raise(SIGSEGV);
+        _exit(71); /* 走到这儿说明信号被吞了 */
+    }
+    if (waitpid(pid, &st, 0) < 0) {
+        return -2;
+    }
+    if (WIFSIGNALED(st)) {
+        return 128 + WTERMSIG(st);
+    }
+    if (WIFEXITED(st)) {
+        return WEXITSTATUS(st);
+    }
+    return -3;
+}
+
+const char *h3bt_version(void) { return "h3bt/2"; }
 H3BTEOF
 
   # 内容没变就直接复用编好的 .so（每单都重编没必要，也省 gcc 存在与否的抖动）
