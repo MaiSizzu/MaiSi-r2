@@ -4640,9 +4640,9 @@ CAST_SHIM_CC_EOF
   return 1
 }
 
-# 这份 .cc 的 md5：smoke 每轮拿它和 $OUT/.stamp_cast_shim 比。
-# 改了上面的 heredoc 就必须同步这一行，_fix/test_cast_shim.sh 会核对；
-# 仓库里的原件 src/InfiniCore/src/infinicore/ops/cast/cast_hygon_shim.cc 也要逐字节一致。
+# 这份 .cc 的 md5：只是给 _fix/test_cast_shim.sh 的锚点 ——
+# 改了上面的 heredoc 就必须同步这一行，测试会核对「heredoc == 仓库原件 == 这个戳」。
+# 运行时重编靠 mtime（下面 "$so" -nt "$src"），不靠这个常量。
 CAST_SHIM_CC_MD5=6744fc8b3b2022912cfb3259a8c23f30
 
 ensure_cast_fallback() {
