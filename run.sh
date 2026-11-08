@@ -77,6 +77,11 @@
 #     是「先出一帧视频」的保底手段。不设 = 保持现在的 8 卡（默认不动，免得
 #     给定位引入新变量）
 #
+# 开关怎么传：平台提交只给位置参数（mode / gpu），环境变量带不进来。所以
+# 在 AFS 根下建 h3.env（和 run.sh 同级那个 $AFS），每行一条 H3_XXX=值，
+# 启动时会当环境变量 set 一遍，日志里会打印生效了几条。外部已经设过的不覆盖。
+# 改开关不必重传 run.sh。
+#
 # compare 模式的取舍（官方脚本一次跑四件事：PyTorch fl2va / InfiniLM fl2va / 两边 ref2va，
 # 每件 124 帧 50 步，一件都不便宜）：
 #   · 只跑 fl2va，ref2va 要额外输入视频且时间翻倍，默认不跑
@@ -174,6 +179,33 @@ hr
 # =============================================================================
 # 1. 环境探测
 # =============================================================================
+# 开关文件：平台提交只给位置参数（mode / gpu），环境变量带不进来。所以留个
+# 约定 —— AFS 根下放 h3.env，每行一条 H3_XXX=值，就当地 set 了一遍。
+# 好处是改开关不用重传 200KB 的 run.sh，也不用赌平台有没有 env 入口。
+# 外部已经设过的不覆盖：命令行/平台真能传时，以它为准。
+load_flags_file() {
+  local f=$1 n=0 k v line
+  [ -f "$f" ] || { echo "  开关文件 $f：不存在"; return 0; }
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=$(printf '%s' "$line" | tr -d '\r')
+    case "$line" in ''|\#*) continue ;; esac
+    # 先判有没有等号，再判变量名 —— 反过来的话，中文注释这类"没有等号"的行
+    # 会先被变量名规则拦下，提示就成了看不懂，反而看不出真正原因
+    case "$line" in *=*) : ;; *) echo "  !! 跳过没有等号的行：$line"; continue ;; esac
+    k=${line%%=*}
+    case "$k" in ''|*[!A-Za-z0-9_]*) echo "  !! 跳过变量名不合法的行：$line"; continue ;; esac
+    case "$k" in [A-Za-z_]*) : ;; *) echo "  !! 跳过变量名不合法的行：$line"; continue ;; esac
+    v=${line#*=}
+    if [ -n "${!k:-}" ]; then
+      echo "   · $k 已由外部设为 ${!k}，文件里这条不生效"
+      continue
+    fi
+    export "$k=$v"
+    n=$((n + 1))
+  done < "$f"
+  echo "  开关文件 $f：生效 $n 条"
+}
+load_flags_file "$AFS/h3.env"
 say "探测 DTK / 编译器"
 DTK_ROOT=${DTK_ROOT:-}
 if [ -z "$DTK_ROOT" ] || [ ! -d "$DTK_ROOT" ]; then
