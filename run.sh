@@ -48,6 +48,17 @@
 # 万一 trace 只能定位到 block 而定位不到单次 kernel：H3_SERIAL=1 打开同步 launch
 # （=2 连 HIP 运行时 memcpy 一起序列化），崩点会精确到那一条 dispatch，代价是变慢。
 #
+# 11-08 05:58 那单终于拿到现场了：faulthandler 的栈顶是
+#   encoders.py:95 get_qwen3vl_prompt_embeds → minimax_h3.py:397 encode
+#   → infiniLM/infinilm/infer_engine.py:548 forward_raw
+# 也就是崩在**文本编码器的第一次 forward**，跟 diffusion、跟集合通信都无关
+# （整份日志一条 [h3ccl] >> 进入 都没有，commInitAll 倒是成功的）。
+# Python 栈到 super().forward(...) 就断，底下全是 C++，所以这一版补两样：
+#   · libh3bt.so（build_bt_shim）：SIGSEGV 时先打 C 层栈（每帧给出「哪个 .so +
+#     偏移」），再把信号交回 faulthandler 打 Python 栈，两份栈都留在日志里
+#   · forward_raw 入参打点：进去那一刻手里拿的张量、形状、精度、在哪张卡。
+#     三行看完就能分清是「喂错了东西」（好改）还是「算子/kernel 自己炸」（难改）
+#
 # compare 模式的取舍（官方脚本一次跑四件事：PyTorch fl2va / InfiniLM fl2va / 两边 ref2va，
 # 每件 124 帧 50 步，一件都不便宜）：
 #   · 只跑 fl2va，ref2va 要额外输入视频且时间翻倍，默认不跑
@@ -2244,6 +2255,7 @@ import time
 _STATE = {
     "installed": False,
     "patched": False,
+    "patched_fr": False,
     "depth": 0,
     "stage": "启动中",
     "t0": time.perf_counter(),
@@ -2295,6 +2307,34 @@ def _enable_faulthandler():
         return True
     _say("[trace] faulthandler 打不开（无可用 fd）：%s: %s" % (type(last).__name__, last))
     return False
+
+
+def _install_native_bt():
+    """装 C 层栈兜底（libh3bt.so）。
+
+    顺序有讲究：本函数必须在 faulthandler.enable() 之后调用。它是以「链」的方式
+    工作的——自己上位，崩时先打 C 栈，再把信号交回被它顶掉的那个处理器，也就是
+    faulthandler。装早了就被 faulthandler 顶掉，装晚了才轮到它打头阵。
+    """
+    lib = os.environ.get("H3_BT_LIB", "")
+    if not lib or not os.path.isfile(lib):
+        return False
+    if os.environ.get("H3_BT", "1").strip().lower() in ("0", "false", "no"):
+        return False
+    try:
+        import ctypes
+
+        so = ctypes.CDLL(lib, use_errno=False)
+        so.h3bt_install.restype = ctypes.c_int
+        rc = so.h3bt_install()
+        if rc != 0:
+            _say("[trace] 原生栈兜底装不上：h3bt_install() 返回 %d" % rc)
+            return False
+        _say("[trace] 原生栈兜底已装：%s（崩时先打 C 栈，再交回 faulthandler）" % lib)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _say("[trace] 原生栈兜底加载失败：%s: %s" % (type(exc).__name__, exc))
+        return False
 
 
 def _start_heartbeat(interval):
@@ -2396,11 +2436,14 @@ def _patch_tree(pipe):
 
 
 def _hook_pipeline():
-    from diffusers.modular_pipelines.modular_pipeline import ModularPipeline
+    mod = sys.modules.get("diffusers.modular_pipelines.modular_pipeline")
+    ModularPipeline = getattr(mod, "ModularPipeline", None) if mod is not None else None
+    if ModularPipeline is None:
+        from diffusers.modular_pipelines.modular_pipeline import ModularPipeline
 
     orig = ModularPipeline.__dict__.get("__call__")
     if orig is None or getattr(orig, "_h3_traced", False):
-        return
+        return False
 
     @functools.wraps(orig)
     def wrapper(self, *args, **kwargs):
@@ -2415,21 +2458,116 @@ def _hook_pipeline():
 
     wrapper._h3_traced = True
     ModularPipeline.__call__ = wrapper
+    return True
+
+
+def _fact(obj):
+    """把入参印成「形状 / 精度 / 落在哪」三件事，一行看完。
+
+    段错误如果是「喂错了东西」引起的，这一行就能定案；如果三样都对，
+    那就是算子或 kernel 层面的问题，再往下才需要 C 层栈。
+    """
+    try:
+        import torch
+
+        if isinstance(obj, torch.Tensor):
+            return "torch.Tensor%s dtype=%s dev=%s" % (
+                tuple(obj.shape),
+                str(obj.dtype).replace("torch.", ""),
+                obj.device,
+            )
+    except Exception:  # noqa: BLE001
+        pass
+    shape = getattr(obj, "shape", None)
+    if shape is not None:
+        return "%s%s dtype=%s dev=%s" % (
+            type(obj).__name__,
+            tuple(shape),
+            getattr(obj, "dtype", "?"),
+            getattr(obj, "device", "?"),
+        )
+    if isinstance(obj, (list, tuple)):
+        return "%s(len=%d)" % (type(obj).__name__, len(obj))
+    if obj is None:
+        return "None"
+    return "%s(%r)" % (type(obj).__name__, obj if isinstance(obj, (int, float, str, bool)) else "…")
+
+
+def _hook_forward_raw():
+    """给 InferEngine.forward_raw 挂日志。
+
+    为什么盯这个函数：11-08 05:58 那单崩在这里（infer_engine.py:548），
+    而 Python 栈到 `super().forward(...)` 就断了——底下全是 C++。
+    所以至少要留下「进去的时候手里拿的是什么」：哪些张量、什么形状、
+    什么精度、在哪张卡上。第一次崩之前能打出来的就这三行。
+    """
+    try:
+        # 关键：不能在这时候 `from infinilm.infer_engine import InferEngine`。
+        # sys.modules 里的条目在 exec 之前就建好了，模块正文还没跑完时 import
+        # 拿到的是半成品，getattr 会扑空（ModularPipeline 那次就是这么栽的）。
+        # 所以先看 sys.modules 里那个对象上有没有类，没有就等下一次机会。
+        mod = sys.modules.get("infinilm.infer_engine")
+        InferEngine = getattr(mod, "InferEngine", None) if mod is not None else None
+        if InferEngine is None:
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+
+    orig = getattr(InferEngine, "forward_raw", None)
+    if orig is None or getattr(orig, "_h3_traced", False):
+        return False
+
+    seen = {"n": 0}
+
+    def wrapper(self, input_ids, **kwargs):
+        seen["n"] += 1
+        n = seen["n"]
+        if n <= 2:
+            try:
+                lines = ["[fr] >>> forward_raw #%d" % n, "      input_ids: %s" % _fact(input_ids)]
+                for k in sorted(kwargs):
+                    if kwargs[k] is not None:
+                        lines.append("      %s: %s" % (k, _fact(kwargs[k])))
+                _say("\n".join(lines))
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            _say("[fr] >>> forward_raw #%d" % n)
+        t0 = time.perf_counter()
+        out = orig(self, input_ids, **kwargs)
+        _say("[fr] <<< forward_raw #%d  %.1fs" % (n, time.perf_counter() - t0))
+        return out
+
+    wrapper._h3_traced = True
+    InferEngine.forward_raw = wrapper
+    return True
 
 
 def _maybe_patch():
-    """目标模块一旦出现在 sys.modules 里就立刻挂上（幂等，可反复调用）。"""
-    if _STATE["patched"]:
-        return
-    if "diffusers.modular_pipelines.modular_pipeline" not in sys.modules:
-        return
-    # 先置位再动作：_hook_pipeline 自己也会走 import
-    _STATE["patched"] = True
-    try:
-        _hook_pipeline()
-        _say("[trace] 已挂 ModularPipeline.__call__（等第一次 pipe(...) 再铺开）")
-    except Exception as exc:  # noqa: BLE001
-        _say("[trace] 挂 pipeline 失败：%s: %s" % (type(exc).__name__, exc))
+    """目标模块一旦就绪就立刻挂上（幂等，可反复调用）。
+
+    三条纪律：
+    - 两件事互相独立：pipeline 挂了不该拖累 forward_raw，反之亦然
+    - 只有真挂上才置位；没挂上就留着重试（模块可能还在 exec 里）
+    - 判断「就绪」看对象上有没有那个类，不看 sys.modules 里有没有那个名字
+    """
+    if not _STATE["patched"]:
+        mod = sys.modules.get("diffusers.modular_pipelines.modular_pipeline")
+        if mod is not None and getattr(mod, "ModularPipeline", None) is not None:
+            try:
+                if _hook_pipeline():
+                    _STATE["patched"] = True
+                    _say("[trace] 已挂 ModularPipeline.__call__（等第一次 pipe(...) 再铺开）")
+            except Exception as exc:  # noqa: BLE001
+                _say("[trace] 挂 pipeline 失败：%s: %s" % (type(exc).__name__, exc))
+
+    if not _STATE["patched_fr"]:
+        try:
+            if _hook_forward_raw():
+                _STATE["patched_fr"] = True
+                _say("[trace] 已挂 InferEngine.forward_raw（会打印入参形状/精度/设备）")
+        except Exception as exc:  # noqa: BLE001
+            _say("[trace] 挂 forward_raw 失败：%s: %s" % (type(exc).__name__, exc))
 
 
 def _hook_import():
@@ -2479,6 +2617,7 @@ def install():
         return False
 
     _enable_faulthandler()
+    _install_native_bt()
 
     try:
         interval = float(os.environ.get("H3_HB", "45"))
@@ -2587,6 +2726,150 @@ patch_fl2va_launcher() {
   return 0
 }
 
+# 原生栈兜底：Python 栈只能停在「调进 C++ 的那一行」（这次就是 infer_engine.py:548），
+# 底下到底崩在哪个 .so、哪段偏移，faulthandler 一个字节都给不出来。gcc 就在手上
+# （薄壳已经在用它编），所以自己编一个信号处理器：SIGSEGV 时先打 C 层栈，
+# 再把控制权交回 faulthandler 打 Python 栈——两边都留，不互相覆盖。
+# 装法见 h3_trace：必须等 faulthandler.enable() 之后再装，才排得上队。
+build_bt_shim() {
+  local dir=$AFS/cudashim
+  local src=$dir/h3_bt.c
+  local tmps=$dir/.h3_bt.c.new
+  local so=$dir/libh3bt.so
+  mkdir -p "$dir" 2>/dev/null || return 1
+
+  # 先写临时文件再比对内容：直接覆盖 $src 会把 mtime 刷新成「刚刚」，
+  # 后面「so 比 src 新就复用」永远不成立，每单都白编一次。
+  cat > "$tmps" <<'H3BTEOF'
+/* ====================================================================
+ * h3_bt.c —— 原生（C/C++）栈兜底
+ *
+ * 为什么需要：段错误发生在 C++ 里时，Python 栈顶只显示「正在调用
+ * super().forward(...)」这一行，再往下全是 C，faulthandler 看不见。
+ * 有了这个处理器，崩的那一刻会先打 C 层栈（每帧给出「哪个 .so + 偏移」），
+ * 打完再把信号交回原来装的那个处理器（Python 的 faulthandler），
+ * 于是 C 栈和 Python 栈都会出现在日志里。
+ *
+ * 只用 async-signal-safe 的东西：write / backtrace / snprintf / dladdr。
+ * 重入保护：正在打栈时再崩（栈被踩坏时会发生）就直接 _exit，不再递归。
+ * ==================================================================== */
+#define _GNU_SOURCE
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <execinfo.h>
+#include <dlfcn.h>
+
+#define H3BT_MAX 64
+#define H3BT_NSIG 4
+
+static const int h3_sigs[H3BT_NSIG] = {SIGSEGV, SIGABRT, SIGBUS, SIGILL};
+static struct sigaction h3_prev[H3BT_NSIG];
+static volatile int h3_busy = 0;
+
+static void h3_wr(const char *s) {
+    ssize_t r = write(2, s, strlen(s));
+    (void)r;
+}
+
+static void h3_handler(int sig, siginfo_t *si, void *uc) {
+    void *frames[H3BT_MAX];
+    int n, i;
+    char line[512];
+    Dl_info info;
+
+    (void)uc;
+    if (h3_busy) {
+        _exit(139);
+    }
+    h3_busy = 1;
+
+    n = backtrace(frames, H3BT_MAX);
+
+    h3_wr("\n===== [h3bt] NATIVE BACKTRACE =====\n");
+    snprintf(line, sizeof line,
+             "[h3bt] signal=%d fault_addr=%p depth=%d\n",
+             sig, si ? si->si_addr : (void *)0, n);
+    h3_wr(line);
+
+    for (i = 0; i < n; i++) {
+        const char *mod = "?";
+        unsigned long off = 0;
+        memset(&info, 0, sizeof info);
+        if (dladdr(frames[i], &info) != 0 && info.dli_fname) {
+            mod = info.dli_fname;
+            if (info.dli_fbase) {
+                off = (unsigned long)((char *)frames[i] - (char *)info.dli_fbase);
+            }
+        }
+        snprintf(line, sizeof line, "[h3bt] #%-2d %s+0x%lx\n", i, mod, off);
+        h3_wr(line);
+    }
+
+    /* 再来一份带符号名的（少一层手工换算，能直接看函数名） */
+    backtrace_symbols_fd(frames, n, 2);
+    h3_wr("===== [h3bt] END BACKTRACE =====\n");
+
+    /* 把信号交回原处理器：faulthandler 会接着打 Python 栈，然后照常死掉 */
+    for (i = 0; i < H3BT_NSIG; i++) {
+        if (h3_sigs[i] == sig) {
+            sigaction(sig, &h3_prev[i], NULL);
+            break;
+        }
+    }
+    raise(sig);
+    _exit(139);
+}
+
+int h3bt_install(void) {
+    struct sigaction sa;
+    int i;
+    for (i = 0; i < H3BT_NSIG; i++) {
+        memset(&sa, 0, sizeof sa);
+        sa.sa_sigaction = h3_handler;
+        sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        sigemptyset(&sa.sa_mask);
+        if (sigaction(h3_sigs[i], &sa, &h3_prev[i]) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+const char *h3bt_version(void) { return "h3bt/1"; }
+H3BTEOF
+
+  # 内容没变就直接复用编好的 .so（每单都重编没必要，也省 gcc 存在与否的抖动）
+  if [ -s "$so" ] && [ -s "$src" ] && cmp -s "$tmps" "$src"; then
+    rm -f "$tmps" 2>/dev/null
+    export H3_BT_LIB=$so
+    return 0
+  fi
+  mv -f "$tmps" "$src" 2>/dev/null || cp -f "$tmps" "$src" 2>/dev/null
+  rm -f "$tmps" 2>/dev/null
+
+  local cc="" c
+  for c in gcc cc clang "$DTK_ROOT/bin/clang"; do
+    [ -n "$c" ] || continue
+    if command -v "$c" >/dev/null 2>&1; then cc=$c; break; fi
+  done
+  if [ -z "$cc" ]; then
+    say "  !! 找不到 C 编译器，原生栈兜底装不上（不影响推理，只是崩了看不到 C 栈）"
+    return 1
+  fi
+
+  if ! "$cc" -O2 -fPIC -shared -o "$so" "$src" -ldl 2>"$dir/bt_cc.log"; then
+    say "  !! 原生栈兜底编译失败（不影响推理，只是崩了看不到 C 栈）："
+    tail -8 "$dir/bt_cc.log" 2>/dev/null | sed 's/^/    /'
+    return 1
+  fi
+  [ -s "$so" ] || { say "  !! 原生栈兜底没产出"; return 1; }
+  export H3_BT_LIB=$so
+  say "  原生栈兜底就位：$so（SIGSEGV 先打 C 栈，再交回 faulthandler）"
+  return 0
+}
+
 ensure_cuda_compat() {
   [ -n "${CUDA_COMPAT_OK:-}" ] && return 0
 
@@ -2628,6 +2911,9 @@ ensure_cuda_compat() {
   else
     say "  !! 集合通信薄壳没建好：TP>1 会继续报 Error Code 5，只能退 TP=1（显存多半不够）"
   fi
+
+  # 4.5) 原生栈兜底：不影响 LD_PRELOAD，纯粹为崩溃时能看见 C 层栈
+  build_bt_shim || true
 
   # 5) 预加载：只放我们的薄壳。DTK 的 libcuda.so.1 由子脚本自己按原样加上，
   #    顺序上正好排在薄壳后面（同名符号我们优先）
