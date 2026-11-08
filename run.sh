@@ -799,7 +799,10 @@ do_setup() {
   if ensure_mha_fallback; then
     say "  视觉塔 op::mha 已有兜底实现（不会再 call 0）"
   else
-    say "  !! mha 兜底没装上：这单跑到视觉塔仍是 rip=0（往上翻 [mha] 那段）"
+    # 没有它 = 100% 在视觉塔第一步 call 0，跑下去只是白烧 9 分钟再崩。
+    # 当场退出，把时间留给改代码。
+    say "  !! mha 兜底没装上：这单必然在视觉塔 rip=0，直接停（往上翻 [mha] 那段）"
+    die "mha 兜底缺失，跑下去必崩"
   fi
   say "setup 完成"
 }
@@ -3832,20 +3835,60 @@ PYEOF
 # 仓库原件：src/InfiniCore/src/infinicore/ops/multi_head_attention/mha_composed_fallback.cc
 # 两边必须逐字节一致，_fix/test_mha_fallback.sh 会比对。
 # =============================================================================
-inject_mha_fallback() {
-  if [ -z "${IC:-}" ]; then
-    say "  !! IC 还没定，注入不了 mha 兜底实现"
-    return 1
-  fi
-  local dir=$IC/src/infinicore/ops/multi_head_attention
+pick_mha_dir() {
+  # 兜底 .cc / .so 放哪儿。顺序都是「每单必然能写」的真实证据：
+  #   $AFS/cudashim —— 两个 shim 每单都在这里重编；
+  #   $OUT          —— 日志就写在这儿；
+  #   /tmp          —— 本机盘，丢了也只是重编几秒。
+  local d
+  for d in "$AFS/cudashim" "$OUT" "/tmp/h3mha"; do
+    [ -n "$d" ] || continue
+    mkdir -p "$d" 2>/dev/null || continue
+    if ( : > "$d/.h3wtest" ) 2>/dev/null; then
+      rm -f "$d/.h3wtest" 2>/dev/null
+      printf '%s\n' "$d"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# 往 $1 写一份兜底 .cc。stdout 打「路径 变化标记」（same / new）。
+# 目录必须**已经可写**：平台上的 $PKG 是上个作业用另一个 uid 解包的，
+# mkdir -p 对已存在目录静默成功，只有真写一次才试得出权限。
+write_mha_src() {
+  local dir=$1
   local f=$dir/mha_composed_fallback.cc
-  if ! mkdir -p "$dir" 2>/dev/null; then
-    say "  !! 建不了目录 $dir（编译树是上个作业的只读树？）"
-    say "     mha 兜底注入不了 = 这一单还会 rip=0，先别跑"
-    return 1
-  fi
   local tmp=$dir/.mha_fallback.new.cc
-  cat > "$tmp" <<'MHA_FALLBACK_CC_EOF'
+
+  # 首选：直接用包里那份真源码（和仓库里 commit 的是同一个文件）。
+  # 这样 run.sh 里的 heredoc 只是备份，不需要和源码逐字同步（之前就漂过一次：
+  # 仓库里改了日志文案，heredoc 还是旧版）。编出来的 .so 因此永远是"仓库那版"。
+  local ref="" c
+  for c in "${PKG:-}/src/InfiniCore/src/infinicore/ops/multi_head_attention/mha_composed_fallback.cc" \
+           "${IC:-}/src/infinicore/ops/multi_head_attention/mha_composed_fallback.cc"; do
+    # 只认「带注册回查」的那版：包若是旧 tarball，里面的 .cc 没有自检，
+    # 用完会在预加载自检里被误判成「注册没落到 cpp_api」，白丢一单。
+    [ -n "$c" ] && [ -s "$c" ] && [ -r "$c" ] || continue
+    grep -q "注册回查" "$c" 2>/dev/null || continue
+    ref=$c
+    break
+  done
+  if [ -n "$ref" ]; then
+    if [ -s "$f" ] && cmp -s "$ref" "$f"; then
+      printf '%s same\n' "$f"
+      return 0
+    fi
+    if cp -f "$ref" "$tmp" 2>/dev/null && [ -s "$tmp" ] \
+       && mv -f "$tmp" "$f" 2>/dev/null && [ -s "$f" ]; then
+      printf '%s new\n' "$f"
+      return 0
+    fi
+    rm -f "$tmp" 2>/dev/null
+    # 拷不出来才往下走 heredoc（包里的源码被删/被截断时的最后一道保险）
+  fi
+
+  cat > "$tmp" 2>/dev/null <<'MHA_FALLBACK_CC_EOF'
 // Hygon(DCU) 上没有 flash-attn 扩展时的 MultiheadAttention 兜底实现。
 //
 // 背景：xmake.lua 只有在 --flash-attn 不为空时才保留 ops/*/hygon/*.cc，
@@ -4019,7 +4062,7 @@ void register_all() {
     MultiheadAttention::run_dispatcher().registerAll(&run, false);
     MultiheadAttention::cleanup_dispatcher().registerAll(&cleanup, false);
     // 这行是判断「兜底到底有没有装上」的唯一凭据，日志里搜 [mha] 即可。
-    std::fprintf(stderr, "[mha] 使用 InfiniCore 组合实现（matmul+softmax+matmul）\n");
+    std::fprintf(stderr, "[mha] 兜底已注册到 dispatcher（Hygon，无 flash-attn）\n");
 }
 
 } // namespace
@@ -4032,8 +4075,19 @@ void register_all() {
 extern "C" __attribute__((constructor)) static void h3_mha_fallback_ctor() {
     try {
         register_all();
+        // 注册完立刻回查：静态 dispatcher 是函数内 static，正常只会有一份；
+        // 万一拿到的不是 cpp_api 那份（跨 DSO 各一份），注册就是白做。
+        // 这一行是「兜底到底有没有真装上」的唯一凭据，日志里搜「注册回查」即可。
+        auto pfn = MultiheadAttention::plan_dispatcher().lookup(Device::Type::HYGON);
+        auto rfn = MultiheadAttention::run_dispatcher().lookup(Device::Type::HYGON);
+        std::fprintf(stderr,
+                     "[mha] 注册回查：plan=%s run=%s\n",
+                     pfn ? "非空" : "空(注册没落到 cpp_api 那份 dispatcher)",
+                     rfn ? "非空" : "空(注册没落到 cpp_api 那份 dispatcher)");
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "[mha] 注册失败：%s\n", e.what());
     } catch (...) {
-        std::fprintf(stderr, "[mha] 注册失败（异常），保持不注册状态\n");
+        std::fprintf(stderr, "[mha] 注册失败（未知异常），保持不注册状态\n");
     }
 }
 #else
@@ -4047,28 +4101,56 @@ const bool registered = (register_all(), true);
 #endif // (ENABLE_HYGON_API || H3_MHA_STANDALONE) && !ENABLE_FLASH_ATTN
 MHA_FALLBACK_CC_EOF
   if [ ! -s "$tmp" ]; then
-    say "  !! mha 兜底实现写出来是空的（heredoc 被截断？）"
     rm -f "$tmp" 2>/dev/null
     return 1
   fi
-  if [ -f "$f" ] && cmp -s "$tmp" "$f"; then
+  if [ -s "$f" ] && cmp -s "$tmp" "$f"; then
     rm -f "$tmp" 2>/dev/null
-    say "  mha 兜底实现已在编译树里且内容一致：$(basename "$f")"
+    printf '%s same\n' "$f"
     return 0
   fi
-  if mv -f "$tmp" "$f" 2>/dev/null || { cp -f "$tmp" "$f" 2>/dev/null && rm -f "$tmp" 2>/dev/null; }; then
+  if mv -f "$tmp" "$f" 2>/dev/null && [ -s "$f" ]; then
+    printf '%s new\n' "$f"
+    return 0
+  fi
+  rm -f "$tmp" 2>/dev/null
+  return 1
+}
+
+# 把兜底 .cc 塞进 $PKG 的编译树 —— 只给 do_build 用（改 xmake 那条老路）。
+# 平台上 $PKG 常是别的 uid 解包的，写不进去是常态；独立 .so 路径不依赖它。
+inject_mha_fallback() {
+  if [ -z "${IC:-}" ]; then
+    say "  !! IC 还没定，注入不了 mha 兜底实现"
+    return 1
+  fi
+  local dir=$IC/src/infinicore/ops/multi_head_attention
+  local f=$dir/mha_composed_fallback.cc
+  mkdir -p "$dir" 2>/dev/null
+  if ! ( : > "$dir/.h3wtest" ) 2>/dev/null; then
+    say "  !! 写不进 $dir（这棵树是上个作业/另一个 uid 解包的）"
+    say "     do_build 走不通；独立 .so 路径不受影响，别在这儿 die"
+    return 1
+  fi
+  rm -f "$dir/.h3wtest" 2>/dev/null
+  local out changed
+  out=$(write_mha_src "$dir") || { say "  !! 注入失败（写不进去）：$f"; return 1; }
+  set -- $out
+  f=$1
+  changed=${2:-new}
+  if [ "$changed" = "same" ]; then
+    say "  mha 兜底实现已在编译树里且内容一致：$(basename "$f")"
+  else
     say "  mha 兜底实现注入：$f"
     say "    $(wc -c < "$f" | tr -d ' ') 字节  md5 $(md5sum "$f" 2>/dev/null | awk '{print $1}')"
-    return 0
   fi
-  say "  !! 注入失败（写不进去）：$f"
-  return 1
+  return 0
 }
 
 # 这份 .cc 的 md5：smoke 每轮拿它和 $OUT/.stamp_mha_fallback 比，
 # 不一致就编一次（平台只给 smoke 入口，没法手动 build）。
 # 改了上面的 heredoc 就必须同步这一行，_fix/test_mha_fallback.sh 会核对。
-MHA_FALLBACK_CC_MD5=e75c7cbbac8d77e0051da0690bc676a9
+MHA_FALLBACK_CC_MD5=ae075f3175e8e56247a144a31a7bd345
 
 # =============================================================================
 # Hygon 上 MultiheadAttention 在 dispatcher 里是零注册，op::mha 的 lookup 返回
@@ -4085,20 +4167,57 @@ MHA_FALLBACK_CC_MD5=e75c7cbbac8d77e0051da0690bc676a9
 ensure_mha_fallback() {
   [ -n "${IC:-}" ] || IC=$PKG/src/InfiniCore
   local api=$INFINI/lib/libinfinicore_cpp_api.so
-  local dir=$AFS/cudashim
+
+  # 正常就在 $INFINI/lib（_infinilm.so 的 RPATH 也指这儿）。万一不在，
+  # 按 refresh_cpp_api 的查找顺序补一遍，别为这个白丢一单。
+  if [ ! -f "$api" ]; then
+    local c
+    for c in "$OVL/infinicore/lib/libinfinicore_cpp_api.so" \
+             "$SRC_IC/python/infinicore/lib/libinfinicore_cpp_api.so" \
+             "$AFS/ic_py/infinicore/lib/libinfinicore_cpp_api.so"; do
+      [ -n "$c" ] && [ -f "$c" ] && { api=$c; break; }
+    done
+  fi
+
+  if [ ! -f "$api" ]; then
+    say "  !! 没有 libinfinicore_cpp_api.so（dispatcher 的宿主），兜底挂不上"
+    return 1
+  fi
+  local apilib
+  apilib=$(dirname "$api")
+
+  # cpp_api 若把注册表符号藏了（-fvisibility=hidden），编译一定 undefined reference、
+  # 预加载也一定失败。先用 nm 静态确认，省得等编译报错还要猜方向。
+  if command -v nm >/dev/null 2>&1; then
+    local nsym
+    nsym=$(nm -D --defined-only "$api" 2>/dev/null | grep -c "MultiheadAttention")
+    if [ "${nsym:-0}" -gt 0 ]; then
+      say "  cpp_api 导出 MultiheadAttention 符号 $nsym 个（可链接）"
+    else
+      say "  !! cpp_api 里没有 MultiheadAttention 符号（被隐藏或版本不符）"
+      say "     独立 .so 这条路走不通，得改成在 InfiniLM 侧绕开 op::mha"
+      return 1
+    fi
+  fi
+
+  # 不再往 $PKG 里写：那棵树是别的 uid 解包的，本作业没写权限（14:04 那单就死在这）。
+  local dir
+  dir=$(pick_mha_dir) || { say "  !! 找不到可写目录放兜底 .cc/.so"; return 1; }
   local so=$dir/libh3mha.so
   local log=$dir/mha_build.log
 
-  if [ ! -f "$api" ]; then
-    say "  !! 没有 $api（dispatcher 的宿主），兜底挂不上"
+  local out changed src
+  out=$(write_mha_src "$dir") || {
+    say "  !! 兜底源码写不进 $dir（连 /tmp 都写不进去？）"
     return 1
-  fi
+  }
+  set -- $out
+  src=$1
+  changed=${2:-new}
+  say "  兜底源码：$src（$(wc -c < "$src" | tr -d ' ') 字节，$([ "$changed" = same ] && echo 未变 || echo 新写)）"
 
-  inject_mha_fallback || { say "  !! 兜底源码没注入成功"; return 1; }
-  local src=$IC/src/infinicore/ops/multi_head_attention/mha_composed_fallback.cc
-
-  # 源码与宿主库都没动就复用（.cc 由 inject 按内容覆盖，内容不变就不改 mtime）
-  if [ -f "$so" ] && [ "$so" -nt "$src" ] && [ "$so" -nt "$api" ]; then
+  # 源码与宿主库都没动就复用（.cc 内容不变时 write_mha_src 不落盘，mtime 也不动）
+  if [ -f "$so" ] && [ "$changed" = "same" ] && [ "$so" -nt "$src" ] && [ "$so" -nt "$api" ]; then
     H3_MHA_PRELOAD=$so
     export H3_MHA_PRELOAD
     say "  mha 兜底 .so 复用：$so  $(ls -lh "$so" 2>/dev/null | awk '{print $5}')"
@@ -4112,12 +4231,14 @@ ensure_mha_fallback() {
   say "  编译 mha 兜底 .so（$cc -shared，只编这一个 .cc，不动 xmake）"
   mkdir -p "$dir" 2>/dev/null
   rm -f "$so.tmp" 2>/dev/null
+  local inc="-I$INFINI/include"
+  [ -d "$IC/include" ] && inc="-I$IC/include $inc"
   if ! "$cc" -O2 -std=c++17 -fPIC -shared \
-        -DH3_MHA_STANDALONE -DENABLE_HYGON_API \
-        -I"$IC/include" -I"$INFINI/include" \
+        -DH3_MHA_STANDALONE \
+        $inc \
         -o "$so.tmp" "$src" \
-        -L"$INFINI/lib" -linfinicore_cpp_api \
-        -Wl,-rpath,"$INFINI/lib" \
+        -L"$apilib" -linfinicore_cpp_api \
+        -Wl,-rpath,"$apilib" \
         2>"$log"; then
     say "  !! 兜底 .so 编译失败（这单还会 rip=0，先别跑）："
     grep -n -m8 -E "error:|fatal error:|undefined reference|cannot find" "$log" 2>/dev/null | cut -c1-200 | sed 's/^/    /'
@@ -4130,7 +4251,7 @@ ensure_mha_fallback() {
   # 必须在独立进程里试加载：这个 .so 会被 LD_PRELOAD 进每一个 python 进程。
   # 万一 cpp_api 没导出 plan_dispatcher（被 -fvisibility=hidden 藏了），ld.so 会
   # 直接拒绝加载，那就不只是 mha 的问题了，整个 smoke 都起不来。宁可这里失败。
-  if ! LD_LIBRARY_PATH="$INFINI/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  if ! LD_LIBRARY_PATH="$apilib:$INFINI/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
        LD_PRELOAD="$so" /bin/true 2>"$dir/mha_preload.log"; then
     say "  !! 兜底 .so 预加载失败（cpp_api 可能没导出符号）："
     tail -6 "$dir/mha_preload.log" 2>/dev/null | sed 's/^/    /'
@@ -4138,6 +4259,18 @@ ensure_mha_fallback() {
     return 1
   fi
   say "  mha 兜底 .so 就位：$so  $(ls -lh "$so" 2>/dev/null | awk '{print $5}')（预加载自检通过）"
+
+  # 能加载还不够：必须看到构造期回查打出「plan=非空」。
+  # 空的话就是注册落到了另一份 dispatcher 实例（跨 DSO 静态变量各一份），
+  # 这条路彻底走不通，得改成在 InfiniLM 侧绕开 op::mha —— 别再去跑整单。
+  if grep -q "注册回查：plan=非空" "$dir/mha_preload.log" 2>/dev/null; then
+    say "  兜底注册回查通过：dispatcher 里 plan/run 都非空"
+  else
+    say "  !! 兜底 .so 能加载，但注册回查没通过："
+    grep -m3 -E "\[mha\]" "$dir/mha_preload.log" 2>/dev/null | sed 's/^/    /'
+    say "     注册没落到 cpp_api 那份 dispatcher —— 独立 .so 这条路走不通"
+    return 1
+  fi
   H3_MHA_PRELOAD=$so
   export H3_MHA_PRELOAD
   return 0
@@ -4150,7 +4283,8 @@ do_build() {
   pick_ic
   cd "$IC" || die "进不去 $IC"
   # 先补算子源码：xmake configure 会扫 add_files，晚于它写文件就要再 configure 一次
-  inject_mha_fallback || die "mha 兜底实现没注入成功，跑下去还是 rip=0"
+  # 只是给 xmake 那条老路补源码；写不进编译树也照跑 —— 独立 .so 已经兜住了
+  inject_mha_fallback || say "  !! 源码没能写进编译树（uid 不同），跳过；独立 .so 路径不受影响"
 
   # 上一个作业 32 并发编 infiniop 花了 2317 秒，而节点有 128 核；这里按内存一起放宽。
   # 每个 hipcc 模板实例化峰值约 3~4 GB，按 MemTotal/4 收口，避免 OOM 直接整轮白跑。

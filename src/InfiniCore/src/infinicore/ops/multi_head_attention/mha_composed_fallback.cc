@@ -171,7 +171,7 @@ void register_all() {
     MultiheadAttention::run_dispatcher().registerAll(&run, false);
     MultiheadAttention::cleanup_dispatcher().registerAll(&cleanup, false);
     // 这行是判断「兜底到底有没有装上」的唯一凭据，日志里搜 [mha] 即可。
-    std::fprintf(stderr, "[mha] 使用 InfiniCore 组合实现（matmul+softmax+matmul）\n");
+    std::fprintf(stderr, "[mha] 兜底已注册到 dispatcher（Hygon，无 flash-attn）\n");
 }
 
 } // namespace
@@ -184,8 +184,19 @@ void register_all() {
 extern "C" __attribute__((constructor)) static void h3_mha_fallback_ctor() {
     try {
         register_all();
+        // 注册完立刻回查：静态 dispatcher 是函数内 static，正常只会有一份；
+        // 万一拿到的不是 cpp_api 那份（跨 DSO 各一份），注册就是白做。
+        // 这一行是「兜底到底有没有真装上」的唯一凭据，日志里搜「注册回查」即可。
+        auto pfn = MultiheadAttention::plan_dispatcher().lookup(Device::Type::HYGON);
+        auto rfn = MultiheadAttention::run_dispatcher().lookup(Device::Type::HYGON);
+        std::fprintf(stderr,
+                     "[mha] 注册回查：plan=%s run=%s\n",
+                     pfn ? "非空" : "空(注册没落到 cpp_api 那份 dispatcher)",
+                     rfn ? "非空" : "空(注册没落到 cpp_api 那份 dispatcher)");
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "[mha] 注册失败：%s\n", e.what());
     } catch (...) {
-        std::fprintf(stderr, "[mha] 注册失败（异常），保持不注册状态\n");
+        std::fprintf(stderr, "[mha] 注册失败（未知异常），保持不注册状态\n");
     }
 }
 #else
