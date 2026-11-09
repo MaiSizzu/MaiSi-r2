@@ -1596,6 +1596,8 @@ typedef struct {
     size_t cap;                /* stage 容量（元素数） */
     size_t esz_cap;            /* 分配时的元素字节数 */
     unsigned long long seq;
+    unsigned long long ag_seq; /* allgather 自己的计数（不能和 allreduce 共用，否则「前 3 次」会被对方吃掉） */
+    unsigned long long rs_seq; /* reduceScatter 自己的计数 */
     unsigned long long enter;  /* 进入次数（用于前几次打点） */
     unsigned long long moved;  /* 累计搬运字节（用于报进度） */
 } h3grp;
@@ -1869,6 +1871,222 @@ static int h3_collective(h3grp *g, int rank, size_t count, int dtype, int op,
     return 0;
 }
 
+/* ---- allgather / allgatherV ----
+ * 与 allreduce 共用同一套栅栏（mu + arrive + gen），但搬运模式不同，所以单独成函数，
+ * 不去动已经跑通的 h3_collective：
+ *   allreduce     每 rank 一份 → 归约 → 广播回每个 rank
+ *   allgather     每 rank 一份 → 按 rank 顺序整块拼进每个 rank 的 output
+ *   reduceScatter 每 rank 有 n 段 → 每段归约 → rank r 只留下第 r 段
+ * 语义按 nccl 对应接口：阻塞返回，返回时 recvbuf 已就绪。
+ *
+ * 为什么要它：11-08 17:45 那单文本塔、cast_ 全过，进 DiT 第一个 block 就死在
+ * allgather.cc:55 "Not Implemented" —— MiniMaxH3AdaLNProjection 是列并行，
+ * 每层都要把 [1, out/tp] 的本地份拼回完整宽度（transformer.cpp:301）。 */
+static int h3_gather(h3grp *g, int rank, size_t send_count, const size_t *recv_counts,
+                     int dtype, void *sbuf, void *rbuf, void *stream) {
+    size_t esz = (size_t)h3_esz(dtype);
+    size_t chunk, off, n, maxc = 0, base = 0;
+    int i, k;
+    unsigned long long mygen;
+
+    if (!esz) {
+        h3_say("[h3ccl] !! allgather 不支持的 dtype=", (long)dtype, "");
+        return 10;
+    }
+    if (send_count == 0) return 0;
+
+    /* 各 rank 的 sendbuf 先算完再进来（和 allreduce 同样的理由） */
+    if (stream) hipStreamSynchronize(stream);
+    else hipDeviceSynchronize();
+
+    H3_MX_LOCK(&g->mu);
+
+    g->enter++;
+    if (g->enter <= 16) {
+        fprintf(stderr, "[h3ccl] >> ag 进入 #%llu rank=%d send=%ld dtype=%d\n",
+                g->enter, rank, (long)send_count, dtype);
+        fflush(stderr);
+    }
+
+    mygen = g->gen;
+    g->count[rank] = send_count;
+    g->dtype[rank] = dtype;
+    g->sbuf[rank] = sbuf;
+    g->rbuf[rank] = rbuf;
+
+    if (++g->arrive < g->n) {
+        while (g->gen == mygen) H3_CV_WAIT(&g->cv, &g->mu);
+        H3_MX_UNLOCK(&g->mu);
+        return 0;
+    }
+    g->arrive = 0;
+
+    /* 每份长度：普通 allgather 全等 send_count，allgatherV 逐份不同。
+     * 分块按最长那份，保证 stage 装得下任意一份的一块。 */
+    for (k = 0; k < g->n; ++k) {
+        size_t ck = recv_counts ? recv_counts[k] : send_count;
+        if (ck > maxc) maxc = ck;
+    }
+    chunk = maxc > (size_t)H3_CHUNK ? (size_t)H3_CHUNK : maxc;
+    if (chunk == 0) chunk = 1;
+    if (h3_ensure(g, chunk) != 0) {
+        g->gen++;
+        H3_CV_BCAST(&g->cv);
+        H3_MX_UNLOCK(&g->mu);
+        return 1;
+    }
+
+    /* 拼接顺序 = rank 顺序：output 里第 k 块就是 rank k 的 sendbuf。
+     * allgather.cc 就是按 shape[0] *= world_size 建的 output，所以必须整块顺序
+     * 追加，不能按块交错（交错只能对上「每份 1 个元素」的特例）。 */
+    for (k = 0; k < g->n; ++k) {
+        size_t ck = recv_counts ? recv_counts[k] : send_count;
+        for (off = 0; off < ck; off += chunk) {
+            n = ck - off;
+            if (n > chunk) n = chunk;
+            hipSetDevice(g->ids[k]);
+            hipMemcpy(g->stage[k], (char *)g->sbuf[k] + off * esz, n * esz, H3_D2H);
+            for (i = 0; i < g->n; ++i) {
+                hipSetDevice(g->ids[i]);
+                hipMemcpy((char *)g->rbuf[i] + (base + off) * esz, g->stage[k], n * esz, H3_H2D);
+            }
+            g->moved += (unsigned long long)(n * esz) * (unsigned long long)(g->n + 1);
+        }
+        base += ck;
+    }
+    if (g->n > 0) hipSetDevice(g->ids[rank]);
+
+    g->ag_seq++;
+    if (g->ag_seq <= 3 || (g->ag_seq % 500ULL) == 0) {
+        char buf[256];
+        char *p = buf;
+        const char *q;
+        for (q = "[h3ccl] allgather #"; *q; ++q) *p++ = *q;
+        p = h3_num(p, (long)g->ag_seq);
+        for (q = "  send="; *q; ++q) *p++ = *q;
+        p = h3_num(p, (long)send_count);
+        for (q = "  total="; *q; ++q) *p++ = *q;
+        p = h3_num(p, (long)base);
+        for (q = "  dtype="; *q; ++q) *p++ = *q;
+        p = h3_num(p, (long)dtype);
+        for (q = "  ranks="; *q; ++q) *p++ = *q;
+        p = h3_num(p, (long)g->n);
+        *p++ = '\n';
+        *p = 0;
+        h3_log(buf);
+        if (g->ag_seq == 3)
+            h3_log("[h3ccl] （allgather 前 3 次已报；之后每 500 次再报一行）\n");
+    }
+
+    g->gen++;
+    H3_CV_BCAST(&g->cv);
+    H3_MX_UNLOCK(&g->mu);
+    return 0;
+}
+
+/* ---- reduceScatter / reduceScatterV ---- */
+static int h3_scatter(h3grp *g, int rank, size_t recv_count, const size_t *send_counts,
+                      int dtype, int op, void *sbuf, void *rbuf, void *stream) {
+    size_t esz = (size_t)h3_esz(dtype);
+    size_t chunk, off, n, maxc = 0, base = 0;
+    int i, k;
+    unsigned long long mygen;
+
+    if (!esz) {
+        h3_say("[h3ccl] !! reduceScatter 不支持的 dtype=", (long)dtype, "");
+        return 10;
+    }
+    if (recv_count == 0) return 0;
+    if (op != 0 && op != 4) {
+        h3_say("[h3ccl] !! reduceScatter 只支持 SUM/AVG，收到 op=", (long)op, "");
+        return 2;
+    }
+
+    if (stream) hipStreamSynchronize(stream);
+    else hipDeviceSynchronize();
+
+    H3_MX_LOCK(&g->mu);
+
+    g->enter++;
+    if (g->enter <= 16) {
+        fprintf(stderr, "[h3ccl] >> rs 进入 #%llu rank=%d recv=%ld dtype=%d op=%d\n",
+                g->enter, rank, (long)recv_count, dtype, op);
+        fflush(stderr);
+    }
+
+    mygen = g->gen;
+    g->count[rank] = recv_count;
+    g->dtype[rank] = dtype;
+    g->op[rank] = op;
+    g->sbuf[rank] = sbuf;
+    g->rbuf[rank] = rbuf;
+
+    if (++g->arrive < g->n) {
+        while (g->gen == mygen) H3_CV_WAIT(&g->cv, &g->mu);
+        H3_MX_UNLOCK(&g->mu);
+        return 0;
+    }
+    g->arrive = 0;
+
+    for (k = 0; k < g->n; ++k) {
+        size_t ck = send_counts ? send_counts[k] : recv_count;
+        if (ck > maxc) maxc = ck;
+    }
+    chunk = maxc > (size_t)H3_CHUNK ? (size_t)H3_CHUNK : maxc;
+    if (chunk == 0) chunk = 1;
+    if (h3_ensure(g, chunk) != 0) {
+        g->gen++;
+        H3_CV_BCAST(&g->cv);
+        H3_MX_UNLOCK(&g->mu);
+        return 1;
+    }
+
+    /* 第 k 段：每个 rank 从自己 sendbuf 的同一段取，归约后只写进 rank k 的 recvbuf
+     * （reduce_scatter 的定义：rank r 拿到的就是「所有 rank 的第 r 段之和」）。 */
+    for (k = 0; k < g->n; ++k) {
+        size_t ck = send_counts ? send_counts[k] : recv_count;
+        for (off = 0; off < ck; off += chunk) {
+            n = ck - off;
+            if (n > chunk) n = chunk;
+            for (i = 0; i < g->n; ++i) {
+                hipSetDevice(g->ids[i]);
+                hipMemcpy(g->stage[i], (char *)g->sbuf[i] + (base + off) * esz, n * esz, H3_D2H);
+            }
+            if (h3_reduce(g, n, dtype, op) != 0) break;
+            hipSetDevice(g->ids[k]);
+            hipMemcpy((char *)g->rbuf[k] + off * esz, g->stage[0], n * esz, H3_H2D);
+            g->moved += (unsigned long long)(n * esz) * (unsigned long long)(g->n + 1);
+        }
+        base += ck;
+    }
+    if (g->n > 0) hipSetDevice(g->ids[rank]);
+
+    g->rs_seq++;
+    if (g->rs_seq <= 3 || (g->rs_seq % 500ULL) == 0) {
+        char buf[256];
+        char *p = buf;
+        const char *q;
+        for (q = "[h3ccl] reduceScatter #"; *q; ++q) *p++ = *q;
+        p = h3_num(p, (long)g->rs_seq);
+        for (q = "  recv="; *q; ++q) *p++ = *q;
+        p = h3_num(p, (long)recv_count);
+        for (q = "  total="; *q; ++q) *p++ = *q;
+        p = h3_num(p, (long)base);
+        for (q = "  dtype="; *q; ++q) *p++ = *q;
+        p = h3_num(p, (long)dtype);
+        for (q = "  ranks="; *q; ++q) *p++ = *q;
+        p = h3_num(p, (long)g->n);
+        *p++ = '\n';
+        *p = 0;
+        h3_log(buf);
+    }
+
+    g->gen++;
+    H3_CV_BCAST(&g->cv);
+    H3_MX_UNLOCK(&g->mu);
+    return 0;
+}
+
 static h3grp *h3_new_group(int n, const int *ids) {
     h3grp *g = (h3grp *)calloc(1, sizeof(h3grp));
     int i;
@@ -1990,32 +2208,43 @@ int infinicclRecv(void *recvbuf, size_t count, int datatype, int peer,
 
 int infinicclAllGather(void *sendbuf, void *recvbuf, size_t send_count, int datatype,
                        void *comm, void *stream) {
-    (void)sendbuf; (void)recvbuf; (void)send_count; (void)datatype;
-    (void)comm; (void)stream;
-    h3_log("[h3ccl] !! AllGather 未实现（本路径未用到）\n");
-    return 2;
+    h3comm *c = (h3comm *)comm;
+    if (!c || !c->grp) return 4;
+    return h3_gather(c->grp, c->rank, send_count, NULL, datatype, sendbuf, recvbuf, stream);
 }
 
 int infinicclAllGatherV(void *sendbuf, void *recvbuf, const size_t *recv_counts, int nranks,
                         int datatype, void *comm, void *stream) {
-    (void)sendbuf; (void)recvbuf; (void)recv_counts; (void)nranks;
-    (void)datatype; (void)comm; (void)stream;
-    return 2;
+    h3comm *c = (h3comm *)comm;
+    if (!c || !c->grp) return 4;
+    if (!recv_counts) return 4;
+    if (nranks != c->grp->n) {
+        h3_say("[h3ccl] !! AllGatherV 的 nranks 与通信域不符：", (long)nranks, "");
+        return 3;
+    }
+    /* send_count 只做「非零」校验用；真实长度逐份从 recv_counts 取 */
+    return h3_gather(c->grp, c->rank, recv_counts[c->rank], recv_counts,
+                     datatype, sendbuf, recvbuf, stream);
 }
 
 int infinicclReduceScatter(void *sendbuf, void *recvbuf, size_t recv_count, int datatype,
                            int op, void *comm, void *stream) {
-    (void)sendbuf; (void)recvbuf; (void)recv_count; (void)datatype;
-    (void)op; (void)comm; (void)stream;
-    h3_log("[h3ccl] !! ReduceScatter 未实现（本路径未用到）\n");
-    return 2;
+    h3comm *c = (h3comm *)comm;
+    if (!c || !c->grp) return 4;
+    return h3_scatter(c->grp, c->rank, recv_count, NULL, datatype, op, sendbuf, recvbuf, stream);
 }
 
 int infinicclReduceScatterV(void *sendbuf, void *recvbuf, const size_t *send_counts, int nranks,
                             int datatype, int op, void *comm, void *stream) {
-    (void)sendbuf; (void)recvbuf; (void)send_counts; (void)nranks;
-    (void)datatype; (void)op; (void)comm; (void)stream;
-    return 2;
+    h3comm *c = (h3comm *)comm;
+    if (!c || !c->grp) return 4;
+    if (!send_counts) return 4;
+    if (nranks != c->grp->n) {
+        h3_say("[h3ccl] !! ReduceScatterV 的 nranks 与通信域不符：", (long)nranks, "");
+        return 3;
+    }
+    return h3_scatter(c->grp, c->rank, send_counts[c->rank], send_counts,
+                      datatype, op, sendbuf, recvbuf, stream);
 }
 
 int infinicclGetUniqueId(void *unique_id) {
@@ -2110,7 +2339,7 @@ H3CCLEOF
     [ -n "$f" ] && [ -e "$f" ] && { hiplib=$f; hipd=$(dirname "$f"); }
   fi
 
-  say "  编译集合通信薄壳（$(basename "$cc")，自实现 allreduce 不依赖 RCCL）"
+  say "  编译集合通信薄壳（$(basename "$cc")，自实现 allreduce/allgather/reduceScatter，不依赖 RCCL）"
   local -a larg=(-pthread)
   [ -n "$hiplib" ] && larg+=("$hiplib" "-Wl,-rpath,$hipd")
   if ! "$cc" -O2 -fPIC -shared -o "$so" "$src" ${larg[@]+"${larg[@]}"} 2>"$dir/ccl_cc.log"; then
@@ -2121,7 +2350,9 @@ H3CCLEOF
   [ -s "$so" ] || { say "  !! 集合通信薄壳没产出（$so 为空）"; return 1; }
 
   # 少一个符号就会在运行时炸，这里逐个核对
-  local want="infinicclCommInitAll infinicclAllReduce infinicclCommDestroy infinicclGetCommName infinicclGroupStart infinicclGroupEnd"
+  # allgather/reduceScatter 是 11-08 17:45 那单补的：DiT 的 adaln 列并行每层都要 allgather，
+  # 原来返回 Not Implemented，白烧一单
+  local want="infinicclCommInitAll infinicclAllReduce infinicclBroadcast infinicclAllGather infinicclAllGatherV infinicclReduceScatter infinicclReduceScatterV infinicclCommDestroy infinicclGetCommName infinicclGroupStart infinicclGroupEnd"
   local miss="" s2
   for s2 in $want; do has_dynsym "$so" "$s2" || miss="$miss $s2"; done
   if [ -n "$miss" ]; then
