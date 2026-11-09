@@ -263,14 +263,16 @@ say "diffusers attention backend = $DIFFUSERS_ATTN_BACKEND（VAE 解码走这条
 # 模型设计画布是短边 768（resolve_canvas_size 的 canvas_short_edge，面积上限
 # 768*1344），但 3000 秒装不下：DiT 的 attention 随 token 数平方涨，
 # 256 短边实测 2 步 26.7s，按面积外推 768 就是每步上百秒、50 步上万秒。
-# 往 256 压之后，124 帧 / 50 步 / seed 42 与模板一致，只有分辨率不同
-# （模板没规定分辨率，但报告里要写清楚）。
+# 往 256 压之后，124 帧 / 50 步 / seed 42 与模板一致，但分辨率低于规格 768x928。
+# 这是已知偏差，必须在报告里写清楚，不能当成"只有分辨率不同"轻描淡写。
+# 比例也一并固定成 768:928，避免"画布由首帧 4:5 反推"这种与规格脱钩的行为。
 # 为什么不用 --height/--width：minimax_h3_compare.py 拼子进程命令时是写死的，
 # 不给这两个参数，命令行管不到它；而 compare 要过尺寸校验、要算 SSIM，
 # 两边必须同尺寸。所以在画布解析这一层统一（h3_proc_fix 的 _patch_canvas_size）。
 # 想换档：h3.env 里写 H3_CANVAS_SHORT=512（32 的倍数）。
 export H3_CANVAS_SHORT="${H3_CANVAS_SHORT:-256}"
-say "画布短边 = $H3_CANVAS_SHORT（默认 768；full 与 compare 都用这个，尺寸才对得上）"
+say "画布短边 = $H3_CANVAS_SHORT（规格 768，这里按 3000 秒上限降档；比例固定 768:928）"
+say "  full 与 compare 都用这个，尺寸才对得上；要按规格跑就在 h3.env 写 H3_CANVAS_SHORT=768"
 
 say "探测 DTK / 编译器"
 DTK_ROOT=${DTK_ROOT:-}
@@ -4563,15 +4565,31 @@ def _patch_canvas_size():
 
     orig = mp.resolve_canvas_size
 
+    # 比例固定成规格的 768:928（24:29），不再由首帧图片的宽高决定。
+    # 短边 768 时这一点正好落在 928（928 = 32*29，是 canvas_multiple 的整数倍），
+    # 即规格原值；短边更小时按同一比例缩，不会退化成首帧的 4:5。
+    pin_w, pin_h = 768, 928
+
     def patched(aspect_width, aspect_height, canvas_multiple, short_edge, max_pixels, **kw):
-        return orig(aspect_width, aspect_height, canvas_multiple, n, max_pixels, **kw)
+        res = orig(pin_w, pin_h, canvas_multiple, n, max_pixels, **kw)
+        try:
+            if isinstance(res, (tuple, list)) and len(res) >= 2:
+                print(f"[h3] 画布 {int(res[1])}x{int(res[0])}"
+                      f"（比例固定 768:928，短边请求 {n}）", flush=True)
+            else:
+                print(f"[h3] 画布 {res}（比例固定 768:928，短边请求 {n}）",
+                      flush=True)
+        except Exception:
+            pass
+        return res
 
     # 三个模块各自 from ... import 绑定了这个名字，只改 modular_pipeline 不够
     for mod in (mp, bd, be):
         mod.resolve_canvas_size = patched
     _CANVAS_PATCHED = True
     print(
-        f"[h3] 画布短边已压到 {n}（默认 768；full 与 compare 都用这个，尺寸才对得上）",
+        f"[h3] 画布比例已固定 768:928，短边改到 {n}"
+        "（full 与 compare 都用这个，尺寸才对得上）",
         flush=True,
     )
     return True
