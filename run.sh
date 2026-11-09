@@ -6574,6 +6574,138 @@ do_run() {
 CMP_DIR=$OUT/compare
 CMP_PY=$PKG/src/InfiniLM/examples/minimax_h3_compare.py
 
+# 官方对比脚本在**解码那一刻**才 import skimage，而集群离线：
+# pip_heal 里 net_ok 一查就返回失败，等于 compare 这条路走到最后一步必崩。
+# 所以自备一份纯 numpy 的 structural_similarity（_fix/ssim_numpy.py），
+# 口径按 skimage 的默认（uniform 7x7 窗 + 样本协方差 + K1/K2），
+# 和真 skimage 0.26 逐工况对拍过，差 < 1e-15。
+# 放在 $PYDEPS/dyn 下、靠 PYTHONPATH 前置命中，不动 pylibs 里的任何东西。
+write_ssim_shim() {
+  local d=$PYDEPS/dyn
+  mkdir -p "$d/skimage/metrics" 2>/dev/null || { say "  !! 建不了 $d/skimage/metrics"; return 1; }
+  cat > "$d/skimage/__init__.py" <<'PYEOF'
+"""离线环境的 skimage 占位：只提供 metrics.structural_similarity。"""
+
+__all__ = ["metrics"]
+PYEOF
+  cat > "$d/skimage/metrics/__init__.py" <<'PYEOF'
+from .ssim import structural_similarity
+
+__all__ = ["structural_similarity"]
+PYEOF
+  cat > "$d/skimage/metrics/ssim.py" <<'PYEOF'
+"""skimage.metrics.structural_similarity 的最小 numpy 替代。
+
+只为本赛题的对比脚本服务：`minimax_h3_compare.py` 里唯一一处调用是
+
+    structural_similarity(gray_a, gray_b, data_range=255)
+
+两张都是 PIL `convert("L")` 出来的二维 uint8 灰度图（长边已缩到 ≤512）。
+所以这里实现的是 skimage 的默认口径：uniform 7x7 窗、样本协方差（cov_norm）、
+K1=0.01、K2=0.03。gaussian_weights / gradient 这些分支官方脚本不用，直接拒绝。
+
+为什么要自己写：集群离线，`pip_heal` 的 net_ok 一查就返回失败，
+而官方脚本是在**解码对比那一刻**才 import skimage —— 不先兜住就会跑完
+124 帧 × 50 步（每侧几十分钟）再崩在 No module named 'skimage'。
+"""
+
+import numpy as np
+
+_K1 = 0.01
+_K2 = 0.03
+_DEFAULT_WIN = 7
+
+
+def _box_mean(x, size):
+    """size x size 均值滤波；边界按 reflect（等价于 scipy.ndimage 的默认 mode）。
+
+    scipy 的 'reflect' 是 (d c b a | a b c d)，正好等于 numpy 的 'symmetric'。
+    用两次 cumsum 做可分离求和，避免引入 scipy。
+    """
+    pad = size // 2
+    xp = np.pad(np.asarray(x, dtype=np.float64), pad, mode="symmetric")
+    c = np.cumsum(np.cumsum(xp, axis=0), axis=1)
+    c = np.pad(c, ((1, 0), (1, 0)), mode="constant")
+    s = c[size:, size:] - c[:-size, size:] - c[size:, :-size] + c[:-size, :-size]
+    return s / float(size * size)
+
+
+def structural_similarity(
+    im1,
+    im2,
+    *,
+    win_size=None,
+    data_range=None,
+    gaussian_weights=False,
+    channel_axis=None,
+    gradient=False,
+    full=False,
+    **kwargs,
+):
+    # 必须先升 float64 再算 a*a / a*b：uint8 上 200*200 会溢出成 8 位，
+    # 方差直接被压平，SSIM 永远贴着 1（第一版就栽在这，随机图能算出 0.98）。
+    a = np.asarray(im1, dtype=np.float64)
+    b = np.asarray(im2, dtype=np.float64)
+    if a.shape != b.shape:
+        raise ValueError("Input images must have the same dimensions.")
+    if a.ndim != 2:
+        if channel_axis is not None and a.ndim == 3:
+            # 官方脚本走的是灰度，这条只是别让别的调用方直接炸
+            a = a.mean(axis=channel_axis)
+            b = b.mean(axis=channel_axis)
+        else:
+            raise ValueError("shim 只支持二维灰度图")
+    if gaussian_weights:
+        raise NotImplementedError("shim 只实现了 uniform 窗（官方脚本不用 gaussian）")
+    if gradient or kwargs:
+        raise NotImplementedError("shim 不支持 gradient / 额外参数")
+
+    if data_range is None:
+        dr = float(max(a.max(), b.max()) - min(a.min(), b.min())) or 1.0
+    else:
+        dr = float(data_range)
+
+    size = _DEFAULT_WIN if win_size is None else int(win_size)
+    if size % 2 == 0:
+        raise ValueError("win_size must be odd")
+    shortest = min(a.shape)
+    if shortest < size:
+        # 窗口比图还大：退到最大的合法奇数窗（skimage 会直接报错，但对比脚本
+        # 用的是 256 级以上的帧，走不到这里；退一步比整轮崩掉划算）
+        size = shortest if shortest % 2 == 1 else shortest - 1
+        if size < 3:
+            m = 1.0 if np.array_equal(a, b) else 0.0
+            return (m, np.full(a.shape, m)) if full else m
+
+    ux = _box_mean(a, size)
+    uy = _box_mean(b, size)
+    uxx = _box_mean(a * a, size)
+    uyy = _box_mean(b * b, size)
+    uxy = _box_mean(a * b, size)
+
+    npix = float(size * size)
+    cov_norm = npix / (npix - 1.0)  # 样本协方差
+    vx = cov_norm * (uxx - ux * ux)
+    vy = cov_norm * (uyy - uy * uy)
+    vxy = cov_norm * (uxy - ux * uy)
+
+    c1 = (_K1 * dr) ** 2
+    c2 = (_K2 * dr) ** 2
+    s = ((2 * ux * uy + c1) * (2 * vxy + c2)) / (
+        (ux * ux + uy * uy + c1) * (vx + vy + c2)
+    )
+
+    pad = (size - 1) // 2
+    if pad:
+        s = s[pad : s.shape[0] - pad, pad : s.shape[1] - pad]
+    m = float(s.mean())
+    return (m, s) if full else m
+PYEOF
+  [ -f "$d/skimage/metrics/ssim.py" ] || { say "  !! SSIM 兜底没写出来"; return 1; }
+  say "  SSIM 兜底已写入 $d/skimage（纯 numpy，不需要 skimage/scipy）"
+  return 0
+}
+
 # 官方脚本用 skimage 算 SSIM，离线 pylibs 里没有这个包。
 # 它是在**解码对比**那一刻才 import 的，也就是说：不先查，就会跑完 124 帧 × 50 步
 # （每侧几十分钟）才在最后一步崩在 No module named 'skimage' 上。
@@ -6588,14 +6720,25 @@ ensure_compare_deps() {
     say "  对比依赖就位：$out"
     return 0
   fi
-  say "  对比要 skimage（SSIM），离线包里没有 → 现场补"
+  say "  对比要 skimage（SSIM），离线包里没有 → 用自带实现（纯 numpy）"
   printf '%s\n' "$out" | tail -3 | sed 's/^/    /'
-  # scikit-image 的硬依赖：scipy / networkx / lazy_loader / imageio / tifffile
-  # （pyfetch_install 只解压指定包，不会替我们解析依赖，得自己列全）
-  pip_heal scikit-image scipy networkx lazy-loader imageio tifffile
+  # 默认不走 pip：集群离线，pip_heal 的 net_ok 一查就 false；就算有网，
+  # scikit-image + scipy 解压也要几十秒，而自带实现已经和 skimage 的默认口径
+  # 逐工况对拍到 1e-15。真要试联网装包：H3_SKIMAGE_PIP=1。
+  if [ "${H3_SKIMAGE_PIP:-0}" = "1" ]; then
+    # scikit-image 的硬依赖：scipy / networkx / lazy_loader / imageio / tifffile
+    # （pyfetch_install 只解压指定包，不会替我们解析依赖，得自己列全）
+    pip_heal scikit-image scipy networkx lazy-loader imageio tifffile || true
+    out=$(PYTHONPATH="$PYDEPS/dyn:$PYDEPS${PYTHONPATH:+:$PYTHONPATH}" "$py" -c "$probe" 2>&1)
+    if [ $? -eq 0 ]; then
+      say "  对比依赖补齐（联网）：$out"
+      return 0
+    fi
+  fi
+  write_ssim_shim || return 3
   out=$(PYTHONPATH="$PYDEPS/dyn:$PYDEPS${PYTHONPATH:+:$PYTHONPATH}" "$py" -c "$probe" 2>&1)
   if [ $? -eq 0 ]; then
-    say "  对比依赖补齐：$out"
+    say "  对比依赖就位（自带 SSIM）：$out"
     return 0
   fi
   printf '%s\n' "$out" | tail -8 | sed 's/^/    /'
