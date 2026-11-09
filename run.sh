@@ -6964,7 +6964,26 @@ case "$MODE" in
               && say "已记下算子源码戳：$MHA_FALLBACK_CC_MD5"
           fi
           do_setup; do_run smoke ;;
-  full)   ensure_deps; do_run full ;;
+  full)
+          # full 必须和 smoke 走同一套准备，不能只 ensure_deps：
+          # ensure_mha_fallback / ensure_cast_fallback 只在 do_setup 里。前者缺了
+          # 视觉塔第一步就 call 0，后者缺了 DiT 第一步抛「cast_ requires ATen」——
+          # 两种都要先烧掉二十分钟导入才暴露，是这里最贵的两个坑。
+          # 这两步都有 md5 戳，编过的直接跳过，正常路径只花几秒。
+          #
+          # H3_ENV_ONLY=1 是「只把环境备好、不跑推理」的开关（调环境时用）。
+          # 它留在 AFS/h3.env 里，full 会 rc=0 却一张片子都没有 ——「成功但没产物」
+          # 是最难查的一种失败，所以在分发这一层直接拦住，别让它占掉一单 8 卡。
+          if [ "${H3_ENV_ONLY:-0}" = "1" ]; then
+            say "  !! h3.env 里 H3_ENV_ONLY=1：那是只备环境、不跑推理的开关"
+            say "     full 这么提会 rc=0 却没有任何 mp4。删掉那一行再提交。"
+            exit 4
+          fi
+          say "正式片：${NUM_FRAMES:-124} 帧 / ${STEPS:-50} 步 / 画布短边 $H3_CANVAS_SHORT"
+          say "  产物 = $OUT/fl2va_${NUM_FRAMES:-124}f_${STEPS:-50}s.mp4"
+          do_setup
+          do_run full
+          ;;
   compare) do_setup; do_compare ;;
   report) do_report ;;
   retry2|retry4)
