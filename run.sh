@@ -172,7 +172,10 @@ PYDEPS=$AFS/pydeps
 # infinicore 的 Python 包目录是上个作业 uid 留下的只读树，写不进去，所以在可写盘上拼一个
 # overlay（包文件 + 编好的 .so），PYTHONPATH 前置它；/dev/shm 优先，装不下再退 AFS
 OVL=${OVL:-/dev/shm/ic_py}
-FIRST_FRAME=$AFS/inputs/first_frame.png
+# 首帧不放在 inputs/ 下：那里躺着的 first_frame.png 是 11-06 07:33 由旧版
+# ensure_first_frame 自造的 512x512 渐变占位图（3277 字节，属主 nobody、权限 660），
+# 本单 uid 未必写得进去，也不该去动别人的文件。自己建一个目录，写自己的那份。
+FIRST_FRAME=$AFS/h3ff/first_frame.png
 # 首帧只能是这一张：md5 写死，ensure_first_frame 每单按它对齐（图以内置 base64 跟在下面）
 H3_FIRST_FRAME_MD5=e9114e556ad7759172a2fa224f666022
 TS=$(date +%m%d_%H%M%S)
@@ -383,15 +386,18 @@ echo "  TARBALL = ${TARBALL:-<未找到>}"
 echo "  已解包  = $( [ -d "$PKG/src/InfiniLM" ] && echo yes || echo no )"
 
 say "定位首帧"
-# 只认这一条路径。以前这里还有一段「.jpg 先、.png 后」的候选回退，后果是
-# inputs/ 下随便一份来历不明的 first_frame.jpg 都会被优先挑走 —— 模型吃哪张图
-# 必须是唯一确定的，不能由目录里恰好有哪个后缀决定。
-FIRST_FRAME=$AFS/inputs/first_frame.png
+# 只认这一条路径，不再有「.jpg 先、.png 后」那种候选回退 —— 模型吃哪张图必须唯一
+# 确定，不能由目录里恰好有哪个后缀决定（03:18 那单就是被 inputs/ 下的旧图坑了）。
 echo "  FIRST_FRAME = $FIRST_FRAME"
 if [ -f "$FIRST_FRAME" ]; then
   echo "  md5         = $(md5sum "$FIRST_FRAME" 2>/dev/null | cut -d' ' -f1)（内置应为 $H3_FIRST_FRAME_MD5）"
 else
   echo "  md5         = <文件不在，ensure_first_frame 会用内置图写入>"
+fi
+# 把 inputs/ 下那张旧图的信息留一行在日志里：报告里要能说清「之前用的是哪张」。
+# 3277 字节 + 800x965 对不上，就是占位图。只读不改。
+if [ -f "$AFS/inputs/first_frame.png" ]; then
+  echo "  旧图       = inputs/first_frame.png $(stat -c%s "$AFS/inputs/first_frame.png" 2>/dev/null) 字节 md5 $(md5sum "$AFS/inputs/first_frame.png" 2>/dev/null | cut -d' ' -f1)（不使用）"
 fi
 
 say "AFS 余量"
@@ -663,7 +669,9 @@ PY
 # 正是占位图的样子 —— 也就是说喂给模型的从来不是那只趴在枯木上的狗，而是它。
 # 所以改成：内置真图，每单按 md5 对齐，不一致就覆盖。
 h3_write_first_frame() {
-  local b64=$AFS/inputs/.first_frame.b64
+  # 临时 .b64 落在目标目录里：放在 inputs/ 下的话，那个目录可能是别人的（只读），
+  # 写不进去就等于整条路走不通
+  local b64=$(dirname "$FIRST_FRAME")/.first_frame.b64
   mkdir -p "$(dirname "$FIRST_FRAME")" || return 1
   cat > "$b64" <<'H3B64'
 iVBORw0KGgoAAAANSUhEUgAAAyAAAAPFCAIAAAASmxsOAAAQAElEQVR4AaT92e9lu5LfiUUEyTXs8TfkcIZ7bw0qXakG9SSrrW5DaMCAbcCN9oMnGIbbsJ8asNF+M2DABvxq+N8zDPQgqVSqO54h8zfuYS0O/nAxc5/fyZNVXZJ5v7/YwWAwGAwGubjXzlNl49gPQ9f3oet8CO6CJqTqvQEYdBCi9glC74F5dcHc4P0YwqqD2uCtd1Xo1Dk1EwADvLfGN7P4sNmsttv1fre53W5frTfXw7jt+03XDX0YcW/sqp0xdJvB7QbddLIJsu1sP7hNH9b9sB3H3QrADKu+oR87HMZtAAO2Q7gWeWvyxtvWZBV0vevHq9HtOt0FYBsfNmG17nar/moI6Hf96MfNar3f7m6udtf77dV+XG+64Xq9hdmOw3o1jGO/2ozbm93VVzfDF9vtH9/6N4Nc2frr3fDF2nZ+/XZro4HQG/bosqJLF7rgekgIfikhsArdMGBw7D+Wbik0NZhXF8wTj94T9gaqTd6auiEwd1DjMHqms9kO1zfbV6+vwM3tbn+13u5G5F1vPkjotB/cuArjync9vIwrW60d81ytq3AYHcoVK3zrx7HmDPEcRh86uld0vXS1r/VDg6O16gzMqOt7poayVuHIWJ6xAJY/6rdeP6JD76663XXY3/Rge9Nvr7vVVdcDMmQ3DNt+3AzjetyBod+uwnov42tdfaHjW+m+0P4L392YDSJexXXSjx50Xdc7v7VhF7qx02Et672ub/32dbf9Yth+Ne6+Xq3fdP2N9Vs3rI04bNYdybAi7F76gcj0BHC9ZplCN4RxPay3m/311fb6ar3fba9vbt9+cfvll/vX1zdfXq9vO78RW4nfaL/3/SaElQuEeh2G1QjGpazIofWqtm7NNqpbtZ3Yldqtc6/88GXfvQ3hlfpbGW5t+0X/6uebt39w9eUfvfniD96++tn11RfbzasRbF+v9m830NVN
@@ -2551,14 +2559,21 @@ ensure_first_frame() {
   else
     say "首帧缺失：把内置图写到 $FIRST_FRAME"
   fi
+  # $AFS/h3ff 建不出来（AFS 只读、或上层目录是别人的），退到本机共享内存。
+  # 这条兜底必须有：首帧写不出来就整单白跑，而 AFS 的属主/权限每单都可能变。
+  if ! mkdir -p "$(dirname "$FIRST_FRAME")" 2>/dev/null; then
+    local alt=${H3_FF_FALLBACK:-/dev/shm/h3ff}/first_frame.png
+    say "  $(dirname "$FIRST_FRAME") 建不出来（AFS 不可写？），改用 $alt"
+    FIRST_FRAME=$alt
+    export FIRST_FRAME
+    mkdir -p "$(dirname "$FIRST_FRAME")" 2>/dev/null \
+      || die "首帧目录建不出来：$(dirname "$FIRST_FRAME")"
+  fi
   h3_write_first_frame || die "内置首帧写不出来（base64 与 python3 两条路都失败）"
   got=$(md5sum "$FIRST_FRAME" 2>/dev/null | cut -d' ' -f1)
   [ "$got" = "$want" ] || die "内置首帧落地后 md5 不符（$got != $want），负载可能被截断"
   size=$(stat -c%s "$FIRST_FRAME" 2>/dev/null)
-  say "  已写入 $size 字节，md5 $got"
-  if [ -f "$AFS/inputs/first_frame.jpg" ]; then
-    say "  注意：$AFS/inputs/first_frame.jpg 还留着（md5 $(md5sum "$AFS/inputs/first_frame.jpg" 2>/dev/null | cut -d' ' -f1)），已不再使用"
-  fi
+  say "  已写入 $size 字节，md5 $got → $FIRST_FRAME"
 }
 
 ensure_xmake() {
