@@ -10,26 +10,34 @@
 | 工具链 | DTK（含 hipcc、hyhal）；`run.sh` 自动探测 `$DTK_ROOT` | `ls /public/software/compiler/ \| grep dtk` |
 | Python | 带 torch(ROCm) + diffusers + transformers 的 `python3` 在 PATH 里 | `python3 -c "import torch,diffusers,transformers"` |
 | 权重 | MiniMax-H3 FL2VA，diffusers 风格目录（含 `model_index.json`），约 135 GB | 见 §2 |
-| 离线依赖包 | `pylibs-py311-v3.zip`（约 16 MB；含 diffusers 0.42 / transformers 5.x / huggingface_hub 2.x） | `ls -lh $IFAB_AFS_HOME/pylibs*-v3.zip` |
-| 编译产物 | `$IFAB_AFS_HOME/infini/lib/libinfinicore_cpp_api.so`；没有就先 `bash run.sh build` 自己编 | `ls $IFAB_AFS_HOME/infini/lib/` |
+| 离线依赖包 | **随包自带** `vendor/pylibs-py311-v3.zip`（33 MB；含 diffusers 0.42 / transformers 5.x / huggingface_hub 2.x）。也认 `$IFAB_AFS_HOME/` 下的同名包或 `PYLIBS_ZIP` | `ls -lh vendor/pylibs*-v3.zip` |
+| 编译产物 | `$IFAB_AFS_HOME/infini/lib/libinfinicore_cpp_api.so` 等；**首次跑 `bash run.sh build` 生成**（冷编约 40 分钟，增量 1~2 分钟） | `bash run.sh check` 里「结论」那一行 |
 | 磁盘 | 持久盘 ≥ 30 GB 可用（编译树 + 出片 + 日志） | `df -h` |
 
-权重**不在仓库里**，这是官方模型，需自备。
+只有权重**不在仓库里**（官方模型，~135 GB，需自备）。依赖包随包，编译产物由脚本生成。
 
 ## 0.1 最小可跑集（缺一项都跑不起来）
 
 | 件 | 在仓库里？ | 体积 | 放哪里 |
 | --- | --- | --- | --- |
 | 全部代码（含两个运行时 shim、补丁、九齿产物脚本） | **是** | 16 MB | `git clone` 即可 |
+| 离线 python 依赖 `vendor/pylibs-py311-v3.zip` | **是** | 33 MB | 已随包；不用手动解压，`run.sh` 自己解到 `$IFAB_AFS_HOME/pylibs` |
 | MiniMax-H3 FL2VA 权重 | **否** | ~135 GB | `MODEL_ROOT` 指向含 `model_index.json` 的那层 |
-| 离线 python 依赖 `pylibs-py311-v3.zip` | **否** | ~16 MB | 持久盘根目录 `$IFAB_AFS_HOME/` |
-| 编译好的 InfiniCore（`.../infini/lib/`） | **否** | ~1 GB | 先跑一次 `bash run.sh build` |
+| 编译产物 `infini/`（libinfiniop、libinfinicore_cpp_api、`_infinicore*.so`） | **否**，脚本生成 | ~1 GB | `bash run.sh build`（或 `H3_AUTO_BUILD=1 bash run.sh setup`） |
 
-三条「否」都不是本包产物：权重是官方模型；离线依赖包是容器里 `pip` 装不了东西
-（读 `/etc/debian_version` 无权限，pip 直接崩）才做成的 zip；`infini/` 是编译产物。
-如果你们环境里 `python3` 本身已能 `import torch, diffusers, transformers`，
-可以把自己的 site-packages 按同样结构打成 zip 放到 `$IFAB_AFS_HOME/pylibs-py311-v3.zip`，
-`run.sh` 只按目录名取用，不校验来源。
+需要外部准备的只剩**两件**，且第二件不需要人工搬运：
+
+1. **权重**：官方模型，必须自备（§2）。
+2. **编译产物**：与本机 DTK/编译器绑定，不可能预置在仓库里，但 `bash run.sh build`
+   一条命令就能生成；`run.sh setup` 会先检查它，缺了当场点名缺哪个 `.so` 并给出命令，
+   不会让你一路跑到视觉层才看到 `rip=0`。已有别人打好的包时用
+   `H3_INFINI_BUNDLE=/path/infini.tar.gz bash run.sh setup` 直接解包。
+
+依赖包为什么是个 zip 而不是 requirements：容器里 `pip` 读 `/etc/debian_version` 就崩，
+装不了任何东西，所以把一套已验证可用的 site-packages 打成 zip，`run.sh` 只解压、
+不安装、不联网。你们环境里 `python3` 本来就能 `import torch, diffusers, transformers` 时，
+这份 zip 也不会被强行使用 —— 它只是「按目录名解压到 `$AFS/pylibs` 再把这个目录
+放进 `PYTHONPATH` 的最前面」，其余照旧。
 
 ## 1. 最短路径：clone 后直接跑
 
@@ -93,7 +101,8 @@ bash run.sh full       # 正式出片 124 帧 / 50 步
 
 | 日志里看到 | 原因 | 处理 |
 | --- | --- | --- |
-| `缺离线依赖包 pylibs-py311.zip` | 持久盘根没有那个 zip（见 §0.1） | 上传，或按 §0.1 末段自己打一个 |
+| `缺离线依赖包。仓库里本该有 vendor/pylibs-py311-v3.zip` | clone 不完整（用了 `--filter`/只下了部分文件） | 重新完整 clone；或把 zip 放到 `$IFAB_AFS_HOME/`、或用 `PYLIBS_ZIP=` 指定 |
+| `缺编译产物： libinfiniop.so …` | 还没编（第一次跑必然出现） | `bash run.sh build`，约 40 分钟；之后增量 1~2 分钟 |
 | `AFS 里找不到 MaiSi-r2-full.tar.gz` | 旧版 run.sh（2,158,044 字节） | 用仓库里这版；或在包根目录直接跑 |
 | `尝试从 https://github.com/... 拉代码` 后失败 | 工作区访问不了 GitHub | 把整包放到 `$AFS/MaiSi-r2`，或设 `H3_PKG=<包路径>` |
 | `可见 DCU = 0` | 卡没分到 / `LD_LIBRARY_PATH` 没带 hyhal | 先 `hy-smi`，再 `source env/dcu_env.sh` |

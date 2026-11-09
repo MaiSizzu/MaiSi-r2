@@ -9,20 +9,23 @@
     patches/                源码补丁 + 九齿 blockDim 修正脚本
     patch_inc/              海光工具链的 CUB 兼容头（需加入 include 路径）
     env/ scripts/ evidence/
+    vendor/                 离线 python 依赖包（pylibs-py311-v3.zip，33 MB，随包自带）
     run.sh                  平台唯一入口（InfiniFabric / 无 Slurm）
     REPRODUCE.md            给评审的复现指南：前置条件、三条路径、失败对照
     BUILD.md                构建细节 + 两个平台适配 shim 的接线方式
-    MANIFEST.txt            文件清单 8594 条（对应提交内容 8595 个文件，不含清单自身）
+    MANIFEST.txt            文件清单（含 vendor/ 依赖包；条数以清单首行为准）
 
 ## 快速开始（InfiniFabric，无 sbatch）
 
 > 评审先看 **REPRODUCE.md**：里面有前置条件清单、三种起跑方式，以及每条失败信息对应的处理。
-> 仓库里是全部代码，但有**两样东西必须自备**：MiniMax-H3 权重（~135 GB）和离线依赖包
-> `pylibs-py311-v3.zip`（~16 MB，容器里 pip 不可用）。清单见 REPRODUCE.md §0.1。
+> **只有一样东西必须自备**：MiniMax-H3 权重（~135 GB，官方模型）。离线依赖包
+> `pylibs-py311-v3.zip` 已随包放在 `vendor/`，编译产物由 `bash run.sh build` 自己生成。
+> 清单见 REPRODUCE.md §0.1。
 
     export IFAB_AFS_HOME=<持久盘目录>          # 每单必设，外层没有 $AFS
     cp $IFAB_AFS_HOME/run.sh .                 # 平台会把工作区的 run.sh 还原成旧版
     bash run.sh check                          # 只读自检，2 分钟，第一次必须先跑
+    bash run.sh build                          # 首次必跑：编 InfiniCore（冷编约 40 分钟）
     bash run.sh compare                        # 出片 + 与 PyTorch 参考片比对
     bash run.sh full                           # 正式 124 帧 / 50 步
 
@@ -178,4 +181,4 @@ DTK / venv / OUTPUT_DIR 可用环境变量覆盖）：
     evidence/blockdim-before-after.diff   blockDim 启动参数改前/改后
     evidence/mp4-probe.txt                出片实测元信息（ffmpeg 原始输出）
     BUILD.md                              构建、shim 接线与自检
-    MANIFEST.txt                          文件清单（2026-11-09，8594 条）
+    MANIFEST.txt                          文件清单（2026-11-09）

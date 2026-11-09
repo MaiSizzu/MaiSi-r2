@@ -4,3 +4,6 @@
 run.sh text eol=lf
 *.c text eol=lf
 *.h text eol=lf
+
+# vendor/ 里的离线依赖包是二进制 zip，禁止任何行尾转换与 diff 展开
+*.zip binary -text -diff

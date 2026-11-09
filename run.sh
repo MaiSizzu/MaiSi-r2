@@ -512,6 +512,24 @@ ensure_pkg() {
 # 15 分钟的作业上限根本等不到崩溃现场。
 # /dev/shm 每单有 450 GB，把 32 MB 的离线包直接解到本地盘只要几秒，之后导入是本地 IO。
 # 只改「从哪 import」：.ready / .deps_ok 这些戳、以及上游补丁，仍然落在 AFS 上。
+# 离线依赖包的位置。顺序：AFS 上的新版 → $AFS/dl → 仓库自带的 vendor/ → 旧版。
+# vendor/ 这一档是关键：以前只认持久盘，评审 clone 完仓库、持久盘上没有那个 zip，
+# ensure_deps 第 10 行就 die 了 —— 明明依赖已经跟着代码一起 clone 下来。
+find_pylibs_zip() {
+  local pat c hit
+  for pat in 'pylibs*-v3.zip' 'pylibs*-v2.zip' 'pylibs*.zip'; do
+    # $PKG/vendor 之外再看 run.sh 自己所在目录和 $AFS/vendor：
+    # 有人会用 H3_PKG 指到别处（或把包放在别的盘），那时 $PKG 里没有 vendor/，
+    # 但代码包同一份里带来的 zip 仍然应该被找到。
+    for c in "$AFS" "$AFS/dl" "$PKG/vendor" "${SELF_DIR:-/nonexistent}/vendor" "$AFS/vendor"; do
+      [ -d "$c" ] || continue
+      hit=$(ls -t "$c"/$pat 2>/dev/null | head -1)
+      [ -n "$hit" ] && { printf '%s\n' "$hit"; return 0; }
+    done
+  done
+  printf '\n'
+}
+
 setup_fast_pylibs() {
   # 每个提前返回都留一句人话：09:55 那单这里一声不响就退出了，
   # 结果 preflight 和启动器全在 AFS 上导包（心跳栈里全是 AFS 的 transformers），
@@ -565,8 +583,7 @@ setup_fast_pylibs() {
   fi
 
   local zip=${PYLIBS_ZIP:-}
-  [ -n "$zip" ] || zip=$(ls -t "$AFS"/pylibs*-v3.zip "$AFS"/dl/pylibs*-v3.zip 2>/dev/null | head -1)
-  [ -n "$zip" ] || zip=$(ls -t "$AFS"/pylibs*.zip "$AFS"/dl/pylibs*.zip 2>/dev/null | head -1)
+  [ -n "$zip" ] || zip=$(find_pylibs_zip)
 
   local t0=$SECONDS
   # 建目录时多试几个位置。11-09 的 compare 单：
@@ -619,21 +636,17 @@ PY
 ensure_deps() {
   # all = setup + build，会连续调两次；第一次过了就直接跳过，省一分钟
   [ "${DEPS_OK:-0}" = "1" ] && { say "依赖已校验过，跳过"; return 0; }
-  # 平台不允许同名覆盖，所以新版用 -v3 后缀；优先命中 v3
+  # 平台不允许同名覆盖，所以新版用 -v3 后缀；优先命中 v3。
+  # 查找顺序见 find_pylibs_zip：持久盘 → 持久盘/dl → 仓库自带 vendor/
   local ZIP=""
-  ZIP=$(ls -t "$AFS"/pylibs*-v3.zip "$AFS"/dl/pylibs*-v3.zip 2>/dev/null | head -1)
-  [ -n "$ZIP" ] || ZIP=$(ls -t "$AFS"/pylibs*-v2.zip "$AFS"/dl/pylibs*-v2.zip 2>/dev/null | head -1)
-  [ -n "$ZIP" ] || ZIP=$(ls -t "$AFS"/pylibs*.zip "$AFS"/dl/pylibs*.zip 2>/dev/null | head -1)
+  ZIP=$(find_pylibs_zip)
   if [ -z "$ZIP" ]; then
-    for c in "$AFS/pylibs-py311.zip" "$AFS/pylibs.zip" "$AFS/dl/pylibs-py311.zip"; do
-      [ -f "$c" ] && ZIP=$c && break
-    done
-  fi
-
-  if [ -z "$ZIP" ]; then
-    say "!! 个人存储里没有 pylibs-py311.zip"
+    say "!! 个人存储（$AFS）和仓库 vendor/ 里都没有 pylibs*.zip"
     say "!! 说明：本容器的 pip 会因为读 /etc/debian_version 无权限而直接崩，pip 路线不可用"
-    die "缺离线依赖包：持久盘根目录要有 pylibs-py311-v3.zip（或 pylibs-py311-v2.zip）。容器里 pip 不可用，见 REPRODUCE.md §0.1"
+    die "缺离线依赖包。仓库里本该有 vendor/pylibs-py311-v3.zip：
+     ① 若你 clone 时加了 --filter/exclude 或只下了部分文件，请重新完整 clone；
+     ② 若确实没有，把它放到 \$IFAB_AFS_HOME/ 或 \$IFAB_AFS_HOME/vendor/ 再跑；
+     ③ 或设置 PYLIBS_ZIP=/path/to/pylibs-py311-v3.zip 显式指定。"
   fi
 
   local ZSIZE=0
@@ -2830,12 +2843,78 @@ PY
   echo "  --- 产物 ---"
   echo "    libinfiniop.so : $(ls -lh "$INFINI/lib/libinfiniop.so" 2>/dev/null || echo '<未编译>')"
   echo "    _infinicore*.so: $(find "$PKG/src/InfiniCore/python" -name '_infinicore*.so' 2>/dev/null | head -1 || echo '<未编译>')"
+  if [ -z "$(infini_artifacts_missing)" ]; then
+    echo "    结论           : 产物齐全，可以直接 setup / compare"
+  else
+    echo "    结论           : 缺$(infini_artifacts_missing) → 先跑 bash run.sh build（约 40 分钟）"
+  fi
   hr
   say "自检结束。若 MODEL_ROOT 有值、可见卡数 ≥ 需要的卡数，就可以跑 setup。"
 }
 
+# ---- 编译产物：不在仓库里，但必须让「缺」这件事在第 10 秒说清楚 ----
+# $INFINI/lib/*.so 与 InfiniCore 的 python 绑定约 1 GB，且和机器/DTK/编译器版本
+# 强绑定，塞进 git 没意义（换个环境直接 ABI 不匹配）。所以这里只做三件事：
+#   · 缺什么，点名报出来（不是笼统一句「请先 build」）
+#   · H3_INFINI_BUNDLE 给了打好的包，就地解包
+#   · H3_AUTO_BUILD=1 时直接开编，一步到底
+# 没有它的时候，评审会一路跑到视觉塔才看到 rip=0，而那个报错和真正原因无关。
+infini_artifacts_missing() {
+  local m="" c api=""
+  for c in "$INFINI/lib/libinfinicore_cpp_api.so" \
+           "${OVL:-/nonexistent}/infinicore/lib/libinfinicore_cpp_api.so" \
+           "${SRC_IC:-/nonexistent}/python/infinicore/lib/libinfinicore_cpp_api.so"; do
+    [ -s "$c" ] && { api=$c; break; }
+  done
+  [ -n "$api" ] || m="$m libinfinicore_cpp_api.so"
+  [ -s "$INFINI/lib/libinfiniop.so" ] || m="$m libinfiniop.so"
+  [ -n "$(find "$PKG/src/InfiniCore/python" -maxdepth 3 -name '_infinicore*.so' 2>/dev/null | head -1)" ] \
+    || m="$m _infinicore*.so"
+  printf '%s\n' "$m"
+}
+
+ensure_infini_artifacts() {
+  local miss=""
+  miss=$(infini_artifacts_missing)
+  if [ -z "$miss" ]; then
+    say "编译产物就位（$INFINI/lib）"
+    return 0
+  fi
+  say "编译产物缺失：$miss"
+
+  if [ -n "${H3_INFINI_BUNDLE:-}" ]; then
+    [ -f "$H3_INFINI_BUNDLE" ] || die "H3_INFINI_BUNDLE 指向的文件不存在：$H3_INFINI_BUNDLE"
+    say "  从 bundle 解包到 $AFS：$H3_INFINI_BUNDLE"
+    mkdir -p "$AFS" 2>/dev/null
+    tar -xzf "$H3_INFINI_BUNDLE" -C "$AFS" 2>/dev/null \
+      || tar -xf "$H3_INFINI_BUNDLE" -C "$AFS" \
+      || die "bundle 解包失败：$H3_INFINI_BUNDLE"
+    miss=$(infini_artifacts_missing)
+    [ -z "$miss" ] && { say "  bundle 解包后产物齐全"; return 0; }
+    say "  !! bundle 解了，但仍缺：$miss"
+  fi
+
+  if [ "${H3_AUTO_BUILD:-0}" = "1" ]; then
+    say "H3_AUTO_BUILD=1 → 现在编（冷编约 40 分钟，单作业上限 50 分钟）"
+    do_build
+    miss=$(infini_artifacts_missing)
+    [ -z "$miss" ] && { say "  编译完成，产物齐全"; return 0; }
+    die "build 跑完了但仍缺：$miss（往上看 build 尾部的 error）"
+  fi
+
+  die "缺编译产物：$miss
+     这些 .so 约 1 GB，和机器/DTK 版本绑定，不在仓库里，必须在本机编一次：
+       ① bash run.sh build     编完再跑 setup / compare / full（增量编 1~2 分钟）
+       ② 已有别人打好的包：H3_INFINI_BUNDLE=/path/infini.tar.gz bash run.sh setup
+       ③ 一键连编带跑：H3_AUTO_BUILD=1 bash run.sh setup
+     只想确认缺什么：bash run.sh check（产物那一行会写「缺 → 先 build」）"
+}
+
 do_setup() {
   ensure_pkg
+  # 先查产物再验依赖：产物缺失是最常见的「第一次跑」状态，10 秒内给出结论，
+  # 不必先花 6 分钟 import torch+diffusers 才发现后面根本编不起来。
+  ensure_infini_artifacts
   ensure_deps
   ensure_first_frame
   # 视觉塔和 DiT 都走 op::mha，而 Hygon 上它零注册。这一步只编一个 .cc（几秒），
