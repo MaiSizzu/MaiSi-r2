@@ -6602,7 +6602,10 @@ do_run() {
         ;;
       *)
         local lastlog
-        lastlog=$(ls -t "$OUT"/fl2va_${tag}_*.log 2>/dev/null | head -1)
+        # 日志名由启动器按 TAG 拼：smoke 是 fl2va_smoke_<MMDD_HHMM>.log，
+        # full 是 fl2va_124f_50s_<MMDD_HHMM>.log —— 里面没有 "full"，按 tag 找会
+        # 一律落空，于是最贵的那一单反而一条对策都不打。取最新的一份即可。
+        lastlog=$(ls -t "$OUT"/fl2va_*.log 2>/dev/null | head -1)
         if [ -n "$lastlog" ] && grep -q "Error Code 5" "$lastlog" 2>/dev/null; then
           echo "  集合通信没接管（Error Code 5）：往上找「集合通信薄壳」那行，看是不是没编出来/没预加载"
         elif [ -n "$lastlog" ] && grep -qi "out of memory\|OUT_OF_RESOURCES\|memory access fault" "$lastlog" 2>/dev/null; then
