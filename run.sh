@@ -8786,6 +8786,24 @@ do_compare() {
          --legacy-gpus="${LEGACY_GPUS:-0,1,2,3}"
          --legacy-memory-fraction="${LEGACY_MEM_FRAC:-0.4}")
 
+  # legacy 模式下生成器把 --legacy-gpus 一劈两半：前半给 Qwen3-VL（文本塔），
+  # 后半给 H3 DiT。默认 0,1,2,3 就等于 DiT 只有两张卡 —— 再叠上 0.4 的显存
+  # 分数（64G×0.4≈25GiB/卡），DiT 极可能装不下，被 accelerate 塞进 CPU，
+  # 每步都走 PCIe 搬权重，124 帧×50 步必然吃满 3000 秒。
+  # 所以允许从开关文件里显式指定这两组：文本塔独占一张（它只跑一次，
+  # 4.8s），DiT 摊到剩下七张。生成器要求两个参数同时给，只给一个直接报错，
+  # 这里就先拦住，别让它跑到一半才抛。
+  if [ -n "${LEGACY_TEXT_GPUS:-}" ] || [ -n "${LEGACY_TRANSFORMER_GPUS:-}" ]; then
+    if [ -n "${LEGACY_TEXT_GPUS:-}" ] && [ -n "${LEGACY_TRANSFORMER_GPUS:-}" ]; then
+      args+=(--legacy-text-gpus="$LEGACY_TEXT_GPUS"
+             --legacy-transformer-gpus="$LEGACY_TRANSFORMER_GPUS")
+      say "  legacy 分组：文本塔 $LEGACY_TEXT_GPUS / DiT $LEGACY_TRANSFORMER_GPUS"
+    else
+      say "  !! LEGACY_TEXT_GPUS 与 LEGACY_TRANSFORMER_GPUS 必须成对出现，已忽略"
+      say "     只给其中一个，生成器会直接抛「must be supplied together」"
+    fi
+  fi
+
   say "官方对比（每侧 124 帧 / 50 步）"
   say "  脚本 = $CMP_PY"
   say "  参数 = ${args[*]}"
@@ -8903,6 +8921,8 @@ case "$MODE" in
           echo "  compare 跑官方 minimax_h3_compare.py：默认只跑 fl2va，PyTorch 基准跑一次就复用"
           echo "    H3_TASKS=fl2va,ref2va  两个任务都跑    H3_REUSE_OURS=1  复用已有的本方片子"
           echo "    H3_FORCE_REF=1  强制重跑基准          LEGACY_GPUS=0,1,2,3  基准用的卡"
+          echo "    LEGACY_MEM_FRAC=0.82  显存分数       LEGACY_TEXT_GPUS / LEGACY_TRANSFORMER_GPUS"
+          echo "      后两个必须成对；不写就是「--legacy-gpus 一劈两半」，DiT 只拿后半"
           echo "  report  只算 SSIM / 尺寸 / 帧数，不生成、不占卡（两条片子都得先在 compare 目录里）"
           echo "  段错误还在就开 H3_SERIAL=1（同步 launch，崩点精确到单次 dispatch；=2 更彻底但更慢）" ;;
 esac
