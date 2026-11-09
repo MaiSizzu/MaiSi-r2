@@ -484,9 +484,29 @@ setup_fast_pylibs() {
   [ -n "$zip" ] || zip=$(ls -t "$AFS"/pylibs*.zip "$AFS"/dl/pylibs*.zip 2>/dev/null | head -1)
 
   local t0=$SECONDS
-  rm -rf "$dst" 2>/dev/null
-  # mkdir 失败也要说话：静默 return 会让这一单又回 AFS 导包，日志里看不出原因
-  mkdir -p "$dst" 2>/dev/null || { say "  !! 本地副本建不出来（$dst），这一单仍从 AFS 导入"; return 0; }
+  # 建目录时多试几个位置。11-09 的 compare 单：
+  #   /dev/shm/h3pylibs.651c52a466d66052.v1 建不出来 → 整单从 AFS 导包，
+  #   processor 预检 + SSIM 依赖两段各白等 6 分钟，setup 从 325s 涨到 1809s。
+  #   再叠上 124 帧 × 50 步的生成，必然撞 3000s 上限。
+  # 最常见的原因是上一单留下的同名目录属主是别人（AFS 上到处是 nobody），
+  # rm 删不掉、mkdir 报 EEXIST。所以带 uid 再来一次，最后退 /tmp。
+  local u cand err built="" first=$dst
+  u=$(id -u 2>/dev/null || echo 0)
+  for cand in "$dst" "$shmb/h3pylibs.${stamp}.u${u}.v1" "/tmp/h3pylibs.${stamp}.v1"; do
+    [ -n "$cand" ] || continue
+    rm -rf "$cand" 2>/dev/null
+    if err=$(mkdir -p "$cand" 2>&1); then
+      built=$cand
+      break
+    fi
+    say "  !! $cand 建不出来：${err:-未知}"
+  done
+  if [ -z "$built" ]; then
+    say "  本地副本一个位置都建不出来，这一单仍从 AFS 导入（会慢 5~15 分钟）"
+    return 0
+  fi
+  dst=$built
+  [ "$dst" = "$first" ] || say "  本地副本改用 $dst"
   say "  建本地导入副本 $dst（解包一次，之后每单导入省 5~10 分钟）"
   if [ -n "$zip" ] && [ -f "$zip" ]; then
     python3 - "$zip" "$dst" >/dev/null 2>&1 <<'PY'
@@ -508,7 +528,7 @@ PY
   touch "$dst/.ok" 2>/dev/null
   export PYLIBS_X=$dst
   export PYTHONPATH="$dst${PYTHONPATH:+:$PYTHONPATH}"
-  say "  本地副本就绪（$((SECONDS - t0))s）：这两条链之后都从 /dev/shm 导入"
+  say "  本地副本就绪（$((SECONDS - t0))s）：这两条链之后都从本地盘导入，不碰 AFS"
 }
 
 ensure_deps() {
@@ -4557,11 +4577,71 @@ def _patch_canvas_size():
     return True
 
 
+_SDPA_PATCHED = False
+
+
+def _patch_torch_sdpa():
+    """把 torch 的 SDPA 分派器钉在 math 分支上。
+
+    diffusers 那条路（VAE 的 dispatch_attention_fn）由
+    DIFFUSERS_ATTN_BACKEND=_native_math 解决；但 transformers 的 Qwen3-VL
+    视觉塔是另一条完全独立的路，diffusers 的开关对它一点作用都没有：
+
+        modeling_qwen3_vl.get_image_features -> self.visual
+          -> integrations/sdpa_attention.sdpa_attention_forward
+             -> torch.nn.functional.scaled_dot_product_attention
+
+    本平台的 torch 是 ROCm 版、flash_sdp 默认开着，而 flash_attn_2_cuda*.so
+    根本不存在，于是首帧图片一进视觉塔就抛：
+
+        RuntimeError: No matching libraries found for flash_attn_2_cuda*.so
+
+    11-09 compare 那单就是这么死的：文本塔 2.7s 崩掉，DiT 一步没跑。
+    视觉塔序列只有几百 token，math 实现的额外开销在整轮里可以忽略，
+    但换来的是这条路彻底不碰 flash。
+    """
+    global _SDPA_PATCHED
+    if _SDPA_PATCHED:
+        return False
+    try:
+        import torch
+    except Exception as exc:  # noqa: BLE001
+        print(f"[h3] 没装 SDPA 后端补丁：import torch 失败 {type(exc).__name__}: {exc}", flush=True)
+        return False
+    b = getattr(torch.backends, "cuda", None)
+    if b is None:
+        print("[h3] 没装 SDPA 后端补丁：torch.backends.cuda 不存在", flush=True)
+        return False
+    # 先关 flash，再关 mem_efficient，最后确认 math 开着。顺序不影响结果，
+    # 关键是 flash 关掉之后分派器才会落到 math 上。
+    for name, enable in (("enable_flash_sdp", False),
+                         ("enable_mem_efficient_sdp", False),
+                         ("enable_math_sdp", True)):
+        fn = getattr(b, name, None)
+        if fn is None:
+            continue
+        try:
+            fn(enable)
+        except Exception:  # noqa: BLE001
+            pass
+    _SDPA_PATCHED = True
+    print(
+        "[h3] torch SDPA 只留 math（已关 flash / mem_efficient："
+        "transformers 视觉塔不再去找 flash_attn_2_cuda）",
+        flush=True,
+    )
+    return True
+
+
 def apply() -> bool:
     """每一步独立成败：任何一步挂了，剩下的照装，绝不整体放弃。"""
     global _APPLIED
     if _APPLIED:
         return True
+
+    # 必须排在 import transformers 之前：视觉塔一 forward 就调 torch SDPA，
+    # 而分派器的后端选择在进程级别，越早钉住越不会漏掉第一条路径。
+    _patch_torch_sdpa()
 
     try:
         import transformers  # noqa: F401
