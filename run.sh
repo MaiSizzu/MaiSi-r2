@@ -412,11 +412,19 @@ setup_fast_pylibs() {
   fi
   if [ -n "${PYLIBS_X:-}" ]; then
     # 已经设过就不要再往 PYTHONPATH 前面拼一遍（这函数会被调好几次）
-    case ":${PYTHONPATH:-}:" in
-      *":$PYLIBS_X:"*) : ;;
-      *) export PYTHONPATH="$PYLIBS_X${PYTHONPATH:+:$PYTHONPATH}" ;;
-    esac
-    return 0
+    # 但要先确认真在：/dev/shm 每个作业都是新的，环境里若残留上一单的路径，
+    # 静默复用等于把 PYTHONPATH 指到一个不存在的目录 —— 两条链又悄悄回 AFS 导包，
+    # 而日志里一句提示都没有（11-09 03:18 那单就是这样：两遍 import 白等 800 秒）。
+    if [ -d "$PYLIBS_X/transformers" ]; then
+      say "  本地盘副本复用：$PYLIBS_X（不碰 AFS）"
+      case ":${PYTHONPATH:-}:" in
+        *":$PYLIBS_X:"*) : ;;
+        *) export PYTHONPATH="$PYLIBS_X${PYTHONPATH:+:$PYTHONPATH}" ;;
+      esac
+      return 0
+    fi
+    say "  本地导入副本：环境里的 PYLIBS_X=$PYLIBS_X 已不存在（新容器的 /dev/shm 是空的），重建"
+    PYLIBS_X=
   fi
   if [ -z "${PYLIBS:-}" ]; then
     say "  !! 本地导入副本：PYLIBS 还是空的（调用点太早），这一单仍从 AFS 导入"
@@ -452,7 +460,8 @@ setup_fast_pylibs() {
 
   local t0=$SECONDS
   rm -rf "$dst" 2>/dev/null
-  mkdir -p "$dst" 2>/dev/null || return 0
+  # mkdir 失败也要说话：静默 return 会让这一单又回 AFS 导包，日志里看不出原因
+  mkdir -p "$dst" 2>/dev/null || { say "  !! 本地副本建不出来（$dst），这一单仍从 AFS 导入"; return 0; }
   say "  建本地导入副本 $dst（解包一次，之后每单导入省 5~10 分钟）"
   if [ -n "$zip" ] && [ -f "$zip" ]; then
     python3 - "$zip" "$dst" >/dev/null 2>&1 <<'PY'
