@@ -4633,6 +4633,86 @@ def _patch_torch_sdpa():
     return True
 
 
+_VAE_FP32_PATCHED = False
+
+
+def _vae_fp32_wanted() -> bool:
+    """H3_VAE_FP32 默认开；只有显式写 0/off/false/no 才退回原来的 bf16 解码。"""
+    return os.environ.get("H3_VAE_FP32", "1").strip().lower() not in (
+        "0",
+        "off",
+        "false",
+        "no",
+    )
+
+
+def _patch_vae_fp32():
+    """把视频 VAE 的解码精度拉回 fp32。
+
+    diffusers 自己就警告过这件事，两条日志里都能看到同一条：
+
+        There are modules in AutoencoderKLMiniMaxH3 that should be kept in
+        float32: ['encoder','quant_conv','norm1','norm2','norm_out',
+        'scale1','scale2']. Casting directly with `to()` can lead to
+        inconsistent results
+
+    `_keep_in_fp32_modules` 就是那个「别动我」的名单，但
+    `examples/minimax_h3.py:513` 在 load_components 之后又补了一句
+
+        pipe.vae.to(device=execution_device, dtype=DTYPE)
+
+    等于把名单整个作废，解码器全变 bf16。bf16 只有 8 位尾数，ViT 解码器
+    最后几层一旦数值放大就压不住，出片表现为成片的青/橙/绿色块。
+
+    证据（11-09 那对比对，两条片同条件）：
+        高饱和像素总数   PyTorch 391,423   我们 365,216
+        逐帧峰值         10,441 @116 帧    9,374 @44 帧
+        出现色斑的帧数   113/124           113/124
+        掩膜空间 IoU 平均 0.19（同区域，不是随机散布）
+    → 两边都坏，且坏在同一个地方，说明是共享的上游代码，不是算子替换。
+
+    修法：解码前把整个视频 VAE 转成 fp32。`decode()` 里那句
+    `z = z.to(get_parameter_dtype(self.post_quant_conv))` 会自动跟上，
+    latent 也就跟着进 fp32，避开了 bf16 解码的溢出。
+
+    只动视频 VAE，不动 audio_vae：色块是像素问题，音频这条路没有再冒险。
+    解码本来就只有 4s 量级，fp32 多出来的开销在整轮里可以忽略。
+    """
+    global _VAE_FP32_PATCHED
+    if _VAE_FP32_PATCHED:
+        return False
+    if not _vae_fp32_wanted():
+        print("[h3] H3_VAE_FP32=0：视频 VAE 保持 bf16 解码（会有彩色过饱和块）", flush=True)
+        return False
+    try:
+        import torch
+        from diffusers.models.autoencoders.autoencoder_kl_minimax_h3 import (
+            AutoencoderKLMiniMaxH3 as _VAE,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[h3] 没装 VAE fp32 补丁：{type(exc).__name__}: {exc}", flush=True)
+        return False
+
+    orig = _VAE.decode
+    if getattr(orig, "_h3_vae_fp32", False):
+        return True
+
+    def decode(self, z, return_dict=True):
+        weight = getattr(getattr(self, "post_quant_conv", None), "weight", None)
+        if weight is not None and weight.dtype != torch.float32:
+            self.to(dtype=torch.float32)
+            print(
+                "[h3] 视频 VAE 解码改用 fp32（原 bf16 会让终帧过饱和出彩色块）",
+                flush=True,
+            )
+        return orig(self, z, return_dict=return_dict)
+
+    decode._h3_vae_fp32 = True
+    _VAE.decode = decode
+    _VAE_FP32_PATCHED = True
+    return True
+
+
 def apply() -> bool:
     """每一步独立成败：任何一步挂了，剩下的照装，绝不整体放弃。"""
     global _APPLIED
@@ -4642,6 +4722,10 @@ def apply() -> bool:
     # 必须排在 import transformers 之前：视觉塔一 forward 就调 torch SDPA，
     # 而分派器的后端选择在进程级别，越早钉住越不会漏掉第一条路径。
     _patch_torch_sdpa()
+
+    # VAE 精度和 processor 无关，但 full 与 compare 两条路都要它，
+    # 所以放在 transformers 那段之前，避免被下面的提前 return 漏掉。
+    _patch_vae_fp32()
 
     try:
         import transformers  # noqa: F401
