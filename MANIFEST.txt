@@ -1,10 +1,12 @@
-package songshan-fl2va-hygon-r2 ; date 2026-11-09 ; files 8675
+package songshan-fl2va-hygon-r2 ; date 2026-11-09 ; files 8677
 InfiniCore f32e2fbb2a9b2ca912b5711f4f3836c403196a74 ; InfiniLM 65deb91f840ebaef752d028fad2f3217ce0950f4 ; ninetoothed da3078814e92fbad1f45a90c446244bd680d4fad
 .gitattributes
 .gitignore
 BUILD.md
 README.md
+REPRODUCE.md
 env/dcu_env.sh
+env/h3.env.example
 env/paths.env
 env/requirements.lock
 evidence/blockdim-before-after.diff

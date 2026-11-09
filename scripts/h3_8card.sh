@@ -1,7 +1,7 @@
 #!/bin/bash
 # h3_8card.sh — 8 卡 FL2VA 一键编排（自检 / 冒烟 / 正式 / 性能落表）
 #
-# 用法（在包根目录 /work2/songshan/MaiSi-r2 下执行）：
+# 用法（在包根目录 $PWD 下执行）：
 #   bash scripts/h3_8card.sh check      # 只读自检，几秒，不烧卡
 #   bash scripts/h3_8card.sh smoke      # 8 卡冒烟：256x256 / 8 帧 / 2 步
 #   bash scripts/h3_8card.sh full       # 8 卡正式：124 帧 / 50 步

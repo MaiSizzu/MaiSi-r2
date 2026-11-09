@@ -5,7 +5,7 @@
 #SBATCH --gres=dcu:4
 #SBATCH --cpus-per-task=32
 #SBATCH -t 08:00:00
-#SBATCH -o /work2/songshan/run_fl2va.log
+#SBATCH -o run_fl2va.log
 #
 # FL2VA end-to-end inference: first frame + text prompt -> video.
 # The official baseline uses 4 GPUs. A single DCU cannot hold the transformer
@@ -15,8 +15,8 @@
 
 set -o pipefail
 
-PKG=${PKG:-/work2/songshan/MaiSi-r2}
-SS=${SS:-/work2/songshan}
+PKG=${PKG:-$PWD}
+SS=${SS:-$PKG}
 
 source "$PKG/env/dcu_env.sh"
 source "$PKG/env/paths.env"

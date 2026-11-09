@@ -160,7 +160,21 @@ export GIT_CONFIG_NOSYSTEM=1
 export GIT_CONFIG_GLOBAL=${GIT_CONFIG_GLOBAL:-$AFS/.gitconfig}
 export GIT_TERMINAL_PROMPT=0
 
-PKG=$AFS/MaiSi-r2
+# ---------- 包根目录 ----------
+# 三个来源，按可信度排：
+#   1) H3_PKG 显式指定（包被放在非默认位置时用）
+#   2) run.sh 自己就在包根目录（评委 clone 后直接 bash run.sh，或整包被上传）
+#   3) $AFS/MaiSi-r2（平台上从 24 MB tar 包解出来的那份）
+# 少了第 2 条，评委 clone 下来跑会直接死在 ensure_pkg：
+#   PKG 恒等于 $AFS/MaiSi-r2，而他自己的 AFS 里并没有那个 tar 包。
+SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)
+if [ -n "${H3_PKG:-}" ]; then
+  PKG=$H3_PKG; PKG_FROM=H3_PKG
+elif [ -n "$SELF_DIR" ] && [ -d "$SELF_DIR/src/InfiniLM" ] && [ -d "$SELF_DIR/src/InfiniCore" ]; then
+  PKG=$SELF_DIR; PKG_FROM="run.sh 所在目录"
+else
+  PKG=$AFS/MaiSi-r2; PKG_FROM=AFS
+fi
 INFINI=$AFS/infini
 OUT=$AFS/outputs
 PYLIBS=$AFS/pylibs
@@ -367,7 +381,14 @@ find_model() {
 }
 
 say "定位模型权重"
-MODEL_ROOT=$(find_model)
+# 显式传进来的 MODEL_ROOT 优先：评委环境的权重不在我们那几条候选路径上，
+# 之前无条件用 find_model 覆盖，等于 paths.env 里写的 MODEL_ROOT 从来没生效过。
+if [ -n "${MODEL_ROOT:-}" ] && { [ -f "$MODEL_ROOT/model_index.json" ] || [ -f "$MODEL_ROOT/diffusers/model_index.json" ]; }; then
+  echo "  用环境变量 MODEL_ROOT（跳过自动搜索）"
+else
+  [ -n "${MODEL_ROOT:-}" ] && echo "  !! 传入的 MODEL_ROOT=$MODEL_ROOT 里没有 model_index.json，改为自动搜索"
+  MODEL_ROOT=$(find_model)
+fi
 if [ -n "$MODEL_ROOT" ]; then
   echo "  MODEL_ROOT = $MODEL_ROOT"
   ls -la "$MODEL_ROOT" 2>/dev/null | head -12 | sed 's/^/    /'
@@ -379,6 +400,7 @@ else
 fi
 
 say "定位代码包"
+echo "  PKG     = $PKG（来源：$PKG_FROM）"
 TARBALL=""
 for c in "$AFS/MaiSi-r2-full.tar.gz" "$AFS/pkg/MaiSi-r2-full.tar.gz" "$AFS/MaiSi-r2.tar.gz" \
          "./MaiSi-r2-full.tar.gz" "$AFS/MaiSi-r2.tgz"; do
@@ -410,12 +432,50 @@ hr
 # =============================================================================
 # 3. 各模式
 # =============================================================================
+# 包里没有源码树、AFS 上也没有 tar 包时的最后一条路：直接从仓库拉。
+# 评委按报告里的仓库地址复现时走的就是这条 —— 他只 clone 了仓库（或只上传了 run.sh），
+# 手上没有那个 24 MB 的 MaiSi-r2-full.tar.gz，而 PKG 默认指向 $AFS/MaiSi-r2。
+# 注意这里**不做 rm -rf**：只有 $PKG 完全不存在时才落盘；已存在但不是包就报错交人工。
+fetch_pkg_from_repo() {
+  local url=${H3_REPO_URL:-https://github.com/MaiSizzu/MaiSi-r2.git}
+  local br=${H3_REPO_BRANCH:-main}
+  local dst="$PKG.clone"
+  command -v git >/dev/null 2>&1 || { say "  !! 环境里没有 git，无法自动拉取"; return 1; }
+  if [ -e "$PKG" ]; then
+    say "  !! $PKG 已存在但不是完整包（缺 src/InfiniCore），不覆盖，请人工确认"
+    return 1
+  fi
+  say "  尝试从 $url（$br，浅克隆）拉代码到 $PKG"
+  mkdir -p "$(dirname "$PKG")" 2>/dev/null
+  rm -rf "$dst" 2>/dev/null
+  GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 \
+    timeout 300 git clone --depth 1 --branch "$br" "$url" "$dst" 2>&1 | tail -6
+  if [ -d "$dst/src/InfiniCore" ] && [ -d "$dst/src/InfiniLM" ]; then
+    if mv "$dst" "$PKG" 2>/dev/null; then
+      PKG_FROM="git clone"
+      say "  已拉到 $PKG"
+      return 0
+    fi
+    say "  !! 拉下来了但挪不到 $PKG"
+    return 1
+  fi
+  rm -rf "$dst" 2>/dev/null
+  say "  !! 拉取失败（网络不通或仓库不可访问）"
+  return 1
+}
+
 ensure_pkg() {
   if [ -d "$PKG/src/InfiniLM" ] && [ -d "$PKG/src/InfiniCore" ]; then
-    say "代码包已解包，跳过"
+    say "代码包已解包，跳过（$PKG）"
     return 0
   fi
-  [ -n "$TARBALL" ] || die "AFS 里找不到 MaiSi-r2-full.tar.gz，请先上传到「个人存储」"
+  if [ -z "$TARBALL" ]; then
+    fetch_pkg_from_repo && return 0
+    die "没有可用的代码包：$PKG 下没有 src/，AFS 里也没有 MaiSi-r2-full.tar.gz，且从仓库拉取失败。
+     三种解法任选：① 在仓库根目录直接 bash run.sh（本脚本会把自己所在目录当 PKG）；
+                    ② 把整包放到 \$AFS/MaiSi-r2 或设置 H3_PKG=<包路径>；
+                    ③ 把 MaiSi-r2-full.tar.gz 上传到持久盘根目录。"
+  fi
   say "解包 $TARBALL → $AFS （约 150 MB / 8668 个文件，需要 1-3 分钟）"
   tar xzf "$TARBALL" -C "$AFS" || die "解包失败"
   [ -d "$PKG/src/InfiniLM" ] || die "解包后仍找不到 $PKG/src/InfiniLM"

@@ -7,7 +7,7 @@
 
 | 项 | 值 |
 | --- | --- |
-| DTK | 25.04.1（`$DTK_ROOT=/public/software/compiler/dtk-25.04.1`） |
+| DTK | 25.10（`run.sh` 自动探测 `$DTK_ROOT`；`env/dcu_env.sh` 里保留的 `dtk-25.04.1` 是早期路径，照抄前先确认该目录存在） |
 | 编译器 | hipcc（`$DTK_ROOT/hip/bin`），host 侧 g++ / clang++ |
 | 构建系统 | xmake >= 3.1.2 |
 | 九齿 | ninetoothed 0.26.0 |

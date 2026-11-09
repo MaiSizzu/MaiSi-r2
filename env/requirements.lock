@@ -1,3 +1,5 @@
+# 注意：下面 torch / triton 是海光专用 wheel，原始 URL 指向提交方账号下的目录（xdzs2026_b0408/whl）。
+# 换环境复现时请替换成你环境里对应的 wheel，或直接用平台预装的 torch —— 这两个包不是本包产物。
 accelerate==1.15.0
 annotated-doc==0.0.5
 annotated-types==0.8.0

@@ -10,10 +10,13 @@
     patch_inc/              海光工具链的 CUB 兼容头（需加入 include 路径）
     env/ scripts/ evidence/
     run.sh                  平台唯一入口（InfiniFabric / 无 Slurm）
+    REPRODUCE.md            给评审的复现指南：前置条件、三条路径、失败对照
     BUILD.md                构建细节 + 两个平台适配 shim 的接线方式
     MANIFEST.txt            文件清单 8673 条（package / date / files 头行 + 路径）
 
 ## 快速开始（InfiniFabric，无 sbatch）
+
+> 评审先看 **REPRODUCE.md**：里面有前置条件清单、三种起跑方式，以及每条失败信息对应的处理。
 
     export IFAB_AFS_HOME=<持久盘目录>          # 每单必设，外层没有 $AFS
     cp $IFAB_AFS_HOME/run.sh .                 # 平台会把工作区的 run.sh 还原成旧版
@@ -116,14 +119,21 @@ flash_attention 被 `--flash-attn` 门控挡在编译之外——这三条都**�
 
 ## Dependencies
 
-Python packages: 见 `env/requirements.lock`。Toolchain: DTK 25.04.1（hipcc）、
+Python packages: 见 `env/requirements.lock`。Toolchain: DTK 25.10（hipcc，`run.sh`
+自动探测 `$DTK_ROOT`；`env/dcu_env.sh` 里的 `dtk-25.04.1` 是早期路径）、
 xmake >= 3.1.2、ninetoothed 0.26.0。CUB 兼容头在 `patch_inc/`，需加入编译 include 路径。
 
 ## Model and data paths
 
-All paths are configurable, no hardcoded absolute path exists in code or scripts:
+所有权重与数据路径都可以用环境变量覆盖。脚本里的默认值只是提交方环境的兜底，
+换环境时请显式设置：
 
-    source env/paths.env      # MODEL_ROOT, FIRST_FRAME, OUTPUT_DIR, NUM_FRAMES, STEPS, GPUS
+    export MODEL_ROOT=/path/to/MiniMax-H3/FL2VA   # 必设：权重不在包里
+    source env/paths.env                          # FIRST_FRAME / OUTPUT_DIR / NUM_FRAMES / STEPS
+
+`MODEL_ROOT` 优先于脚本内部的自动搜索（`$SHARED/MiniMax-H3/...`）；
+不设的时候脚本会去找 `$SHARED/MiniMax-H3/FL2VA` 等候选，而 `SHARED` 的默认值
+指向提交方所在组的共享目录，在别的环境里不存在。
 
 Weights are not included (~135 GB FL2VA checkpoint). `MODEL_ROOT` must point to a
 diffusers-style directory containing `model_index.json` and the transformer weights.

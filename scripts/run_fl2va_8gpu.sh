@@ -5,7 +5,7 @@
 #SBATCH --gres=dcu:8
 #SBATCH --cpus-per-task=64
 #SBATCH -t 04:00:00
-#SBATCH -o /work2/songshan/run_fl2va_8gpu.%j.log
+#SBATCH -o run_fl2va_8gpu.%j.log
 #
 # FL2VA 端到端推理（8 卡版）。相对 run_fl2va.sh 的改动只有三处：
 #   1. --gres=dcu:4 -> dcu:8
@@ -18,8 +18,8 @@
 
 set -o pipefail
 
-PKG=${PKG:-/work2/songshan/MaiSi-r2}
-SS=${SS:-/work2/songshan}
+PKG=${PKG:-$PWD}
+SS=${SS:-$PKG}
 GPUS=${GPUS:-0,1,2,3,4,5,6,7}
 
 source "$PKG/env/dcu_env.sh"
