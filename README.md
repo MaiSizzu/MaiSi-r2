@@ -12,7 +12,7 @@
     run.sh                  平台唯一入口（InfiniFabric / 无 Slurm）
     REPRODUCE.md            给评审的复现指南：前置条件、三条路径、失败对照
     BUILD.md                构建细节 + 两个平台适配 shim 的接线方式
-    MANIFEST.txt            文件清单 8677 条（package / date / files 头行 + 路径）
+    MANIFEST.txt            文件清单 8594 条（对应提交内容 8595 个文件，不含清单自身）
 
 ## 快速开始（InfiniFabric，无 sbatch）
 
@@ -178,4 +178,4 @@ DTK / venv / OUTPUT_DIR 可用环境变量覆盖）：
     evidence/blockdim-before-after.diff   blockDim 启动参数改前/改后
     evidence/mp4-probe.txt                出片实测元信息（ffmpeg 原始输出）
     BUILD.md                              构建、shim 接线与自检
-    MANIFEST.txt                          文件清单（2026-11-09，8677 条）
+    MANIFEST.txt                          文件清单（2026-11-09，8594 条）
