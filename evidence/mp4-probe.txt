@@ -1,0 +1,22 @@
+# 出片元信息（ffmpeg -i 原始输出摘录）
+# 生成时间 2026-11-09；本机无 ffprobe，用 imageio_ffmpeg 自带的 ffmpeg 读容器信息
+
+## fl2va_124f_50s.mp4
+bytes 711997  md5 2d7ceff791d9fdbe693c09b4f02bfbb9
+  Duration: 00:00:05.18, start: 0.000000, bitrate: 1100 kb/s
+  Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), yuv420p(progressive), 256x320, 965 kb/s, 24 fps, 24 tbr, 12288 tbn (default)
+
+## fl2va_smoke.mp4
+bytes 750588  md5 fa432207ef49cdfde66f61e5113f0680
+  Duration: 00:00:05.18, start: 0.000000, bitrate: 1160 kb/s
+  Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), yuv420p(progressive), 256x256, 1027 kb/s, 24 fps, 24 tbr, 12288 tbn (default)
+
+## infinilm_fl2va.mp4
+bytes 711997  md5 2d7ceff791d9fdbe693c09b4f02bfbb9
+  Duration: 00:00:05.18, start: 0.000000, bitrate: 1100 kb/s
+  Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), yuv420p(progressive), 256x320, 965 kb/s, 24 fps, 24 tbr, 12288 tbn (default)
+
+# 说明
+# fl2va_124f_50s.mp4   8 卡 full 产物，124 帧 / 24 fps / 5.18 s / 256x320
+# fl2va_smoke.mp4      smoke 产物（256x256，画布比例修正前的版本）
+# infinilm_fl2va.mp4   与 fl2va_124f_50s.mp4 逐字节相同（平台回传副本，md5 相同）
