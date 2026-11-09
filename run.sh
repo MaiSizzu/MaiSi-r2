@@ -254,6 +254,19 @@ load_flags_file "$AFS/h3.env"
 export DIFFUSERS_ATTN_BACKEND="${DIFFUSERS_ATTN_BACKEND:-_native_math}"
 say "diffusers attention backend = $DIFFUSERS_ATTN_BACKEND（VAE 解码走这条；native 会去要 flash 库）"
 
+# ---------- 画布短边 ----------
+# 模型设计画布是短边 768（resolve_canvas_size 的 canvas_short_edge，面积上限
+# 768*1344），但 3000 秒装不下：DiT 的 attention 随 token 数平方涨，
+# 256 短边实测 2 步 26.7s，按面积外推 768 就是每步上百秒、50 步上万秒。
+# 往 256 压之后，124 帧 / 50 步 / seed 42 与模板一致，只有分辨率不同
+# （模板没规定分辨率，但报告里要写清楚）。
+# 为什么不用 --height/--width：minimax_h3_compare.py 拼子进程命令时是写死的，
+# 不给这两个参数，命令行管不到它；而 compare 要过尺寸校验、要算 SSIM，
+# 两边必须同尺寸。所以在画布解析这一层统一（h3_proc_fix 的 _patch_canvas_size）。
+# 想换档：h3.env 里写 H3_CANVAS_SHORT=512（32 的倍数）。
+export H3_CANVAS_SHORT="${H3_CANVAS_SHORT:-256}"
+say "画布短边 = $H3_CANVAS_SHORT（默认 768；full 与 compare 都用这个，尺寸才对得上）"
+
 say "探测 DTK / 编译器"
 DTK_ROOT=${DTK_ROOT:-}
 if [ -z "$DTK_ROOT" ] || [ ! -d "$DTK_ROOT" ]; then
@@ -2480,11 +2493,13 @@ MiniMax-H3 全程只喂 keyframes（图片），从不走视频分支，所以�
 from __future__ import annotations
 
 import logging
+import os
 
 _LOG = logging.getLogger("h3.procfix")
 
 _APPLIED = False
 _VPM = None  # transformers.video_processing_utils.VideoProcessorMixin 的真类
+_CANVAS_PATCHED = False
 
 
 def _null_video_processor_class():
@@ -2612,6 +2627,46 @@ def _patch_argument_check():
     ProcessorMixin.check_argument_for_proper_class = check_argument_for_proper_class
 
 
+def _patch_canvas_size():
+    """把默认画布短边压到 H3_CANVAS_SHORT（run.sh 里默认 256）。
+
+    平台的 3000 秒装不下设计值（短边 768）：DiT 的 attention 随 token 数平方涨，
+    256 短边实测 2 步 26.7s；按面积放大 10.9 倍、S 放大 9 倍外推，50 步要上万秒。
+    full 与 compare 还必须同尺寸 —— compare 要过尺寸校验、才谈得上 SSIM，
+    而 minimax_h3_compare.py 拉起子进程时不给 --height/--width（命令是拼死的），
+    所以只能从画布解析这一层统一，命令行参数反而管不到 compare。
+
+    只改 short_edge，max_pixels 原样传回：256 短边算出来的面积远小于预算
+    （768*1344），不会触发那条按面积缩的分支。
+    """
+    global _CANVAS_PATCHED
+    short = os.environ.get("H3_CANVAS_SHORT", "").strip()
+    if not short or _CANVAS_PATCHED:
+        return False
+    n = int(short)
+    if n <= 0 or n % 32:
+        raise ValueError(f"H3_CANVAS_SHORT 必须是 32 的正整数倍，拿到 {short!r}")
+
+    import diffusers.modular_pipelines.minimax_h3.modular_pipeline as mp
+    import diffusers.modular_pipelines.minimax_h3.before_denoise as bd
+    import diffusers.modular_pipelines.minimax_h3.before_encoder as be
+
+    orig = mp.resolve_canvas_size
+
+    def patched(aspect_width, aspect_height, canvas_multiple, short_edge, max_pixels, **kw):
+        return orig(aspect_width, aspect_height, canvas_multiple, n, max_pixels, **kw)
+
+    # 三个模块各自 from ... import 绑定了这个名字，只改 modular_pipeline 不够
+    for mod in (mp, bd, be):
+        mod.resolve_canvas_size = patched
+    _CANVAS_PATCHED = True
+    print(
+        f"[h3] 画布短边已压到 {n}（默认 768；full 与 compare 都用这个，尺寸才对得上）",
+        flush=True,
+    )
+    return True
+
+
 def apply() -> bool:
     """每一步独立成败：任何一步挂了，剩下的照装，绝不整体放弃。"""
     global _APPLIED
@@ -2636,6 +2691,9 @@ def apply() -> bool:
     if null_cls is not None:
         step("AutoVideoProcessor 兜底", lambda: _patch_auto_video_processor(null_cls))
     step("类型校验兜底", _patch_argument_check)
+    # 画布尺寸和 processor 无关，但两条路都要它：full 走 h3_entry，compare 走
+    # sitecustomize，都从这里过。只有设了 H3_CANVAS_SHORT 才动手。
+    step("画布尺寸兜底", _patch_canvas_size)
 
     installed = null_cls is not None and getattr(_VPM, "__name__", "") == "VideoProcessorMixin"
     _APPLIED = installed
