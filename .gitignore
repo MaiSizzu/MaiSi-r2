@@ -11,7 +11,9 @@ __pycache__/
 xbin/
 .xbin/
 ic_work/
-infini/
+# 只忽略仓库根目录的安装前缀；不加前导斜线会连带屏蔽
+# src/InfiniCore/submodules/InfiniOps/include/infini/ 这类真实源码目录
+/infini/
 outputs/
 songshan_pkg/
 .cache/

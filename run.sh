@@ -448,12 +448,35 @@ fetch_pkg_from_repo() {
   say "  尝试从 $url（$br，浅克隆）拉代码到 $PKG"
   mkdir -p "$(dirname "$PKG")" 2>/dev/null
   rm -rf "$dst" 2>/dev/null
+  # core.longpaths：本仓库有 8600+ 文件，路径偏长；不打开时 Windows 侧检出会中断
+  # （Linux/AFS 上无副作用，git 会忽略这个仅 Windows 生效的项）
   GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 \
-    timeout 300 git clone --depth 1 --branch "$br" "$url" "$dst" 2>&1 | tail -6
+    timeout 300 git -c core.longpaths=true clone --depth 1 --branch "$br" "$url" "$dst" 2>&1 | tail -6
+
+  # 克隆退出码为 0 不等于落地成功。git clone 先写 index 再检出工作树，检出被
+  # 打断时它只打一行 warning（"Clone succeeded, but checkout failed"）就返回 0，
+  # 而 index 可能是空的：目录看着都在，实际少几百个文件，git 里全显示成 staged
+  # deletion。这种树要一直跑到 build 才炸，报错还和真正原因无关。
+  # 判据：HEAD 里的文件数 == index 里的文件数。
+  local want have
+  want=$(git -C "$dst" ls-tree -r --name-only HEAD 2>/dev/null | wc -l | tr -d ' ')
+  have=$(git -C "$dst" ls-files 2>/dev/null | wc -l | tr -d ' ')
+  if [ "${want:-0}" -gt 0 ] && [ "$have" != "$want" ]; then
+    say "  !! 检出不完整（HEAD $want 个文件，index 里 $have 个），尝试修复一次"
+    git -C "$dst" -c core.longpaths=true reset --hard HEAD >/dev/null 2>&1
+    have=$(git -C "$dst" ls-files 2>/dev/null | wc -l | tr -d ' ')
+  fi
+  if [ "${want:-0}" -eq 0 ] || [ "$have" != "$want" ]; then
+    say "  !! 克隆不完整：HEAD $want 个文件，落地 ${have:-0} 个"
+    say "     常见原因：单文件名过长、大小写冲突、磁盘满、AFS 文件数配额"
+    say "     缺失文件（前 5 个）："
+    git -C "$dst" diff --cached --name-only --diff-filter=D 2>/dev/null | head -5 | sed 's/^/       /'
+    return 1
+  fi
   if [ -d "$dst/src/InfiniCore" ] && [ -d "$dst/src/InfiniLM" ]; then
     if mv "$dst" "$PKG" 2>/dev/null; then
       PKG_FROM="git clone"
-      say "  已拉到 $PKG"
+      say "  已拉到 $PKG（$have 个文件）"
       return 0
     fi
     say "  !! 拉下来了但挪不到 $PKG"
@@ -610,7 +633,7 @@ ensure_deps() {
   if [ -z "$ZIP" ]; then
     say "!! 个人存储里没有 pylibs-py311.zip"
     say "!! 说明：本容器的 pip 会因为读 /etc/debian_version 无权限而直接崩，pip 路线不可用"
-    die "缺离线依赖包 pylibs-py311.zip（要传到「个人存储」，不是项目）"
+    die "缺离线依赖包：持久盘根目录要有 pylibs-py311-v3.zip（或 pylibs-py311-v2.zip）。容器里 pip 不可用，见 REPRODUCE.md §0.1"
   fi
 
   local ZSIZE=0
