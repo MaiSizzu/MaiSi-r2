@@ -235,6 +235,25 @@ load_flags_file() {
   echo "  开关文件 $f：生效 $n 条"
 }
 load_flags_file "$AFS/h3.env"
+
+# ---------- diffusers 的 attention 后端 ----------
+# 视频/音频 VAE 的解码不走 InfiniLM，而是 diffusers 自己的 dispatch_attention_fn
+# （autoencoder_kl_minimax_h3.py:331、autoencoder_kl_minimax_h3_audio.py:325，
+#  两处都是 backend=self._attention_backend，类属性 None → 跟随全局）。
+# 全局默认是 "native"，它只是「用 torch SDPA」的意思，具体挑哪个 kernel 由 torch 定：
+# 本平台 torch 是 ROCm 版，flash_sdp 默认开着，而 flash_attn_2_cuda*.so 并不存在，
+# 于是 scaled_dot_product_attention 在选后端时直接抛
+#     RuntimeError: No matching libraries found for flash_attn_2_cuda*.so
+# 11-09 02:13 那单就是这样倒在 VideoDecodeStep：DiT 2 步 25.4s 全跑完、allgather 也通了，
+# 只剩最后一步出片被这个 kernel 选择挡死。
+# "_native_math" 是 diffusers 现成的后端（attention_dispatch.py 的 _native_math_attention），
+# 内部就是 with sdpa_kernel(SDPBackend.MATH)，纯 matmul+softmax，不问任何 flash 库。
+# 精度上 MATH 反而更稳（softmax 内部升 f32），代价是显存换速度；VAE 解码是分块做的，
+# 单块 S 有限，扛得住。想换回去/试别的：h3.env 里写 DIFFUSERS_ATTN_BACKEND=xxx 即可，
+# 这里用的是 :- 默认值，外部设过就不覆盖。
+export DIFFUSERS_ATTN_BACKEND="${DIFFUSERS_ATTN_BACKEND:-_native_math}"
+say "diffusers attention backend = $DIFFUSERS_ATTN_BACKEND（VAE 解码走这条；native 会去要 flash 库）"
+
 say "探测 DTK / 编译器"
 DTK_ROOT=${DTK_ROOT:-}
 if [ -z "$DTK_ROOT" ] || [ ! -d "$DTK_ROOT" ]; then
@@ -4119,6 +4138,14 @@ ensure_cuda_compat() {
   if [ -d "$ovl" ]; then
     cat > "$ovl/sitecustomize.py" <<'PYEOF'
 import ctypes, os
+
+# VAE 解码走 diffusers 的 dispatch_attention_fn，默认 backend=native 会在
+# ROCm 上挑到 flash kernel，而本平台没有 flash_attn_2_cuda*.so，SDPA 直接抛
+# "No matching libraries found"。_native_math 走 sdpa_kernel(MATH)，不问 flash。
+# run.sh 主体已经 export 过一次；这里再兜一层，管的是那些把环境洗掉、
+# 或者绕过启动器直接 sys.executable 起的子进程（compare 就是这种）。
+os.environ.setdefault("DIFFUSERS_ATTN_BACKEND", "_native_math")
+
 for _p in os.environ.get("H3_CUDA_PRELOAD", "").split(":"):
     if _p and os.path.exists(_p):
         try:
