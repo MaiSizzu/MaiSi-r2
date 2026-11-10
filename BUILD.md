@@ -9,7 +9,7 @@
 | --- | --- |
 | DTK | 25.10（`run.sh` 自动探测 `$DTK_ROOT`；`env/dcu_env.sh` 里保留的 `dtk-25.04.1` 是早期路径，照抄前先确认该目录存在） |
 | 编译器 | hipcc（`$DTK_ROOT/hip/bin`），host 侧 g++ / clang++ |
-| 构建系统 | xmake >= 3.1.2 |
+| 构建系统 | xmake 3.0.7（`vendor/xmake-bundle-v3.0.7.linux.x86_64`，静态 ELF、无 PT_INTERP，任何 glibc 都能跑；3.0.8+ 改动态链接要 glibc 2.38，2.x 缺 `add_orders`） |
 | 九齿 | ninetoothed 0.26.0 |
 | 设备 | 海光 DCU，`--offload-arch=gfx936`，波前宽度 64 |
 

@@ -21,7 +21,7 @@
 
 | 件 | 在仓库里？ | 体积 | 放哪里 |
 | --- | --- | --- | --- |
-| 全部代码（含两个运行时 shim、补丁、九齿产物脚本） | **是** | 16 MB | `git clone` 即可 |
+| 全部代码（含两个运行时 shim、补丁、九齿产物脚本） | **是** | clone 下载 51 MB，展开 170 MB（`src/` 131 MB，大头是 `third_party` 与九齿产物 957 个文件） | `git clone` 即可 |
 | 离线 python 依赖 `vendor/pylibs-py311-v3.zip` | **是** | 33 MB | 已随包；不用手动解压，`run.sh` 自己解到 `$IFAB_AFS_HOME/pylibs` |
 | MiniMax-H3 FL2VA 权重 | **否** | ~135 GB | `MODEL_ROOT` 指向含 `model_index.json` 的那层 |
 | 编译工具 xmake **3.0.7**（build 的第一关） | **是** | 2.9 MB | `vendor/xmake-bundle-v3.0.7.linux.x86_64`，`run.sh` 自动启用，不用上传 |

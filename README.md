@@ -130,7 +130,8 @@ flash_attention 被 `--flash-attn` 门控挡在编译之外——这三条都**�
 
 Python packages: 见 `env/requirements.lock`。Toolchain: DTK 25.10（hipcc，`run.sh`
 自动探测 `$DTK_ROOT`；`env/dcu_env.sh` 里的 `dtk-25.04.1` 是早期路径）、
-xmake >= 3.1.2、ninetoothed 0.26.0。CUB 兼容头在 `patch_inc/`，需加入编译 include 路径。
+xmake **3.0.7**（静态版随包在 `vendor/`，`run.sh` 自动启用；3.0.8 起官方改成动态链接、
+要 glibc 2.38，容器里跑不起来；2.x 缺 `add_orders` 也不行）、ninetoothed 0.26.0。CUB 兼容头在 `patch_inc/`，需加入编译 include 路径。
 
 ## Model and data paths
 
@@ -185,4 +186,4 @@ DTK / venv / OUTPUT_DIR 可用环境变量覆盖）：
     evidence/blockdim-before-after.diff   blockDim 启动参数改前/改后
     evidence/mp4-probe.txt                出片实测元信息（ffmpeg 原始输出）
     BUILD.md                              构建、shim 接线与自检
-    MANIFEST.txt                          文件清单（2026-11-09）
+    MANIFEST.txt                          文件清单（2026-11-10）
