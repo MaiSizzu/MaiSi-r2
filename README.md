@@ -8,7 +8,8 @@
     src/InfiniLM            minimax_h3
     patches/                源码补丁 + 九齿 blockDim 修正脚本
     patch_inc/              海光工具链的 CUB 兼容头（需加入 include 路径）
-    env/ scripts/ evidence/  evidence/ 内含出片 mp4、mp4-probe、自测日志、blockDim diff
+    env/ scripts/            环境变量、工具脚本
+    evidence/               出片 mp4、mp4-probe、自测日志、blockDim diff
     vendor/                 离线依赖包 33 MB + xmake 3.0.7 静态版 2.9 MB（都随包自带）
     run.sh                  平台唯一入口（InfiniFabric / 无 Slurm）
     REPRODUCE.md            给评审的复现指南：前置条件、三条路径、失败对照

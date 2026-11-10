@@ -14,7 +14,8 @@
 | 编译产物 | `$IFAB_AFS_HOME/infini/lib/libinfinicore_cpp_api.so` 等；**首次跑 `bash run.sh build` 生成**（冷编约 40 分钟，增量 1~2 分钟） | `bash run.sh check` 里「结论」那一行 |
 | 磁盘 | 持久盘 ≥ 30 GB 可用（编译树 + 出片 + 日志） | `df -h` |
 
-只有权重**不在仓库里**（官方模型，~135 GB，需自备）。依赖包随包，编译产物由脚本生成。
+仓库里已含**代码、离线依赖包、xmake**；需要外部提供的只有两件：
+**权重**（官方模型，~135 GB，需自备）与**编译产物**（`bash run.sh build` 生成，不随包）。
 
 ## 0.1 最小可跑集（缺一项都跑不起来）
 
@@ -25,7 +26,6 @@
 | MiniMax-H3 FL2VA 权重 | **否** | ~135 GB | `MODEL_ROOT` 指向含 `model_index.json` 的那层 |
 | 编译工具 xmake **3.0.7**（build 的第一关） | **是** | 2.9 MB | `vendor/xmake-bundle-v3.0.7.linux.x86_64`，`run.sh` 自动启用，不用上传 |
 | 编译产物 `infini/lib/*.so` + `_infinicore*.so` + `_infinilm.so` | **否**，脚本生成 | 149 MB | `bash run.sh build`（冷编约 40 分钟，增量 1~2 分钟） |
-| MiniMax-H3 FL2VA 权重 | **否** | ~135 GB | `MODEL_ROOT` 指向含 `model_index.json` 的那层 |
 
 **外部需要准备两件**：权重、编译产物。第二件由脚本生成，实际只需一条命令。
 
@@ -43,9 +43,8 @@ musl 静态链接，任何 glibc 都能跑）随包自带，`run.sh` 在持久�
 必须是 3.0.x（2.x 缺 `add_orders`），也别用 3.0.8+（改成动态链接 glibc 2.38，容器跑不起来）。
 只有 `build` 需要它；`check` / `setup` / 用现成产物跑 `compare` 都不碰。
 
-   三条全不满足时 `run.sh:2779` 会停在这里并打印上面这段指引，不会白跑 40 分钟。
-   **注意**：这一步只在真正编译（`bash run.sh build`）时才需要，跑 `check`、`setup`、`compare`
-   （用现成产物时）都不碰它。
+万一 `vendor/` 那份被删、系统里又只有 2.x，`build` 会在 `ensure_xmake` 处停下并打印上面这段指引
+（不会白跑 40 分钟）；按提示把静态包 cp 到持久盘根目录即可。
 
 依赖包为什么是个 zip 而不是 requirements：容器里 `pip` 读 `/etc/debian_version` 就崩，
 装不了任何东西，所以把一套已验证可用的 site-packages 打成 zip，`run.sh` 只解压、
