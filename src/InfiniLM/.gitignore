@@ -34,3 +34,9 @@ __pycache__/
 *.http
 
 *.nsys-rep
+
+# third_party 是上游子模块的原始树：CMakeLists.txt、LICENSES/*.txt、CI 脚本
+# 都必须完整随包 —— xmake 虽然只用头文件，但分发第三方代码要带许可证，
+# 而且评审若改用 cmake 构建也需要这些 CMakeLists。
+# 上面那些 *.txt / *.json / *.sh / *.log 只针对本目录自身的产物与导出文件。
+!third_party/**
