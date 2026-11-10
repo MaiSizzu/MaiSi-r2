@@ -1,8 +1,24 @@
-# vendor/ —— 离线 python 依赖包
+# vendor/ —— 离线依赖与编译工具
 
-    pylibs-py311-v3.zip    33 MB，5,378 个文件，解压后是一套可直接 import 的 site-packages
+    pylibs-py311-v3.zip                    33 MB，5,378 个文件，解压后是一套可直接 import 的 site-packages
+    xmake-bundle-v3.0.7.linux.x86_64      2.9 MB，musl 静态链接的 xmake 3.0.7，`build` 的第一关
 
-## 为什么是这个形式
+## xmake 为什么也在这里
+
+容器里没有 xmake，仓库里原本只有 `xmake.lua` 配置。`build` 走到 `ensure_xmake` 时若找不到
+3.x 就直接 `die`，而这一步在评审的复现路径上出现得极早（`build` 开头），却长期没被写进
+任何文档——等于「文档说四件就够，实际跑起来第五关就停」。
+
+官方 bundle 只有 2.9 MB，塞进 `vendor/` 的成本比让评审去下载/编译低得多。选 **3.0.7**
+是因为：3.0.8 起官方改成动态链接 glibc 2.38，容器里 glibc 更旧，会报
+`GLIBC_2.38 not found`；3.0.4~3.0.7 是 musl 静态单文件，任何 glibc 都能跑。2.x 则缺
+`add_orders`，本项目用了它，会直接报错。
+
+`ensure_xmake` 的查找顺序：持久盘 `$IFAB_AFS_HOME/xmake-bundle-*` → `$AFS/dl/` →
+**本目录（`vendor/`）** → 兜底扫描 `$AFS/xmake*`。找到多个时按版本号从高到低逐个试运行，
+能起来的那份才用。想覆盖成别的版本，把文件放持久盘根目录即可，那里优先级更高。
+
+## 依赖包为什么是这个形式
 
 目标容器里 `pip` 用不了：读 `/etc/debian_version` 就抛异常（无权限），`pip install`
 任何包都直接崩，也没有可用的内网源。但推理需要 diffusers 0.42 / transformers 5.x /

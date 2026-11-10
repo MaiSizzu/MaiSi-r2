@@ -2703,12 +2703,16 @@ ensure_xmake() {
   # "GLIBC_2.38 not found"），只有 v3.0.4~v3.0.7 是 musl 静态单文件、任何 glibc 都能跑。
   # → 从高版本往下逐个试跑，能起来的那份才用。
   local CANDS="" sz
+  # 除持久盘外也看仓库自带的 vendor/：xmake 静态版只有 2.9 MB，随包交付最省事，
+  # 评审 clone 完就不用再上传任何东西（find_pylibs_zip 同理）。
   CANDS=$( { ls -1 "$AFS"/xmake-bundle-* "$AFS"/dl/xmake-bundle-* \
-                 "$AFS"/xmake*linux*x86_64 "$AFS"/dl/xmake*linux*x86_64 2>/dev/null; } \
+                 "$AFS"/xmake*linux*x86_64 "$AFS"/dl/xmake*linux*x86_64 \
+                 "${SELF_DIR:-/nonexistent}"/vendor/xmake-bundle-* \
+                 "$PKG"/vendor/xmake-bundle-* 2>/dev/null; } \
            | while read -r f; do case "$f" in *.tar.gz|*.tgz|*.zip) continue ;; esac; [ -f "$f" ] && echo "$f"; done | sort -u -V -r )
   if [ -z "$CANDS" ]; then
     # 兜底：任何以 xmake 开头、大于 1 MB 的非压缩文件都当成二进制试
-    for f in "$AFS"/xmake* "$AFS"/dl/xmake*; do
+    for f in "$AFS"/xmake* "$AFS"/dl/xmake* "${SELF_DIR:-/nonexistent}"/vendor/xmake*; do
       [ -f "$f" ] || continue
       case "$f" in *.tar.gz|*.tgz|*.zip) continue ;; esac
       sz=$(stat -c%s "$f" 2>/dev/null || echo 0)
@@ -2797,13 +2801,14 @@ do_check() {
   echo "  git       = $(command -v git || echo '<无>')"
   echo "  xmake     = $(command -v xmake || echo '<无>')"
   local XB=""
-  XB=$( { ls -1 "$AFS"/xmake-bundle-* "$AFS"/dl/xmake-bundle-* "$AFS"/xmake*linux*x86_64 2>/dev/null; } \
+  XB=$( { ls -1 "$AFS"/xmake-bundle-* "$AFS"/dl/xmake-bundle-* "$AFS"/xmake*linux*x86_64 \
+                "${SELF_DIR:-/nonexistent}"/vendor/xmake-bundle-* "$PKG"/vendor/xmake-bundle-* 2>/dev/null; } \
         | while read -r f; do case "$f" in *.tar.gz|*.tgz|*.zip) continue ;; esac; [ -f "$f" ] && echo "$f"; done \
         | sort -u -V -r | head -1 )
   if [ -n "$XB" ]; then
     echo "  离线 xmake = $(basename "$XB")  $(du -h "$XB" 2>/dev/null | cut -f1)  （build 时自动启用）"
   else
-    echo "  离线 xmake = <无>  建议上传 xmake-bundle-v3.0.7.linux.x86_64 到个人存储根目录（必须是 3.x，且 3.0.7 是最后一个静态版）"
+    echo "  离线 xmake = <无>  仓库 vendor/ 里本该有 xmake-bundle-v3.0.7.linux.x86_64（2.9 MB）"
   fi
   local NT=""
   for f in "$PKG/src/InfiniCore/build/ninetoothed/ninetoothed.h" "$PKG/patch_inc/ninetoothed.h"; do

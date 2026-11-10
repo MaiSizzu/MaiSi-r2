@@ -1,4 +1,4 @@
-package songshan-fl2va-hygon-r2 ; date 2026-11-10 ; files 8597
+package songshan-fl2va-hygon-r2 ; date 2026-11-10 ; files 8598
 InfiniCore f32e2fbb2a9b2ca912b5711f4f3836c403196a74 ; InfiniLM 65deb91f840ebaef752d028fad2f3217ce0950f4 ; ninetoothed da3078814e92fbad1f45a90c446244bd680d4fad
 .gitattributes
 .gitignore
@@ -8597,3 +8597,4 @@ src/InfiniLM/third_party/spdlog/tests/utils.h
 src/InfiniLM/xmake.lua
 vendor/README.md
 vendor/pylibs-py311-v3.zip
+vendor/xmake-bundle-v3.0.7.linux.x86_64
