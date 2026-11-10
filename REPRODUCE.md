@@ -23,15 +23,34 @@
 | 全部代码（含两个运行时 shim、补丁、九齿产物脚本） | **是** | 16 MB | `git clone` 即可 |
 | 离线 python 依赖 `vendor/pylibs-py311-v3.zip` | **是** | 33 MB | 已随包；不用手动解压，`run.sh` 自己解到 `$IFAB_AFS_HOME/pylibs` |
 | MiniMax-H3 FL2VA 权重 | **否** | ~135 GB | `MODEL_ROOT` 指向含 `model_index.json` 的那层 |
-| 编译产物 `infini/`（libinfiniop、libinfinicore_cpp_api、`_infinicore*.so`） | **否**，脚本生成 | ~1 GB | `bash run.sh build`（或 `H3_AUTO_BUILD=1 bash run.sh setup`） |
+| 编译产物 `infini/lib/*.so` + `_infinicore*.so` + `_infinilm.so` | **否**，脚本生成 | 149 MB | `bash run.sh build`（冷编约 40 分钟，增量 1~2 分钟） |
+| 编译工具 xmake **3.0.7**（build 的第一关，容易被忽略） | **否** | 约 10 MB | 见下「xmake 怎么来」 |
 
-需要外部准备的只剩**两件**，且第二件不需要人工搬运：
+**外部需要准备三件**：权重、编译产物、xmake。后两件都只需要做一次。
 
 1. **权重**：官方模型，必须自备（§2）。
 2. **编译产物**：与本机 DTK/编译器绑定，不可能预置在仓库里，但 `bash run.sh build`
-   一条命令就能生成；`run.sh setup` 会先检查它，缺了当场点名缺哪个 `.so` 并给出命令，
+   一条命令就能生成。`run.sh setup` 会先检查它，缺了当场点名缺哪个 `.so` 并给出命令，
    不会让你一路跑到视觉层才看到 `rip=0`。已有别人打好的包时用
-   `H3_INFINI_BUNDLE=/path/infini.tar.gz bash run.sh setup` 直接解包。
+   `H3_INFINI_BUNDLE=/path/infini.tar.gz bash run.sh setup` 直接解包（包内需含
+   `infini/lib/`、`il_root/_infinilm*.so`、`outputs/.stamp_infinilm`、
+   `<代码包>/src/InfiniCore/python/infinicore/_infinicore*.so`，解包目标是 `$IFAB_AFS_HOME`）。
+3. **xmake 3.0.7**：容器里默认没有，仓库里也只有 `xmake.lua` 配置、没有 xmake 本体。
+   三条来源，`run.sh` 会按顺序自己找：
+
+   ```bash
+   # ① 首选：把静态版 bundle 放到持久盘根目录，脚本自动 chmod 并使用
+   #    xmake-bundle-v3.0.7.linux.x86_64（3.0.8 起改为动态链接，容器 glibc 太旧跑不起来）
+   ls -lh "$IFAB_AFS_HOME"/xmake-bundle-*
+   # ② 其次：系统里已经装了 3.x
+   xmake --version | head -1     # 必须是 3.0.x；2.x 会因缺 add_orders 直接失败
+   # ③ 兜底：容器能上网时由脚本 clone gitee 源码编译（4~8 分钟）
+   git clone --depth 1 https://gitee.com/tboox/xmake.git
+   ```
+
+   三条全不满足时 `run.sh:2779` 会停在这里并打印上面这段指引，不会白跑 40 分钟。
+   **注意**：这一步只在真正编译（`bash run.sh build`）时才需要，跑 `check`、`setup`、`compare`
+   （用现成产物时）都不碰它。
 
 依赖包为什么是个 zip 而不是 requirements：容器里 `pip` 读 `/etc/debian_version` 就崩，
 装不了任何东西，所以把一套已验证可用的 site-packages 打成 zip，`run.sh` 只解压、
@@ -68,6 +87,25 @@ bash run.sh compare    # 出我方片 + PyTorch 基准片 + Size/Length/SSIM
 bash run.sh full       # 正式出片 124 帧 / 50 步
 ```
 
+## 1.1 没有 DCU、或拿不到权重时，怎么核对这份结果
+
+审核不一定需要先跑起来。下面五样都在仓库里，**不需要卡、不需要权重、不需要联网**：
+
+| 要看什么 | 看哪里 | 怎么核对 |
+| --- | --- | --- |
+| 出片本身 | `evidence/fl2va_124f_50s.mp4`（696 KB） | 直接播；`md5sum` 应为 `2d7ceff791d9fdbe693c09b4f02bfbb9` |
+| 出片规格 | `evidence/mp4-probe.txt` | 256×320 / 24 fps / 124 帧 / 5.18 s，与上面那个文件对得上 |
+| 算子自测 | `evidence/run_tests.log` | 81 条 shape，末行 `Test passed!`，退出码 0 |
+| 九齿产物 | `src/InfiniCore/build/ninetoothed/` | `git ls-files src/InfiniCore/build \| wc -l` = **957**（908 cpp / 45 h / 4 c） |
+| blockDim 替换 | 同上 | `grep -rhoE '[0-9]+ \* 64' src/InfiniCore/build/ninetoothed \| wc -l` = **867**，残余 `[0-9]+ \* 32` 为 0 |
+
+最后一条有两种数法会得到不同结果，先说明以免误判：按 `[0-9]+ * 64`（替换脚本自己用的正则）
+得 867；若按 `* 64, 1, 1, 0, stream` 这种「sharedMem 为 0」的完整签名去数，只有 686 ——
+差的 181 处是 sharedMem 非零的启动调用（形如 `, 1, 1, 8224, stream`），同样被替换过。
+`python3 patches/ninetoothed_blockdim_fix.py <目录>` 对已替换的树应报 `0 / 0`（幂等）。
+
+这五样是「打开就能看」的证据。要真正复现出片，仍需 §0.1 列的三件外部条件。
+
 ## 2. 权重怎么指
 
 `run.sh` 的解析顺序：
@@ -103,6 +141,8 @@ bash run.sh full       # 正式出片 124 帧 / 50 步
 | --- | --- | --- |
 | `缺离线依赖包。仓库里本该有 vendor/pylibs-py311-v3.zip` | clone 不完整（用了 `--filter`/只下了部分文件） | 重新完整 clone；或把 zip 放到 `$IFAB_AFS_HOME/`、或用 `PYLIBS_ZIP=` 指定 |
 | `缺编译产物： libinfiniop.so …` | 还没编（第一次跑必然出现） | `bash run.sh build`，约 40 分钟；之后增量 1~2 分钟 |
+| `xmake 装不上。把 xmake-bundle-v3.0.7…` | 容器没有 xmake 3.x，仓库里只有 `xmake.lua`（§0.1 第三件） | 上传 `xmake-bundle-v3.0.7.linux.x86_64` 到持久盘根；或容器能上网时脚本自动从 gitee 编译 |
+| `当前是 xmake 2.x，本项目需要 3.x` | 系统自带 2.x，缺 `add_orders` | 换 3.0.7 静态版；不要用 3.0.8+（动态链接，容器 glibc 太旧跑不起来） |
 | `AFS 里找不到 MaiSi-r2-full.tar.gz` | 旧版 run.sh（2,158,044 字节） | 用仓库里这版；或在包根目录直接跑 |
 | `尝试从 https://github.com/... 拉代码` 后失败 | 工作区访问不了 GitHub | 把整包放到 `$AFS/MaiSi-r2`，或设 `H3_PKG=<包路径>` |
 | `可见 DCU = 0` | 卡没分到 / `LD_LIBRARY_PATH` 没带 hyhal | 先 `hy-smi`，再 `source env/dcu_env.sh` |

@@ -8,7 +8,7 @@
     src/InfiniLM            minimax_h3
     patches/                源码补丁 + 九齿 blockDim 修正脚本
     patch_inc/              海光工具链的 CUB 兼容头（需加入 include 路径）
-    env/ scripts/ evidence/
+    env/ scripts/ evidence/  evidence/ 内含出片 mp4、mp4-probe、自测日志、blockDim diff
     vendor/                 离线 python 依赖包（pylibs-py311-v3.zip，33 MB，随包自带）
     run.sh                  平台唯一入口（InfiniFabric / 无 Slurm）
     REPRODUCE.md            给评审的复现指南：前置条件、三条路径、失败对照
@@ -17,9 +17,12 @@
 
 ## 快速开始（InfiniFabric，无 sbatch）
 
-> 评审先看 **REPRODUCE.md**：里面有前置条件清单、三种起跑方式，以及每条失败信息对应的处理。
-> **只有一样东西必须自备**：MiniMax-H3 权重（~135 GB，官方模型）。离线依赖包
-> `pylibs-py311-v3.zip` 已随包放在 `vendor/`，编译产物由 `bash run.sh build` 自己生成。
+> 评审先看 **REPRODUCE.md**：
+> - 想**核对结果**但不占卡 → §1.1，五样证据都在仓库里（出片 `evidence/fl2va_124f_50s.mp4`、
+>   规格、81 条自测、957 个九齿产物、867 处 blockDim），clone 完直接看，不需要权重。
+> - 想**复现出片** → §0.1 列出三件外部条件：MiniMax-H3 权重（~135 GB）、编译产物
+>   （`bash run.sh build`）、xmake 3.0.7（`build` 的第一关，容易被忽略，来源见 §0.1）。
+>   离线依赖包已随包在 `vendor/`，不用另找。
 > 清单见 REPRODUCE.md §0.1。
 
     export IFAB_AFS_HOME=<持久盘目录>          # 每单必设，外层没有 $AFS
