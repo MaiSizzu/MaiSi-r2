@@ -137,6 +137,7 @@ bash run.sh full       # 正式出片 124 帧 / 50 步
 | `缺编译产物： libinfiniop.so …` | 还没编（第一次跑必然出现） | `bash run.sh build`，约 40 分钟；之后增量 1~2 分钟 |
 | `xmake 装不上。把 xmake-bundle-v3.0.7…` | `vendor/` 里缺那个 2.9 MB 静态包（clone 不完整） | 重新完整 clone；`ls -lh vendor/xmake-bundle-*` 应有 2.9 MB |
 | `当前是 xmake 2.x，本项目需要 3.x` | 系统里的 xmake 2.x 被优先命中 | `cp vendor/xmake-bundle-v3.0.7.linux.x86_64 "$IFAB_AFS_HOME/"`，脚本优先用持久盘那份 |
+| 日志里出现 `/work2/songshan` 或 `anaconda3` 路径 | 拿到的是 r3 之前的提交（xmake 里写死了集群绝对路径，脱离集群必编译失败） | 换到 r3 及之后的 commit；或用 `bash run.sh build`（脚本会就地重写这几处） |
 | `AFS 里找不到 MaiSi-r2-full.tar.gz` | 旧版 run.sh（2,158,044 字节） | 用仓库里这版；或在包根目录直接跑 |
 | `尝试从 https://github.com/... 拉代码` 后失败 | 工作区访问不了 GitHub | 把整包放到 `$AFS/MaiSi-r2`，或设 `H3_PKG=<包路径>` |
 | `可见 DCU = 0` | 卡没分到 / `LD_LIBRARY_PATH` 没带 hyhal | 先 `hy-smi`，再 `source env/dcu_env.sh` |

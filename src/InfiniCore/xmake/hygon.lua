@@ -1,5 +1,12 @@
 local dtk_root = os.getenv("DTK_ROOT") or "/opt/dtk"
 
+-- CUB 兼容头目录：优先 H3_PATCH_INC（run.sh 会导出），否则按仓库布局 <repo>/patch_inc
+local function h3_patch_inc()
+    local e = os.getenv("H3_PATCH_INC")
+    if e and e ~= "" then return e end
+    return path.directory(path.directory(os.projectdir())) .. "/patch_inc"
+end
+
 local function hygon_cuda_roots()
     local configured = get_config("cuda") or os.getenv("HYGON_CUDA_HOME")
     if configured and configured ~= "" then
@@ -120,7 +127,8 @@ target("infiniop-hygon")
     -- 海光DCU使用DTK中的CUDA库
     add_links("cudart", "cublas", "curand", "cublasLt", "cudnn")
     
-add_includedirs("/work2/songshan/patch_inc")
+    -- CUB 兼容头在仓库根 patch_inc/（原先写死集群内绝对路径，脱离集群即编译失败）
+    add_includedirs(h3_patch_inc())
     add_hygon_dtk_paths()
 
     set_warnings("all", "error")
@@ -175,7 +183,8 @@ target("infinirt-hygon")
 
     add_links("cudart", "cublas", "curand", "cublasLt", "cudnn")
     
-add_includedirs("/work2/songshan/patch_inc")
+    -- CUB 兼容头在仓库根 patch_inc/（原先写死集群内绝对路径，脱离集群即编译失败）
+    add_includedirs(h3_patch_inc())
     add_hygon_dtk_paths()
 
     set_warnings("all", "error")
@@ -210,7 +219,8 @@ target("infiniccl-hygon")
 
         add_links("cudart", "cublas", "curand", "cublasLt", "cudnn")
         
-add_includedirs("/work2/songshan/patch_inc")
+    -- CUB 兼容头在仓库根 patch_inc/（原先写死集群内绝对路径，脱离集群即编译失败）
+    add_includedirs(h3_patch_inc())
         add_hygon_dtk_paths()
 
         set_warnings("all", "error")

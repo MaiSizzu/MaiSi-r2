@@ -17,6 +17,12 @@
 
 ## 2. 构建命令
 
+> 下面这些命令在**任意一台 clone 下来的机器上**都应能直接执行：xmake 里不再有
+> 集群绝对路径。CUB 兼容头取仓库根 `patch_inc/`，pybind11 头取仓库根
+> `third_party/pybind11/include`（随仓库交付，1 MB），Python 头由环境变量
+> `PYTHON_INCLUDE` 决定，未设时自动问 `python3`（`sysconfig.get_paths()['include']`）。
+> 两者都可显式覆盖，用于 Python 装在非默认前缀的机器。
+
 ```bash
 source env/dcu_env.sh
 cd src/InfiniCore

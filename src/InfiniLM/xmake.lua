@@ -21,9 +21,28 @@ end
 add_includedirs("third_party/spdlog/include")
 add_includedirs("third_party/json/single_include/")
 
+-- python / pybind11 头文件：优先环境变量，其次仓库内相对路径（原来写死集群 anaconda 路径）
+local function _h3_py_include()
+    local e = os.getenv("PYTHON_INCLUDE")
+    if e and e ~= "" then return e end
+    local ok, out = pcall(os.iorunv, "python3", {"-c",
+        "import sysconfig;print(sysconfig.get_paths()['include'])"})
+    if ok and out then
+        out = out:gsub("%s+$", "")
+        if out ~= "" and os.isdir(out) then return out end
+    end
+    return nil
+end
+local _h3_pyinc = _h3_py_include()
+
+local _h3_pbinc = os.getenv("PYBIND11_INCLUDE")
+if not _h3_pbinc or _h3_pbinc == "" then
+    _h3_pbinc = path.directory(path.directory(os.projectdir())) .. "/third_party/pybind11/include"
+end
+
 target("_infinilm")
-    add_includedirs(os.getenv("PYBIND11_INCLUDE"), { public = false })
-add_includedirs(os.getenv("PYTHON_INCLUDE") or "/public/software/apps/anaconda3/2023.09/include/python3.11", { public = false })
+    add_includedirs(_h3_pbinc, { public = false })
+    if _h3_pyinc then add_includedirs(_h3_pyinc, { public = false }) end
     set_default(false)
     add_rules("python.module", {soabi = true})
     set_languages("cxx17")

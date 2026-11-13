@@ -7349,6 +7349,12 @@ do_build() {
   # 不设会落到 $HOME/.infini，编 _infinicore 时链接不到 -linfiniop
   export INFINI_ROOT=$INFINI
 
+  # 头文件路径：xmake 里已改成仓库相对路径；这几行兜住「编译树与仓库不同根」的情形
+  # （例如从 tar 包展开的 ic_work），也保证用的是当前环境的 python 头。
+  [ -d "$PKG/patch_inc" ] && export H3_PATCH_INC="$PKG/patch_inc"
+  [ -d "$PYLIBS/pybind11/include" ] && export PYBIND11_INCLUDE="$PYLIBS/pybind11/include"
+  export PYTHON_INCLUDE=$(python3 -c "import sysconfig;print(sysconfig.get_paths()['include'])" 2>/dev/null)
+
   patch_build_paths
   ensure_nt_header
 

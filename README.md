@@ -51,6 +51,12 @@ InfiniCore ｜ `smoke` 256×256/8 帧/2 步 ｜ `full` 124 帧/50 步 ｜ `compa
 
 与官方说明的三处差异（`--aten=y` 未开、`--flash-attn` 未传、`--ccl=y` 按
 `librccl` 存在与否探测）、以及为此写的两个 shim，见 **BUILD.md**。
+
+> **头文件路径已全部改为仓库内相对路径**（r3 起）：CUB 兼容头取仓库根 `patch_inc/`，
+> pybind11 头取仓库根 `third_party/pybind11/include`，Python 头由 `PYTHON_INCLUDE`
+> 或当前 `python3` 的 `sysconfig` 决定。clone 到任意机器上直接跑上面的命令即可，
+> 不再需要先改写 xmake 文件里的集群绝对路径。若你的 Python 装在非默认位置，
+> 显式 `export PYTHON_INCLUDE=$(python3 -c "import sysconfig;print(sysconfig.get_paths()['include'])")`。
 两个 shim 不在 `xmake.lua` 里，是刻意的：用独立 .so + `LD_PRELOAD` 同名符号覆盖，
 宏门控保证它们即使被 `add_files` 扫进编译树也只是空 TU。
 
