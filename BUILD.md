@@ -19,9 +19,16 @@
 
 > 下面这些命令在**任意一台 clone 下来的机器上**都应能直接执行：xmake 里不再有
 > 集群绝对路径。CUB 兼容头取仓库根 `patch_inc/`，pybind11 头取仓库根
-> `third_party/pybind11/include`（随仓库交付，1 MB），Python 头由环境变量
-> `PYTHON_INCLUDE` 决定，未设时自动问 `python3`（`sysconfig.get_paths()['include']`）。
-> 两者都可显式覆盖，用于 Python 装在非默认前缀的机器。
+> `third_party/pybind11/include`（随仓库交付，1 MB）。Python 头优先取环境变量
+> `PYTHON_INCLUDE`；未设时在 `$CONDA_PREFIX` / `$VIRTUAL_ENV` / `$HOME/.local` /
+> `/usr` / `/usr/local` / `/opt/conda` 下扫描 `include/python3.*/Python.h`，取第一个
+> 命中前缀里的最高版本。**这一步只做文件系统探测，不调用外部进程**——xmake 的脚本
+> 沙箱不暴露 `pcall`，早期版本在这里用 `pcall` 包装会直接报
+> `attempt to call a nil value (global 'pcall')`。
+>
+> 探测不到时只打印一行告警、不中断 configure。此时 `infiniop` / `infinirt` 等 C++
+> 目标仍可正常编译；只有 python 绑定目标（`_infinicore`、`_infinilm`）需要
+> `export PYTHON_INCLUDE=<含 Python.h 的目录>` 后重新 configure。
 >
 > `env/dcu_env.sh` 同样不写死路径：DTK 根按 `$DTK_ROOT` → `/opt/dtk*` →
 > `/public/software/compiler/dtk-*` → `$HOME/dtk*` 顺序探测；`INFINI_ROOT` 缺省

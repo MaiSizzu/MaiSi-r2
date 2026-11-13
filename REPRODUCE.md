@@ -65,6 +65,10 @@ bash run.sh check                                # 只读自检，2 分钟，不
 `run.sh` 会把自己所在目录当作代码包（日志里打 `PKG = ...（来源：run.sh 所在目录）`），
 **不需要**额外准备什么 `MaiSi-r2-full.tar.gz`。
 
+> 在 Windows 上 clone 到较深的目录时，git 可能报 `Filename too long`（仓库内九齿
+> 产物的路径较长）。先执行 `git config --global core.longpaths true` 再 clone 即可。
+> 这是 Windows 客户端限制，与 Linux 目标平台无关。
+
 那个 `h3.env` 建议照抄：不复制也能跑，但会退回内置默认 `LEGACY_GPUS=0,1,2,3`
 （4 卡、显存 0.4），出片与耗时都对不上报告里的 8 卡口径。文件放持久盘根
 （`$AFS/h3.env`，`$AFS` 未设时就是 `$HOME/h3.env`），`run.sh` 每单开头会加载它。
