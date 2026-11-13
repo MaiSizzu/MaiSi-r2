@@ -32,9 +32,11 @@
 source env/dcu_env.sh
 cd src/InfiniCore
 
-# 九齿产物与 blockDim 修正（幂等，期望 patched sites 867）
+# 九齿生成产物已随仓库交付（build/ninetoothed/ 下 900+ 个 .c/.cpp）。
+# 产物齐全时脚本自动跳过，不需要机器上装有 ninetoothed 这个 pip 包；
+# 只有修改过算子定义才需 `pip install ninetoothed` 后加 --force 重生成。
 PYTHONPATH=src python scripts/build_ntops.py
-python ../../patches/ninetoothed_blockdim_fix.py
+python ../../patches/ninetoothed_blockdim_fix.py   # 期望 patched sites 867
 
 # configure：注意这里没有 --flash-attn，也没有 --aten
 xmake g --network=private            # 不联网拉 xmake-repo
