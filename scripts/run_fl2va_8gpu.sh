@@ -26,8 +26,8 @@ source "$PKG/env/dcu_env.sh"
 source "$PKG/env/paths.env"
 source "${H3_VENV}/bin/activate"
 
-export LD_LIBRARY_PATH=${INFINI_ROOT:-$HOME/.infini}/lib:$DTK_ROOT/cuda/cuda-12/lib64:$DTK_ROOT/lib:/opt/hyhal/lib:/opt/hyhal/lib64:$LD_LIBRARY_PATH
-export LD_PRELOAD=$DTK_ROOT/cuda/cuda-12/targets/x86_64-linux/lib/libcuda.so.1
+export LD_LIBRARY_PATH=${INFINI_ROOT:-$HOME/.infini}/lib:${CUDA_PATH:-$DTK_ROOT/cuda/cuda-12}/lib64:$DTK_ROOT/lib:/opt/hyhal/lib:/opt/hyhal/lib64:$LD_LIBRARY_PATH
+export LD_PRELOAD=${CUDA_PATH:-$DTK_ROOT/cuda/cuda-12}/targets/x86_64-linux/lib/libcuda.so.1
 export PYTHONPATH=$SS/InfiniCore/python:$SS/InfiniLM/python
 
 echo "[env] visible DCUs:"

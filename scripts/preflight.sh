@@ -103,7 +103,7 @@ fi
   || bad "缺少首帧图片。放一张到 $PKG/inputs/first_frame.jpg，或 export FIRST_FRAME=/路径"
 
 echo "================ 7. 自编译算子库 ================"
-IR=${INFINI_ROOT:-/work2/infini}
+IR=${INFINI_ROOT:-$HOME/.infini}
 if [ -f "$IR/lib/libinfiniop.so" ]; then
   ok "libinfiniop.so: $IR/lib/libinfiniop.so"
   ls -lh "$IR/lib/libinfiniop.so" | sed 's/^/    /'

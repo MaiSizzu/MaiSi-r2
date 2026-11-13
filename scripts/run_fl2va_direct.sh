@@ -26,16 +26,16 @@ fi
 if [ -n "$DTK_ROOT" ] && [ -f "$DTK_ROOT/env.sh" ]; then source "$DTK_ROOT/env.sh"; fi
 export HIP_PATH=${HIP_PATH:-$DTK_ROOT}
 export ROCM_PATH=${ROCM_PATH:-$DTK_ROOT}
-export CUDA_HOME=${CUDA_HOME:-$DTK_ROOT/cuda/cuda-12}
+export CUDA_HOME=${CUDA_HOME:-${CUDA_PATH:-$DTK_ROOT/cuda/cuda-12}}
 export CUDA_PATH=$CUDA_HOME
 export PATH=$CUDA_HOME/bin:$PATH
 
 # ---- 包内路径配置（MODEL_ROOT / FIRST_FRAME / OUTPUT_DIR / PROMPT ...）----
 [ -f "$PKG/env/paths.env" ] && source "$PKG/env/paths.env"
 
-MID=${INFINI_ROOT:-/work2/infini}
-export LD_LIBRARY_PATH=$MID/lib:$DTK_ROOT/cuda/cuda-12/lib64:$DTK_ROOT/lib:/opt/hyhal/lib:/opt/hyhal/lib64:$LD_LIBRARY_PATH
-PRELOAD=$DTK_ROOT/cuda/cuda-12/targets/x86_64-linux/lib/libcuda.so.1
+MID=${INFINI_ROOT:-$HOME/.infini}
+export LD_LIBRARY_PATH=$MID/lib:${CUDA_PATH:-$DTK_ROOT/cuda/cuda-12}/lib64:$DTK_ROOT/lib:/opt/hyhal/lib:/opt/hyhal/lib64:$LD_LIBRARY_PATH
+PRELOAD=${CUDA_PATH:-$DTK_ROOT/cuda/cuda-12}/targets/x86_64-linux/lib/libcuda.so.1
 [ -f "$PRELOAD" ] && export LD_PRELOAD=$PRELOAD
 export PYTHONPATH=$SS/InfiniCore/python:$SS/InfiniLM/python:$PYTHONPATH
 
