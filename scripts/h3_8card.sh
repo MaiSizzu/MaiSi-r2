@@ -35,7 +35,7 @@ fi
 [ -n "$DTK_ROOT" ] && [ -f "$DTK_ROOT/env.sh" ] && source "$DTK_ROOT/env.sh"
 
 [ -f "$PKG/env/paths.env" ] && source "$PKG/env/paths.env"
-MID=${INFINI_ROOT:-/work2/infini}
+MID=${INFINI_ROOT:-$HOME/.infini}
 
 PY=${PY:-}
 if [ -z "$PY" ]; then
